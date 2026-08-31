@@ -1,0 +1,24 @@
+# What the SDIST carries beyond the package itself.
+#
+# ⭐ WITHOUT THIS FILE THE RELEASED SDIST SHIPS A BROKEN TEST SUITE. setuptools' default sdist
+# contents include `tests/test*.py` but NOT `tests/conftest.py`, so the tarball attached to every
+# GitHub Release contained the tests and not the fixtures they depend on: two tests failed
+# outright, and — the part that actually matters — the autouse fixture that makes "no test in this
+# suite reaches the network" TRUE was simply absent from the artifact.
+#
+# That also quietly weakened the contract in README.md that "tests travel with the module", for
+# anyone consuming the sdist rather than the repository. Tests that travel without their
+# conftest have not travelled.
+include MANIFEST.in
+include README.md
+include CHANGELOG.md
+include pyproject.toml
+recursive-include tests *.py
+
+# ⛔ `scripts/` is DELIBERATELY NOT INCLUDED. It briefly was, on the reasoning that a consumer
+# auditing the tarball should be able to run the same scan CI runs. That reasoning was thin — the
+# guard is a CI tool for THIS repository, not part of the library — and it had a real cost: the
+# canonical guard's docstring enumerates the fleet's other repositories by name, so including it
+# put that inventory inside every tarball attached to every public GitHub Release, widening the
+# distribution of something the tests were edited to stop publishing. Anyone who wants the guard
+# can clone the repository, which is where a CI tool belongs.

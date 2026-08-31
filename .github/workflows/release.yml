@@ -1,0 +1,297 @@
+name: release
+
+# A release is an ANNOTATED semver tag. There is no image and nothing to deploy: this workflow
+# builds the wheel + sdist and attaches them to a GitHub Release, which is what a consumer's
+# pinned install resolves against.
+#
+#   pip install git+https://github.com/texasdaddy/kw-common@vX.Y.Z
+#
+# ⭐ A TAG CAN POINT AT ANY COMMIT — including one that never went through a PR and so never ran
+# ci.yml. That is why the gates below are duplicated here rather than assumed: the guard, the
+# full matrix and the packaging check all run again, against the TAG's tree, and the publish
+# waits on every one of them.
+on:
+  # A webhook-independent way to start a run when Actions is throttled. `ref` selects the tag.
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+# Workflow-level: READ ONLY. The gate jobs execute arbitrary tag-tree code (pytest) and must not
+# hold a write-capable token; only the publish job gets write, scoped at the job level below.
+permissions:
+  contents: read
+
+jobs:
+  no-internal-info:
+    name: No internal info (leak guard)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The range scan needs real history AND TAGS: `git describe` finds no previous release
+          # on a shallow checkout and `git rev-list` then FAILS, which the script turns into
+          # exit 1 rather than a silent zero-commit pass.
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Self-test the patterns, then scan the working tree
+        run: |
+          python scripts/check_no_internal_info.py --selftest
+          python scripts/check_no_internal_info.py
+      # ⛔ AN EMPTY RANGE IS NOT A PASS. The guard's job is to scan the commits this tag
+      # publishes, and "there were none to scan" must never be reported as "there was nothing
+      # wrong". `--range` legitimately exits 0 on zero commits — correct for a pre-push hook,
+      # which really can have nothing new — so the CALLER decides what empty means. Here it
+      # means: look wider.
+      #
+      # Two ways an empty range arises on a tag, both real:
+      #   * the FIRST release ever — there is no previous tag at all (this is v1.0.0's case);
+      #   * a re-tag of an already-released commit.
+      # In each case fall back to scanning ALL history reachable from the tag. Slower, once, and
+      # the only answer that cannot silently publish an unscanned commit.
+      # ⭐⭐ THE RANGE NAMES THE TAG REF, NOT `HEAD` — and that is the whole point of this step
+      # rather than a detail of it. A TAG ANNOTATION is free prose, authored at release time,
+      # published verbatim on the Release page and carried into every clone. It is the ONLY text
+      # a tag adds that is not already in the scanned commit history, and with `HEAD` in the
+      # range the guard never reads it.
+      #
+      # Measured on this repository: a tag annotated with an RFC1918 address scans CLEAN as
+      # `--range HEAD` (exit 0) and is CAUGHT as `--range refs/tags/<name>` (exit 1,
+      # `<tag object>:6: private IPv4`). The guard has a purpose-written `<tag object>`
+      # remediation branch — deleting and re-cutting the tag, no history rewrite — so it was
+      # built for exactly this and the workflow simply was not asking. Naming the ref is a strict
+      # superset: the same commits are covered either way, plus the tag object itself.
+      - name: Scan the commits AND THE TAG OBJECT this tag would publish
+        run: |
+          set -eu
+          # `$GITHUB_REF` (refs/tags/<name>), never the bare commit sha: the guard reads a tag
+          # object only when the range NAMES it, so a tag cut at an already-merged commit would
+          # otherwise resolve to zero commits and the annotation would go unread entirely.
+          target="${GITHUB_REF}"
+          # Exclude EVERY tag co-located with HEAD, not just this one, or a twin tag becomes the
+          # base and the range collapses to nothing.
+          excludes=""
+          for t in $(git tag --points-at HEAD); do excludes="$excludes --exclude=$t"; done
+          # shellcheck disable=SC2086
+          base="$(git describe --tags --abbrev=0 --match 'v*' $excludes HEAD 2>/dev/null || true)"
+          range=""
+          count=0
+          if [ -n "$base" ]; then
+            range="${base}..${target}"
+            count="$(git rev-list --count "$range")"
+          fi
+          if [ "$count" -eq 0 ]; then
+            echo "no previous release tag to scan from (or nothing new since it) — scanning ALL"
+            echo "history reachable from this tag rather than reporting an empty range as clean"
+            range="${target}"
+            count="$(git rev-list --count "${target}")"
+          fi
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no commits to scan at all. An unrunnable guard must never be"
+            echo "::error::reported as a pass."
+            exit 1
+          fi
+          echo "scanning ${range} (${count} commit(s), plus the tag object itself)"
+          python scripts/check_no_internal_info.py --range "$range"
+
+  test:
+    name: Lint, type-check and test the tagged tree (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install the package and the pinned tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install "ruff==0.16.1" "mypy==2.3.0" "pytest==9.1.1" \
+                                "pytest-timeout==2.4.0"
+      - run: ruff check .
+      - run: mypy
+      - run: python -u -m pytest
+
+  build:
+    name: Build the wheel and sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # `fetch-tags` so the TAG OBJECT itself is in the local repository, not merely the
+          # commit it points at. The annotated-tag check below reads that object with
+          # `git cat-file -t`, and a checkout that resolved the ref to a commit without keeping
+          # the tag would make the check unable to answer — which, on a publish path, must never
+          # be indistinguishable from "it answered yes".
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.10"  # the declared FLOOR — build and prove the install there
+      # ⭐ THE TAG AND THE PACKAGE VERSION MUST AGREE, and nothing else checks it. A consumer
+      # pins `@v1.2.3` and then reads `kw_common.__version__` to report what it is running; if
+      # the tag says one number and the package says another, every consumer's version report is
+      # a lie and there is no way to tell from the outside which is right. `__init__.py` is the
+      # single source (pyproject reads it dynamically), so this compares the tag against it.
+      # ⭐ ANNOTATED, NOT LIGHTWEIGHT — and enforced, because README.md and CHANGELOG.md both
+      # state it as a fact. `on: push: tags: ["v*"]` fires identically for `git tag v1.0.1`, so
+      # without this step the stated invariant was documentation only and a lightweight tag would
+      # publish a full release. An annotated tag carries a tagger, a date and a message; that is
+      # what makes a release object something you can audit later.
+      - name: The tag must be annotated
+        run: |
+          set -eu
+          # ⛔ THREE OUTCOMES, NOT TWO, and each says what actually happened. Every one of them
+          # fails closed — an unanswerable check must never read as a pass on a publish path —
+          # but a failure that misdescribes itself sends the next person to fix the wrong thing.
+          #
+          # `|| true` on the substitution because `set -e` would otherwise abort the whole
+          # step here on an unresolvable ref — and with `2>/dev/null` on the same line the
+          # step would then fail having printed NOTHING at all, rather than the guidance
+          # below. The redirect and the `|| true` are a pair; removing either loses the
+          # message.
+          if [ "${GITHUB_REF}" = "${GITHUB_REF#refs/tags/}" ]; then
+            # workflow_dispatch on a BRANCH. The file documents that entry point, so it is a real
+            # path — and telling someone to `git tag -d main` would be actively harmful advice.
+            echo "::error::${GITHUB_REF} is not a tag ref. This workflow publishes a release from"
+            echo "::error::an annotated v* TAG; re-run it with 'ref' set to the tag."
+            exit 1
+          fi
+          kind="$(git cat-file -t "${GITHUB_REF}" 2>/dev/null || true)"
+          if [ -z "$kind" ]; then
+            echo "::error::${GITHUB_REF} could not be resolved in this checkout, so whether it is"
+            echo "::error::annotated cannot be determined. This is an environment failure, not a"
+            echo "::error::verdict on the tag — the checkout needs fetch-depth: 0 + fetch-tags."
+            exit 1
+          fi
+          echo "${GITHUB_REF} is a ${kind} object"
+          if [ "$kind" != "tag" ]; then
+            echo "::error::${GITHUB_REF_NAME} is a LIGHTWEIGHT tag. A release must be annotated:"
+            echo "::error::  git tag -d ${GITHUB_REF_NAME}"
+            echo "::error::  git push origin :refs/tags/${GITHUB_REF_NAME}"
+            echo "::error::  git tag -a ${GITHUB_REF_NAME} -m '<what this release is>'"
+            echo "::error::  git push origin ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+      - name: The tag must match the package version
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME}"
+          pkg="v$(python -c "
+          import ast, pathlib
+          src = pathlib.Path('src/kw_common/__init__.py').read_text(encoding='utf-8')
+          tree = ast.parse(src)
+          for node in tree.body:
+              if isinstance(node, ast.Assign) and node.targets[0].id == '__version__':
+                  print(node.value.value)
+                  break
+          else:
+              raise SystemExit('__version__ not found in src/kw_common/__init__.py')
+          ")"
+          echo "tag=${tag}  package=${pkg}"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::tag ${tag} does not match the package version ${pkg}."
+            echo "::error::Bump __version__ in src/kw_common/__init__.py, or retag."
+            exit 1
+          fi
+      # ⭐ THE SAME SDIST INSPECTION `ci.yml` RUNS, DUPLICATED HERE ON PURPOSE — this is the job
+      # that UPLOADS the tarball to the Release, and the header of this file promises the
+      # packaging check runs again against the tag's tree. It did not: the check was added to
+      # `ci.yml` alone, so a tag cut directly on a commit that never went through a PR — the
+      # exact case this file's duplication exists for — could publish a tarball nobody inspected.
+      # Adding it to one of the two workflows and not the other is the same fix-the-instance miss
+      # this repository keeps making, so it is stated here rather than assumed.
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - name: The sdist carries its fixtures and nothing it should not
+        run: |
+          set -eu
+          sdist="$(ls dist/*.tar.gz)"
+          echo "inspecting ${sdist}"
+          names="$(tar tzf "$sdist")"
+          echo "$names" | grep -q '/tests/conftest.py$' || {
+            echo "::error::the sdist has no tests/conftest.py — its suite ships without the"
+            echo "::error::autouse fixtures it depends on. Check MANIFEST.in."
+            exit 1
+          }
+          if echo "$names" | grep -q '/scripts/'; then
+            echo "::error::the sdist contains scripts/. The leak guard is a CI tool for this"
+            echo "::error::repository and its docstring names other repositories; it must not be"
+            echo "::error::published inside a release artifact. Check MANIFEST.in."
+            exit 1
+          fi
+          echo "sdist contents are as intended"
+      # The same check ci.yml runs, repeated here because THIS is the artifact being published.
+      - name: Install the built wheel into a clean environment and import it
+        run: |
+          set -eu
+          python -m venv /tmp/consumer
+          /tmp/consumer/bin/python -m pip install --upgrade pip
+          /tmp/consumer/bin/python -m pip install --no-index dist/*.whl
+          cd /tmp
+          /tmp/consumer/bin/python -c "
+          import kw_common, kw_common.alerting as a
+          import os
+          assert kw_common.__version__ == os.environ['GITHUB_REF_NAME'].lstrip('v'), (
+              kw_common.__version__, os.environ['GITHUB_REF_NAME'])
+          assert a.notify and a.AlertSettings and a.configure
+          print('installed', kw_common.__version__, 'with', len(a.__all__), 'exports')
+          "
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Create the GitHub Release
+    needs: [no-internal-info, test, build]
+    runs-on: ubuntu-latest
+    # The ONLY job with write access, and it runs nothing from the tag's tree.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: dist
+          path: dist/
+      - name: Extract the release notes from CHANGELOG.md
+        run: |
+          set -eu
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v hdr="## [${VERSION}]" '
+            index($0, hdr) == 1 {f=1; next}
+            f && index($0, "## [") == 1 {exit}
+            f {print}
+          ' CHANGELOG.md > release_notes.md
+          if [ ! -s release_notes.md ]; then
+            echo "No CHANGELOG section for ${VERSION}; using a default note."
+            echo "Release ${GITHUB_REF_NAME}." > release_notes.md
+          fi
+          echo "--- release notes ---"
+          cat release_notes.md
+      - name: Create the release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3.0.2
+        with:
+          name: ${{ github.ref_name }}
+          body_path: release_notes.md
+          prerelease: false
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+          fail_on_unmatched_files: true

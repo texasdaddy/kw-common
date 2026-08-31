@@ -1,0 +1,91 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kw-common"
+dynamic = ["version"]
+description = "Shared, stdlib-only building blocks for the fleet's Python services."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "texasdaddy" }]
+keywords = ["alerting", "ops"]
+# ⭐ ONLY THE VERSIONS CI ACTUALLY RUNS. This list claimed 3.11 and 3.13 as well, which CI never
+# measured — and this project's own README says a library that claims a version and is only ever
+# run on another is claiming something nobody checked. `requires-python = ">=3.10"` remains the
+# binding constraint, so 3.11 and 3.13 still install; the classifiers just stop asserting a
+# result no run produced. Adding them back is a one-line matrix change in both workflows, and
+# that is the order to do it in.
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.12",
+    "Intended Audience :: Developers",
+    "Topic :: System :: Monitoring",
+]
+
+# ⭐ NO RUNTIME DEPENDENCIES, AND THAT IS A CONTRACT, NOT AN ACCIDENT.
+# Every third-party dependency added here is a supply-chain surface across the WHOLE fleet at
+# once, because every consumer installs this library. Adding one needs a stated justification,
+# not just a convenience argument. `dependencies` is written out empty rather than omitted so
+# that adding an entry is a visible diff on this line.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/texasdaddy/kw-common"
+Issues = "https://github.com/texasdaddy/kw-common/issues"
+
+[tool.setuptools.dynamic]
+# ⭐ ONE source of truth for the version: `src/kw_common/__init__.py`. Repeating the number here
+# would be a second place to forget. The release workflow additionally asserts that the git TAG
+# agrees with this value, which is the third place it could drift.
+version = { attr = "kw_common.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# ⭐ `BLE` IS SELECTED ON PURPOSE. The alerting module is full of deliberate broad excepts —
+# "notify() never raises" is a structural guarantee, not a promise — and every one of them carries
+# a `# noqa: BLE001` naming the reason it exists. Selecting the rule is what makes those comments
+# load-bearing instead of decorative: a NEW unjustified `except Exception` fails the lint, and
+# `RUF100` fails an obsolete suppression, so the set of blanket catches cannot grow silently.
+select = ["E", "F", "W", "I", "UP", "B", "S", "BLE", "C4", "SIM", "RUF"]
+ignore = [
+    "S101",   # `assert` is how the tests are written
+    "RUF001", # ambiguous unicode in prose: the docstrings quote real characters on purpose
+    "RUF002",
+    "RUF003",
+    # `__all__` is grouped by concern (severity / configuration / functions / constants) rather
+    # than alphabetised, because it doubles as the map of the public surface.
+    "RUF022",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The leak guard is a VERBATIM copy of the canonical file from `unraid-templates`. It is not
+# edited here — a local lint fix would make it a fork, which is the one thing a copied guard must
+# never become. See the header of the file itself.
+"scripts/check_no_internal_info.py" = ["ALL"]
+# S603: every subprocess call in the tests runs `sys.executable` on a file this suite just wrote.
+# There is no untrusted input to audit, and the isolation tests cannot be written without it.
+"tests/*" = ["S603"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["src"]
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = false
+disallow_untyped_defs = true
+no_implicit_optional = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# ⭐ NO TEST MAY HANG. A hung process emits no output and is indistinguishable from a slow one;
+# a per-test ceiling turns that into a fast, legible failure.
+addopts = "-q --timeout=60"
+filterwarnings = ["error"]
