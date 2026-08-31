@@ -1166,6 +1166,87 @@ def test_settings_refuse_a_path_that_is_not_a_path(name: str) -> None:
         AlertSettings(service="svc", **{name: 17})  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("name", ["config_file", "state_file", "error_log"])
+def test_the_blank_refusal_names_what_that_field_would_actually_cost(name: str) -> None:
+    """The three fields fail differently, so the refusal says which failure it just prevented.
+
+    An earlier version told every field the `state_file` story — de-duplication off, escalating
+    conditions re-paging — which is untrue of the other two and sends an operator looking for the
+    wrong symptom.
+    """
+    costs = {
+        "config_file": "email channel is unconfigured",
+        "state_file": "de-duplication is OFF",
+        "error_log": "retrievable sink is OFF",
+    }
+    with pytest.raises(ValueError) as excinfo:
+        AlertSettings(service="svc", **{name: ""})  # type: ignore[arg-type]
+    message = str(excinfo.value)
+    assert costs[name] in message, f"the refusal for {name} does not say what it costs: {message}"
+    for other, text in costs.items():
+        if other != name:
+            assert text not in message, f"the refusal for {name} recites {other}'s consequence"
+
+
+@pytest.mark.parametrize("name", ["config_file", "state_file", "error_log"])
+def test_a_pathlike_whose_fspath_misbehaves_is_refused_as_a_value_error(name: str) -> None:
+    """⭐ `__fspath__` is CALLER CODE and can do anything.
+
+    One that raises used to propagate its own exception, and one returning `None` produced a bare
+    `TypeError` — both straight past a caller catching `ValueError` around this constructor,
+    which is the only thing every other refusal here invites them to catch. A guard with no test
+    proving it is half a guard, and this one had none.
+    """
+    class Raises:
+        def __fspath__(self) -> str:
+            raise RuntimeError("this path resolves lazily and it failed")
+
+    class ReturnsNone:
+        def __fspath__(self) -> str:
+            return None  # type: ignore[return-value]
+
+    for bad in (Raises(), ReturnsNone()):
+        with pytest.raises(ValueError, match=name):
+            AlertSettings(service="svc", **{name: bad})  # type: ignore[arg-type]
+
+
+def test_the_dedup_check_and_its_diagnostic_cannot_disagree(tmp_path: Path,
+                                                            channels: dict[str, Spy]) -> None:
+    """⭐⭐ TWO PLACES ASKING ONE QUESTION MUST NOT ANSWER IT DIFFERENTLY.
+
+    `state_file_problem()` and `_dedup_enabled()` both decide "is there a usable state file
+    here". They normalise the value the same way now; they did not, and the split was invisible
+    in the worst direction: with a `Path` reaching an `Alerter` through a settings object that
+    bypassed `AlertSettings`, the diagnostic reported no problem while `_dedup_enabled()` raised
+    `AttributeError`, which `notify()`'s fail-open guard swallowed. De-duplication was OFF, the
+    boot report was silent about it, and two identical edge-triggered alerts were both delivered.
+    """
+    settings = _DuckSettings(state_file=tmp_path / "state.json")  # a Path, not a str
+    alerter = Alerter(settings)  # type: ignore[arg-type]
+
+    assert alerter._dedup_enabled() is True, "a real path was read as no state file at all"
+    assert alerter.state_file_problem() == "", "a usable state file was reported as a problem"
+
+    assert alerter.notify(ERROR, "svc: cond", "1")["ntfy"] == "sent"
+    assert alerter.notify(ERROR, "svc: cond", "2")["ntfy"] == "suppressed", (
+        "de-duplication did not run — the two halves of the state-file check disagree")
+
+
+def test_a_lying_str_subclass_is_still_reported_by_the_backstop() -> None:
+    """The route the backstop's own comment names: a `str` subclass whose `strip()` does not tell
+    the truth passes the public constructor. `str(path)` in the diagnostic re-normalises it to a
+    genuine `str`, so the backstop still sees a blank."""
+    class LyingStr(str):
+        def strip(self, *args: object) -> str:  # type: ignore[override]
+            return "not-blank"
+
+    settings = AlertSettings(service="svc", state_file=LyingStr(""))
+    assert settings.state_file == ""
+    problem = Alerter(settings).state_file_problem()
+    assert "de-duplication is OFF" in problem, (
+        "a blank that lied its way past the constructor was reported as fine")
+
+
 def test_an_error_log_whose_path_raises_does_not_break_the_alert(
         channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
     """⭐ Resolving the error-log path happens INSIDE the record-building guard.
@@ -1334,6 +1415,10 @@ def test_warn_if_unconfigured_survives_a_settings_object_whose_name_raises(
 
     assert ready == ["ntfy"]
     assert "could not be resolved" in caplog.text
+    # The substitute must READ as a substitute. An empty string would render the later lines as
+    # "ALERTING STATE for : ..." — which looks like a formatting bug rather than a settings one,
+    # and sends the reader to the wrong place.
+    assert "<unknown service>" in caplog.text
 
 
 def test_state_file_problem_reports_a_missing_directory(tmp_path: Path) -> None:

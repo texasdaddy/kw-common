@@ -30,10 +30,15 @@ MODULE_PATH = Path(__file__).resolve().parents[1] / "src" / "kw_common" / "alert
 # repository — the exact class of disclosure `scripts/check_no_internal_info.py` exists to stop,
 # and one it structurally cannot catch, because a bare project name has no shape to match.
 #
-# The enumeration was never needed. The property that matters is STRONGER and is stated
-# positively below: after importing this module alone, NOTHING outside the standard library is
-# in `sys.modules`. That covers every consumer module, named or not, including ones that do not
-# exist yet — a hardcoded list only ever covers the ones somebody remembered.
+# The enumeration was never needed. Two positive properties replace it, stated below and scoped
+# honestly: after importing this module alone, (a) nothing outside the standard library is in
+# `sys.modules`, and (b) the sandbox directory supplied nothing but `alerting` itself. Neither
+# needs a list to maintain, and together they cover consumers that do not exist yet.
+#
+# ⚠️ (a) ALONE IS NOT A SUPERSET of the list it replaced — a consumer whose top-level name
+# collides with a standard-library one would be invisible to it. That is what (b) is for: it asks
+# where a module was loaded FROM, which is a question a name cannot answer. See the note on the
+# assertions themselves.
 
 
 def test_the_module_source_is_where_the_test_thinks_it_is() -> None:

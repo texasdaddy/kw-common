@@ -10,11 +10,15 @@ readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "texasdaddy" }]
 keywords = ["alerting", "ops"]
+# ⭐ ONLY THE VERSIONS CI ACTUALLY RUNS. This list claimed 3.11 and 3.13 as well, which CI never
+# measured — and this project's own README says a library that claims a version and is only ever
+# run on another is claiming something nobody checked. `requires-python = ">=3.10"` remains the
+# binding constraint, so 3.11 and 3.13 still install; the classifiers just stop asserting a
+# result no run produced. Adding them back is a one-line matrix change in both workflows, and
+# that is the order to do it in.
 classifiers = [
     "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
     "Intended Audience :: Developers",
     "Topic :: System :: Monitoring",
 ]

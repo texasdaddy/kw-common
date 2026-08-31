@@ -4,7 +4,7 @@ name: release
 # builds the wheel + sdist and attaches them to a GitHub Release, which is what a consumer's
 # pinned install resolves against.
 #
-#   pip install git+https://github.com/texasdaddy/kw-common@v1.2.3
+#   pip install git+https://github.com/texasdaddy/kw-common@vX.Y.Z
 #
 # ⭐ A TAG CAN POINT AT ANY COMMIT — including one that never went through a PR and so never ran
 # ci.yml. That is why the gates below are duplicated here rather than assumed: the guard, the
@@ -52,9 +52,25 @@ jobs:
       #   * a re-tag of an already-released commit.
       # In each case fall back to scanning ALL history reachable from the tag. Slower, once, and
       # the only answer that cannot silently publish an unscanned commit.
-      - name: Scan the commits this tag would publish
+      # ⭐⭐ THE RANGE NAMES THE TAG REF, NOT `HEAD` — and that is the whole point of this step
+      # rather than a detail of it. A TAG ANNOTATION is free prose, authored at release time,
+      # published verbatim on the Release page and carried into every clone. It is the ONLY text
+      # a tag adds that is not already in the scanned commit history, and with `HEAD` in the
+      # range the guard never reads it.
+      #
+      # Measured on this repository: a tag annotated with an RFC1918 address scans CLEAN as
+      # `--range HEAD` (exit 0) and is CAUGHT as `--range refs/tags/<name>` (exit 1,
+      # `<tag object>:6: private IPv4`). The guard has a purpose-written `<tag object>`
+      # remediation branch — deleting and re-cutting the tag, no history rewrite — so it was
+      # built for exactly this and the workflow simply was not asking. Naming the ref is a strict
+      # superset: the same commits are covered either way, plus the tag object itself.
+      - name: Scan the commits AND THE TAG OBJECT this tag would publish
         run: |
           set -eu
+          # `$GITHUB_REF` (refs/tags/<name>), never the bare commit sha: the guard reads a tag
+          # object only when the range NAMES it, so a tag cut at an already-merged commit would
+          # otherwise resolve to zero commits and the annotation would go unread entirely.
+          target="${GITHUB_REF}"
           # Exclude EVERY tag co-located with HEAD, not just this one, or a twin tag becomes the
           # base and the range collapses to nothing.
           excludes=""
@@ -64,21 +80,21 @@ jobs:
           range=""
           count=0
           if [ -n "$base" ]; then
-            range="${base}..HEAD"
+            range="${base}..${target}"
             count="$(git rev-list --count "$range")"
           fi
           if [ "$count" -eq 0 ]; then
             echo "no previous release tag to scan from (or nothing new since it) — scanning ALL"
             echo "history reachable from this tag rather than reporting an empty range as clean"
-            range="HEAD"
-            count="$(git rev-list --count HEAD)"
+            range="${target}"
+            count="$(git rev-list --count "${target}")"
           fi
           if [ "$count" -eq 0 ]; then
             echo "::error::no commits to scan at all. An unrunnable guard must never be"
             echo "::error::reported as a pass."
             exit 1
           fi
-          echo "scanning ${range} (${count} commit(s))"
+          echo "scanning ${range} (${count} commit(s), plus the tag object itself)"
           python scripts/check_no_internal_info.py --range "$range"
 
   test:
@@ -139,8 +155,11 @@ jobs:
           # fails closed — an unanswerable check must never read as a pass on a publish path —
           # but a failure that misdescribes itself sends the next person to fix the wrong thing.
           #
-          # `|| true` on the substitution because `set -e` would otherwise abort here on an
-          # unresolvable ref, printing a bare `fatal:` instead of the guidance below.
+          # `|| true` on the substitution because `set -e` would otherwise abort the whole
+          # step here on an unresolvable ref — and with `2>/dev/null` on the same line the
+          # step would then fail having printed NOTHING at all, rather than the guidance
+          # below. The redirect and the `|| true` are a pair; removing either loses the
+          # message.
           if [ "${GITHUB_REF}" = "${GITHUB_REF#refs/tags/}" ]; then
             # workflow_dispatch on a BRANCH. The file documents that entry point, so it is a real
             # path — and telling someone to `git tag -d main` would be actively harmful advice.

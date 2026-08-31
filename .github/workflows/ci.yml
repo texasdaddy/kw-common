@@ -142,6 +142,34 @@ jobs:
         run: |
           python -m pip install --upgrade pip build
           python -m build
+      # ⭐ THE SDIST IS AN ARTIFACT TOO, and until this step nothing looked inside it. Two
+      # properties, each of which has already been wrong once:
+      #   * `tests/conftest.py` must be PRESENT — setuptools' default sdist takes `tests/test*.py`
+      #     and not `conftest.py`, so the released tarball shipped tests without the autouse
+      #     fixtures they depend on, including the one that makes "no test reaches the network"
+      #     true. `MANIFEST.in` fixes that, and this is what keeps it fixed.
+      #   * `scripts/` must be ABSENT — the leak guard is a CI tool for this repository, and its
+      #     docstring names the fleet's other repositories, so shipping it put that list inside
+      #     every tarball attached to a public Release.
+      # Both are one line of `MANIFEST.in` away from regressing, with nothing else watching.
+      - name: The sdist carries its fixtures and nothing it should not
+        run: |
+          set -eu
+          sdist="$(ls dist/*.tar.gz)"
+          echo "inspecting ${sdist}"
+          names="$(tar tzf "$sdist")"
+          echo "$names" | grep -q '/tests/conftest.py$' || {
+            echo "::error::the sdist has no tests/conftest.py — its suite ships without the"
+            echo "::error::autouse fixtures it depends on. Check MANIFEST.in."
+            exit 1
+          }
+          if echo "$names" | grep -q '/scripts/'; then
+            echo "::error::the sdist contains scripts/. The leak guard is a CI tool for this"
+            echo "::error::repository and its docstring names other repositories; it must not be"
+            echo "::error::published inside a release artifact. Check MANIFEST.in."
+            exit 1
+          fi
+          echo "sdist contents are as intended"
       - name: Install the wheel into a clean environment and import it
         # A throwaway venv, and `--no-index` so nothing can be silently satisfied from PyPI: this
         # asserts the library needs no third-party package at install time either.

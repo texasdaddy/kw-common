@@ -50,5 +50,17 @@ every service runs the same code instead of a copy that drifts.
 - Configuration that used to be read from the environment is now passed in. There is no default
   path for the email settings file, the state file or the error log: an unset sink is OFF and says
   so at boot, rather than silently succeeding into a container's disposable layer.
+- ⚠️ **A BLANK path is REFUSED at construction; `None` is how you turn a sink off.** This is the
+  one migration detail likely to bite, because the obvious port of an environment-driven service
+  is `state_file=os.environ.get("ALERT_STATE_FILE", "")` — and a container platform that passes
+  every unset optional Variable as an empty string makes that the common case rather than the
+  exotic one. A blank behaving like `None` would disable de-duplication silently, so
+  `AlertSettings(...)` raises `ValueError` naming the field and what its blank would have cost.
+  Port it as `os.environ.get("ALERT_STATE_FILE") or None`.
+- `os.PathLike` is accepted for all three path settings, so `pathlib.Path` works everywhere a
+  `str` does.
+- `read_jsonl_tail(backups=...)` no longer takes `None` as a sentinel meaning "use the module
+  default" — `Alerter.read_errors()` passes the settings' value, so the reader and the roller
+  cannot disagree. Calling the function directly with `backups=None` raises; see issue #5.
 
 [1.0.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.0.0

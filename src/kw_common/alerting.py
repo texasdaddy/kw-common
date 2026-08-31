@@ -1344,9 +1344,21 @@ class Alerter:
 
         Gated at the two functions that touch the filesystem rather than at each of their callers,
         because a caller added later would not know to ask.
+
+        ⭐ `str(path)`, MATCHING `state_file_problem()` EXACTLY. These two ask the same question —
+        "is there a usable state file here?" — and they must not be able to answer it
+        differently. They could: the diagnostic normalised with `str(path)` while this did a raw
+        `path.strip()`, so a settings object carrying a `Path` (which only reaches here by
+        bypassing `AlertSettings`, the same population the diagnostic's backstop exists for) made
+        this raise `AttributeError`. The fail-open guard in `notify()` swallowed it, so
+        de-duplication was silently OFF while the boot report said nothing was wrong — measured:
+        two identical edge-triggered alerts both delivered.
+
+        Same shape as the roller/reader generation-count invariant elsewhere in this module: two
+        sides of one question, so they read it from one expression.
         """
         path = self.settings.state_file
-        return bool(path and path.strip())
+        return bool(path and str(path).strip())
 
     def _read_state(self) -> dict[str, dict]:
         """Currently-firing conditions, keyed by title. A missing or unusable file means "nothing

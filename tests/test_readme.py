@@ -97,6 +97,53 @@ def test_the_pin_an_exact_tag_rule_is_stated() -> None:
     assert "Never pin a branch" in README.read_text(encoding="utf-8")
 
 
+def test_no_shipped_file_pins_a_version_this_package_is_not() -> None:
+    """⭐ THE DRIFT CLASS, NOT JUST THE README INSTANCE.
+
+    The README install line was made to derive from `kw_common.__version__`; the package's own
+    `__init__.py` docstring carries the same `@vX.Y.Z` install example and was left as a literal,
+    so it would drift silently on the next bump. Fixing the reported instance and leaving its
+    sibling is the recurring miss in this repository, so this asks the question of EVERY tracked
+    file that shows an install line rather than of one of them.
+    """
+    import kw_common
+
+    expected = f"@v{kw_common.__version__}"
+    # ⚠️ ASSEMBLED FROM FRAGMENTS, and this file is skipped below. A scanner that searches for a
+    # literal will find that literal in its own source — the same self-match that trips a leak
+    # guard's own test file. Both halves are needed: the fragments keep the marker out of any
+    # OTHER matcher, and the skip keeps this file out of its own results.
+    marker = "github.com/texasdaddy/" + "kw-common@"
+    root = Path(__file__).resolve().parents[1]
+    stale: list[str] = []
+    checked = 0
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix not in (".md", ".py", ".toml", ".in", ".yml"):
+            continue
+        if path.resolve() == Path(__file__).resolve():
+            continue  # the scanner is not one of the scanned
+        if any(part in {".git", ".venv", "dist", "build", ".mypy_cache", ".ruff_cache",
+                        ".pytest_cache"} for part in path.parts):
+            continue
+        for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if marker not in line:
+                continue
+            # Only a CONCRETE pin — `@v` followed by a digit. A documented placeholder like
+            # `@vX.Y.Z` is not a version anyone would copy, and demanding it track the release
+            # would be the same backwards incentive this test exists to remove.
+            after = line.split(marker, 1)[1]
+            if not after.startswith("v") or not after[1:2].isdigit():
+                continue
+            checked += 1
+            if expected not in line:
+                stale.append(f"{path.relative_to(root)}:{n}: {line.strip()}")
+    assert checked >= 2, (
+        f"only {checked} install line(s) found — this test is no longer looking where the "
+        f"install examples live")
+    assert stale == [], (
+        f"these pin a version this package is not ({kw_common.__version__}):\n" + "\n".join(stale))
+
+
 def test_the_install_line_names_the_version_this_package_actually_is() -> None:
     """⭐ DERIVED FROM `kw_common.__version__`, NOT PINNED TO A LITERAL.
 
