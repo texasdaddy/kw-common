@@ -1,0 +1,159 @@
+name: CI
+
+# Single-branch model: `feature/*` / `fix/*` → PR → `main`. There is no `dev` line, no container
+# and no registry — this repository is a LIBRARY, and a release is an annotated `v*` tag handled
+# by release.yml.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  # A superseded PR run costs a runner slot something else needs. Cancel those — but never a
+  # `main` push.
+  #
+  # ⚠️ THE SHA IN THE GROUP IS NOT DECORATION. For a push the expression below evaluates false,
+  # and a FALSE `cancel-in-progress` does not mean "never cancelled": a group holds at most one
+  # PENDING run, so on a shared group two merges inside one run's lifetime cancel the queued one
+  # while it is still waiting — and that commit is never leak-scanned, linted or tested. Keying
+  # push runs by SHA gives each commit its own group.
+  group: ci-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# ⭐ EVERY JOB HERE RUNS ON GITHUB-HOSTED RUNNERS, AND THAT IS A SECURITY DECISION, NOT A DEFAULT.
+# Several sibling repositories run CI on the self-hosted fleet. They are all PRIVATE and take no
+# outside fork PRs, which is the argument that makes it safe there. **This repository is PUBLIC**,
+# so a `pull_request` from any fork would execute that fork's `pytest` — arbitrary code — on a
+# persistent machine inside a private network. Do not move these jobs to the fleet.
+
+jobs:
+  # ⚠️ A JOB NAME IS A STATUS-CHECK CONTEXT. If `main` is ever given branch protection listing
+  # these names, renaming one does not fail the check — the required context simply never reports
+  # and every PR sits BLOCKED with green jobs and no explanation. Change the protection rule
+  # first, then the name.
+  no-internal-info:
+    name: No internal info (leak guard)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The COMMIT-RANGE scan below needs real history; the default shallow checkout has
+          # none, and `git rev-list base..head` on it FAILS rather than silently scanning zero
+          # commits (the script turns that failure into exit 1 on purpose).
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Self-test the patterns, then scan the working tree
+        run: |
+          python scripts/check_no_internal_info.py --selftest
+          python scripts/check_no_internal_info.py
+      # TWO DIFFERENT QUESTIONS, so two scans. The tree scan above answers "is the leak here
+      # NOW", and it reads `git ls-files` — TRACKED files only. It is blind to a value committed
+      # and then deleted, which stays permanently readable at the commit that added it.
+      #
+      # The range scan reads what each COMMIT added, so it sees that. Catching it before the
+      # merge is the difference between an amend and a history rewrite across every clone.
+      - name: Scan the commits being published
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_HEAD: ${{ github.sha }}
+        run: |
+          set -eu
+          z40=0000000000000000000000000000000000000000
+          if [ "$EVENT" = "pull_request" ]; then
+            range="$PR_BASE..$PR_HEAD"
+          elif [ -z "$PUSH_BEFORE" ] || [ "$PUSH_BEFORE" = "$z40" ]; then
+            # The branch was created by this push, so there is no previous tip. Scan the commit
+            # itself rather than reporting clean — "I could not work out a range" must never be
+            # a pass, which is the one failure mode a leak guard cannot have.
+            if git rev-parse --verify -q "${PUSH_HEAD}^" >/dev/null; then
+              range="${PUSH_HEAD}^..${PUSH_HEAD}"
+            else
+              range="$PUSH_HEAD"   # root commit: scan all of it
+            fi
+          else
+            range="$PUSH_BEFORE..$PUSH_HEAD"
+          fi
+          echo "range: $range"
+          python scripts/check_no_internal_info.py --range "$range"
+
+  test:
+    # ⭐ 3.10 AND 3.12, BOTH REQUIRED. `requires-python = ">=3.10"` is a promise to six consuming
+    # repositories, and the 3.10/3.12 split has reddened fleet CI twice — a library that claims
+    # 3.10 and is only ever run on 3.12 is claiming something nobody measured. The floor is not
+    # cosmetic here: `datetime.fromisoformat` learned `Z` in 3.11, and this library writes `Z`
+    # into its own records.
+    name: Lint, type-check and test (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false  # a 3.10-only break must be visible even when 3.12 is red too
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install the package and the pinned tooling
+        # EXACT pins — a ruff patch can add a rule, and a linter that changes under an unchanged
+        # tree reddens CI for reasons that have nothing to do with the commit. New tool versions
+        # are adopted deliberately, as their own change.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install "ruff==0.16.1" "mypy==2.3.0" "pytest==9.1.1" \
+                                "pytest-timeout==2.4.0"
+      - name: Lint
+        run: ruff check .
+      - name: Type-check
+        run: mypy
+      - name: Test
+        # `-u` so output is unbuffered: a block-buffered stdout is what makes a hung run look
+        # like a slow one. The per-test timeout lives in pyproject's `addopts`.
+        run: python -u -m pytest
+
+  # The install path a consumer actually uses. Everything above runs against the working tree
+  # with an editable install; NONE of it would notice a `pyproject.toml` that does not package
+  # the module — a missing `packages.find`, a wrong `where`, a module left out of the wheel.
+  # That failure surfaces only at `pip install` time, in the consumer's repository, after the tag
+  # has been cut.
+  packaging:
+    name: The built wheel installs and imports
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.10"  # the FLOOR: the version a consumer is most likely to break on
+      - name: Build the wheel and the sdist
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - name: Install the wheel into a clean environment and import it
+        # A throwaway venv, and `--no-index` so nothing can be silently satisfied from PyPI: this
+        # asserts the library needs no third-party package at install time either.
+        run: |
+          set -eu
+          python -m venv /tmp/consumer
+          /tmp/consumer/bin/python -m pip install --upgrade pip
+          /tmp/consumer/bin/python -m pip install --no-index dist/*.whl
+          cd /tmp   # away from the source tree, so a passing import cannot come from `src/`
+          /tmp/consumer/bin/python -c "
+          import kw_common, kw_common.alerting as a
+          print('version:', kw_common.__version__)
+          print('exports:', len(a.__all__))
+          assert a.notify and a.AlertSettings and a.configure
+          "
