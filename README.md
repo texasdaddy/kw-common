@@ -41,7 +41,9 @@ the release notes name every consumer that needs a code change.
 Modules are **independently importable**. `import kw_common` pulls in nothing; take what you need:
 
 ```python
-from kw_common.alerting import AlertSettings, configure, notify, OK, WARN, ERROR
+from kw_common.alerting import (
+    AlertSettings, configure, notify, warn_if_unconfigured, OK, WARN, ERROR,
+)
 
 configure(AlertSettings(
     service="my-service",
@@ -136,7 +138,26 @@ would make it a fork, and a forked guard is exactly the drift this library exist
 it upstream and re-copy the whole file.
 
 Placeholders in code, tests, comments and documentation come from the guard's own `_MUST_PASS`
-corpus: `example.com` and `*.invalid` for hosts, the RFC 5737 documentation ranges
-(`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) for addresses, and `/mnt/POOL/appdata/<app>`
-or the container path the code actually uses for filesystem paths. "Realistic" is not a reason to
-write a real value.
+corpus — the list of shapes it is pinned to *allow*: `example.com` and `*.example` for hosts, the
+RFC 5737 documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) for addresses,
+and `/mnt/POOL/appdata/<app>` or the container path the code actually uses for filesystem paths.
+"Realistic" is not a reason to write a real value.
+
+⚠️ `*.invalid` is **not** in `_MUST_PASS`, and it is not a blanket-safe suffix. `example.invalid`
+passes, but the freemail pattern matches on the mail *provider* and ignores the TLD — so an
+address at one of the big consumer mail providers is a **denied** shape even with `.invalid`
+stuck on the end, and it reddens CI on a line containing no real data.
+
+That paragraph cannot show you the failing example, and the reason is worth knowing: the guard
+scans this file too, so writing the denied literal here would redden CI on the very sentence
+warning you about it. Ask the guard instead of guessing — if a placeholder is not already in
+`_MUST_PASS`, check it before committing:
+
+```
+python scripts/check_no_internal_info.py --selftest
+```
+
+```
+python -c "import sys; sys.path.insert(0,'scripts'); import check_no_internal_info as g; \
+print(g.scan_text('YOUR PLACEHOLDER HERE', g.compile_patterns()) or 'allowed')"
+```

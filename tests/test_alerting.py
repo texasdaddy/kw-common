@@ -17,6 +17,7 @@ import subprocess
 import sys
 import urllib.error
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -293,13 +294,7 @@ def test_email_is_not_ready_when_nothing_is_configured(
 
 def test_a_separator_only_recipient_list_is_a_reported_misconfiguration(
         settings: AlertSettings, caplog: pytest.LogCaptureFixture) -> None:
-    """⭐ THE LOAD-BEARING ORDERING. `EMAIL_TO=;` is non-empty, so the raw `any()` shortcut passes
-    and the check proceeds to normalisation, where EMAIL_TO resolves to nothing and is REPORTED.
-
-    Counting the RESOLVED values in the shortcut instead would make all five look absent and
-    return False with NO log line at all — reclassifying a real misconfiguration as "nothing
-    configured", which is this module's one unforgivable failure: going quiet.
-    """
+    """`EMAIL_TO=;` alongside the other four settings must be REPORTED, not passed over."""
     write_email_config(settings, EMAIL_TO=";")
     with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
         assert AlertConfig.load(settings).email_ready() is False
@@ -307,13 +302,56 @@ def test_a_separator_only_recipient_list_is_a_reported_misconfiguration(
     assert "missing or unusable" in caplog.text
 
 
+def test_a_file_holding_only_a_separator_recipient_is_reported_not_called_unconfigured(
+        settings: AlertSettings, caplog: pytest.LogCaptureFixture) -> None:
+    """⭐⭐ THE LOAD-BEARING ORDERING, AND THE ONLY INPUT THAT PINS IT.
+
+    `email_ready()` asks `any(...)` of the RAW values BEFORE normalising `EMAIL_TO`. Swap those
+    two steps and this is the file that changes answer — which is why the test above, written
+    with all five settings present, could not tell the orderings apart and let the swap survive
+    a mutation sweep:
+
+        file = {EMAIL_TO: ";", + the other four}   raw any()=True,  resolved any()=True   (same)
+        file = {EMAIL_TO: ";"}  <- this test       raw any()=True,  resolved any()=False  (differs)
+
+    With the RAW ordering the shortcut does not fire, so normalisation runs and the
+    misconfiguration is REPORTED by name. With the RESOLVED ordering all five look absent, and
+    the function returns False having logged NOTHING — silently reclassifying a real
+    misconfiguration as "nothing was configured". Going quiet is this module's one unforgivable
+    failure, so the ordering is pinned here rather than merely described in a comment.
+    """
+    assert settings.config_file is not None
+    Path(settings.config_file).write_text("EMAIL_TO=;\n", encoding="utf-8")
+
+    with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
+        assert AlertConfig.load(settings).email_ready() is False
+
+    assert "EMAIL_TO" in caplog.text, (
+        "email_ready() went SILENT on a real misconfiguration — the `any()` shortcut is asking "
+        "the RESOLVED values instead of the raw ones")
+    assert "missing or unusable" in caplog.text
+
+
 def test_email_readiness_never_names_the_password(
         settings: AlertSettings, caplog: pytest.LogCaptureFixture) -> None:
-    write_email_config(settings, SMTP_PASSWORD="", EMAIL_TO="ops@example.com")
+    """The complaint names the SETTING, never its value.
+
+    ⚠️ The password must be PRESENT for this to mean anything. An earlier version blanked
+    `SMTP_PASSWORD` to provoke the complaint and then asserted its value was absent from the log
+    — but a blanked password is never written to the config file at all, so that assertion could
+    not fail whatever the code did. Here the password is real and a DIFFERENT required setting is
+    blanked, so the value is genuinely present in the config the code just read.
+    """
+    secret = "s3cret-app-password"  # noqa: S105 — a fixture value, and the point of the test
+    write_email_config(settings, SMTP_PASSWORD=secret, SMTP_USER="")
     with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
-        AlertConfig.load(settings).email_ready()
-    assert "SMTP_PASSWORD" in caplog.text  # the NAME
-    assert "not-a-real-password" not in caplog.text  # never the value
+        assert AlertConfig.load(settings).email_ready() is False
+
+    assert "SMTP_USER" in caplog.text          # the NAME of what is missing
+    assert secret not in caplog.text           # never the value of what is not
+    # And the password is really in the config the check just read, so the assertion above is
+    # answering a question that could have gone the other way.
+    assert AlertConfig.load(settings).email["SMTP_PASSWORD"] == secret  # type: ignore[index]
 
 
 @pytest.mark.parametrize("url", [
@@ -462,6 +500,168 @@ def test_a_self_referencing_cause_chain_does_not_spin_forever() -> None:
     exc = RuntimeError("loop")
     exc.__cause__ = exc
     assert alerting._is_cert_failure(exc) is False
+
+
+# ================================================================= the channels THEMSELVES
+# ⭐ WHY THIS SECTION EXISTS. Every test above replaces `_CHANNELS` with spies, so until these
+# were written NOTHING executed `_send_email` or `_post_ntfy` — the two functions that actually
+# talk to the outside world. A mutation sweep confirmed the hole: dropping the TLS context,
+# deleting the `login()`, never calling `send_message()`, and — sharpest of all — replacing
+# `msg["To"] = _recipients(...)` with the raw value ALL survived a fully green suite. That last
+# one un-does this module's headline recipient fix at the ONE place it ships, while
+# `_recipients` itself stays exhaustively unit-tested.
+#
+# These use in-process fakes rather than a socket: the point is what the module ASKS the
+# transport to do, which is exactly what a spy can answer and a live server cannot, reliably.
+
+
+class FakeSMTP:
+    """Records the whole conversation `_send_email` drives. Never raises by itself."""
+
+    instances: ClassVar[list[FakeSMTP]] = []
+
+    def __init__(self, host: str, port: int, timeout: float | None = None) -> None:
+        self.host, self.port, self.timeout = host, port, timeout
+        self.starttls_context: ssl.SSLContext | None = None
+        self.starttls_called = False
+        self.login_args: tuple[str, str] | None = None
+        self.sent: list[object] = []
+        FakeSMTP.instances.append(self)
+
+    def __enter__(self) -> FakeSMTP:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+    def starttls(self, context: ssl.SSLContext | None = None) -> None:
+        self.starttls_called = True
+        self.starttls_context = context
+
+    def login(self, user: str, password: str) -> None:
+        self.login_args = (user, password)
+
+    def send_message(self, msg: object) -> None:
+        self.sent.append(msg)
+
+
+@pytest.fixture
+def fake_smtp(monkeypatch: pytest.MonkeyPatch) -> type[FakeSMTP]:
+    FakeSMTP.instances = []
+    monkeypatch.setattr(alerting.smtplib, "SMTP", FakeSMTP)
+    return FakeSMTP
+
+
+def test_send_email_normalises_the_recipient_header_before_it_is_sent(
+        settings: AlertSettings, fake_smtp: type[FakeSMTP]) -> None:
+    """⭐ The headline `;` fix, asserted AT THE SEND SITE rather than only on the helper.
+
+    `smtplib.send_message()` derives its recipient list from the `To` header, so a `;` reaching
+    it silently costs recipients. `_recipients` is unit-tested to death above; this is the test
+    that `_send_email` actually CALLS it.
+    """
+    write_email_config(settings, EMAIL_TO="a@example.com;b@example.com")
+    cfg = AlertConfig.load(settings)
+
+    alerting._send_email(cfg, alerting.SEVERITIES[ERROR], "svc: down", "refused")
+
+    (smtp,) = fake_smtp.instances
+    (msg,) = smtp.sent
+    assert msg["To"] == "a@example.com, b@example.com", (
+        "the raw EMAIL_TO reached the header — send_message() will drop a recipient in silence")
+    assert msg["Subject"] == "[ERROR] svc: down"
+    assert msg["From"] == "svc@example.com"
+    assert msg.get_content().strip() == "refused"
+
+
+def test_send_email_verifies_the_server_certificate(
+        settings: AlertSettings, fake_smtp: type[FakeSMTP]) -> None:
+    """⭐ `starttls()` with NO context does not verify the server: smtplib falls back to a
+    check_hostname=False / CERT_NONE context, so the channel is encrypted but unauthenticated and
+    anyone able to intercept the egress collects the app password on the next `login()`.
+
+    That is the whole reason the password lives in a file rather than the environment, so the
+    context is asserted here — and it is asserted BEFORE the login, because the ordering is what
+    makes it matter.
+    """
+    write_email_config(settings)
+    cfg = AlertConfig.load(settings)
+
+    alerting._send_email(cfg, alerting.SEVERITIES[WARN], "svc: slow", "p95 up")
+
+    (smtp,) = fake_smtp.instances
+    assert smtp.starttls_called, "STARTTLS was never negotiated"
+    ctx = smtp.starttls_context
+    assert ctx is not None, "starttls() was called with NO context — the server is unverified"
+    assert ctx.check_hostname is True
+    assert ctx.verify_mode is ssl.CERT_REQUIRED
+    assert smtp.login_args == ("svc@example.com", "not-a-real-password")
+    assert smtp.timeout == alerting.SMTP_TIMEOUT_S, "an SMTP send with no timeout can hang forever"
+
+
+def test_send_email_uses_the_configured_port_and_host(
+        settings: AlertSettings, fake_smtp: type[FakeSMTP]) -> None:
+    """The one path that proves a VALID SMTP_PORT reaches the transport. `smtp_port()`'s
+    `return int(raw)` branch is otherwise never executed by anything."""
+    write_email_config(settings, SMTP_PORT="2525")
+    alerting._send_email(AlertConfig.load(settings), alerting.SEVERITIES[ERROR], "t", "m")
+    (smtp,) = fake_smtp.instances
+    assert (smtp.host, smtp.port) == ("smtp.example.com", 2525)
+
+
+def test_post_ntfy_sends_the_body_and_the_severity_headers(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """The headers ARE the rendering: ntfy turns the `Tags` NAME into the emoji, and `Priority`
+    decides whether the phone buzzes. Swapping the two survived a mutation sweep."""
+    captured: dict[str, object] = {}
+
+    def fake_urlopen(req: object, timeout: float | None = None) -> object:
+        captured["url"] = req.full_url  # type: ignore[attr-defined]
+        captured["data"] = req.data  # type: ignore[attr-defined]
+        captured["headers"] = dict(req.headers)  # type: ignore[attr-defined]
+        captured["timeout"] = timeout
+
+        class Response:
+            def read(self) -> bytes:
+                return b"ok"
+
+        return Response()
+
+    monkeypatch.setattr(alerting.urllib.request, "urlopen", fake_urlopen)
+    cfg = AlertConfig(ntfy_url="https://ntfy.example.com/svc")
+
+    alerting._post_ntfy(cfg, alerting.SEVERITIES[ERROR], "svc: down", "connection refused")
+
+    assert captured["url"] == "https://ntfy.example.com/svc"
+    assert captured["data"] == b"connection refused"
+    assert captured["timeout"] == alerting.NTFY_TIMEOUT_S
+    headers = captured["headers"]
+    assert headers["Title"] == "[ERROR] svc: down"
+    assert headers["Priority"] == "urgent"
+    assert headers["Tags"] == "red_circle"
+
+
+def test_post_ntfy_keeps_the_title_header_ascii(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`http.client` encodes header values latin-1, so putting the emoji itself in `Title` raises
+    `UnicodeEncodeError` before anything is sent. The emoji travels as a TAG NAME instead — this
+    pins that the severity table's `emoji` field never reaches a header."""
+    seen: dict[str, object] = {}
+
+    def fake_urlopen(req: object, timeout: float | None = None) -> object:
+        seen.update(dict(req.headers))  # type: ignore[attr-defined]
+
+        class Response:
+            def read(self) -> bytes:
+                return b"ok"
+
+        return Response()
+
+    monkeypatch.setattr(alerting.urllib.request, "urlopen", fake_urlopen)
+    for severity in (OK, WARN, ERROR):
+        alerting._post_ntfy(AlertConfig(ntfy_url="https://ntfy.example.com/t"),
+                            alerting.SEVERITIES[severity], "svc: x", "m")
+        for name, value in seen.items():
+            assert str(value).isascii(), f"{name} header is not latin-1 safe: {value!r}"
 
 
 # ============================================================ edge-trigger / escalate / clears
@@ -902,6 +1102,85 @@ def test_settings_strip_the_service_name() -> None:
     assert AlertSettings(service="  svc  ").service == "svc"
 
 
+@pytest.mark.parametrize("name", ["config_file", "state_file", "error_log"])
+@pytest.mark.parametrize("blank", ["", "   ", "\t"])
+def test_settings_refuse_a_blank_path_rather_than_silently_disabling_it(
+        name: str, blank: str) -> None:
+    """⭐⭐ THE MISCONFIGURATION THIS LIBRARY IS MOST LIKELY TO MEET.
+
+    The natural port of an environment-driven consumer is
+    `state_file=os.environ.get("ALERT_STATE_FILE", "")`, and a container platform that passes
+    every unset optional Variable as an EMPTY STRING makes that the common case. A blank that
+    behaves like `None` disables de-duplication silently: every escalating condition then
+    re-pages at the caller's full cycle rate with no backoff, and nothing says why.
+
+    `None` means off and is spelled `None`. A blank is a mistake and is refused at construction,
+    where an operator can still see it.
+    """
+    with pytest.raises(ValueError, match=name):
+        AlertSettings(service="svc", **{name: blank})  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("name", ["config_file", "state_file", "error_log"])
+def test_settings_accept_a_pathlike_for_every_path(name: str, tmp_path: Path) -> None:
+    """`Path(...)` is the obvious thing to hand a public library, and it used to work for two of
+    these three and break the third — `state_file` reached `.strip()` and raised, so
+    de-duplication went silently off and every notification logged a traceback. All three now
+    coerce, so the asymmetry cannot come back."""
+    settings = AlertSettings(service="svc", **{name: tmp_path / "thing.json"})  # type: ignore[arg-type]
+    value = getattr(settings, name)
+    assert isinstance(value, str)
+    assert value == str(tmp_path / "thing.json")
+
+
+def test_a_pathlike_state_file_still_de_duplicates(tmp_path: Path,
+                                                   channels: dict[str, Spy]) -> None:
+    """The behavioural half of the test above: coercion is only worth anything if the resulting
+    alerter actually de-duplicates."""
+    alerter = Alerter(AlertSettings(service="svc", ntfy_url="https://ntfy.example.com/t",
+                                    state_file=tmp_path / "state.json"))  # type: ignore[arg-type]
+    assert alerter.notify(ERROR, "svc: x", "1")["ntfy"] == "sent"
+    assert alerter.notify(ERROR, "svc: x", "2")["ntfy"] == "suppressed"
+    assert alerter.state_file_problem() == ""
+
+
+@pytest.mark.parametrize("name", ["config_file", "state_file", "error_log"])
+def test_settings_refuse_a_path_that_is_not_a_path(name: str) -> None:
+    with pytest.raises(ValueError, match=name):
+        AlertSettings(service="svc", **{name: 17})  # type: ignore[arg-type]
+
+
+def test_an_error_log_whose_path_raises_does_not_break_the_alert(
+        channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ Resolving the error-log path happens INSIDE the record-building guard.
+
+    It sat outside, which made `_append_error_record`'s own docstring false: `self.settings` is
+    an attribute access, and an attribute access can run arbitrary code. A duck-typed or lazily
+    resolved settings object is enough to reach it, and the exception travelled straight out of
+    `notify()` — into a caller that is usually already inside an `except` handler.
+    """
+    class ExplodingSettings:
+        service = "svc"
+        config_file = None
+        ntfy_url = "https://ntfy.example.com/t"
+        state_file = None
+        max_record_field = 4000
+        max_tracked_conditions = 200
+        error_log_max_bytes = 1_000_000
+        error_log_backups = 1
+
+        @property
+        def error_log(self) -> str:
+            raise RuntimeError("the settings object resolves this lazily and it failed")
+
+    alerter = Alerter(ExplodingSettings())  # type: ignore[arg-type]
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        results = alerter.notify(ERROR, "svc: x", "...")
+
+    assert results["ntfy"] == "sent", "a broken error-log path cost the notification"
+    assert "could not build an error-log record" in caplog.text
+
+
 @pytest.mark.parametrize("name", ["error_log_max_bytes", "error_log_backups", "max_record_field",
                                   "max_tracked_conditions"])
 @pytest.mark.parametrize("bad", [0, -1, 1.5, True, "10"])
@@ -997,6 +1276,53 @@ def test_module_warn_if_unconfigured_without_configure_names_the_service(
     assert "svc" in caplog.text
 
 
+def test_the_unconfigured_path_never_raises_either(tmp_path: Path) -> None:
+    """⭐⭐ THE UNCONFIGURED BRANCH IS HELD TO THE SAME STANDARD AS THE CONFIGURED ONE.
+
+    It was not, and that was the worst possible place to be lax: the population this branch
+    exists to protect is exactly the process that got its startup wrong, and it died inside the
+    caller's `except` handler instead of logging. Two causes, both fixed —
+    `SEVERITIES.get(severity)` was unguarded (`dict.get` propagates whatever the key's own
+    `__hash__` raises), and the message was built with an EAGER f-string, which evaluates the
+    caller's `__repr__` at the call site before `logging` is ever reached.
+
+    ⚠️ IN A SUBPROCESS, for the same reason as
+    `test_notify_does_not_raise_even_when_str_itself_raises`: pytest's log handler overrides
+    `handleError` and RE-RAISES formatting errors, while the stdlib prints them to stderr and
+    returns. Measured — an in-process version of this test fails on all four hostile cases
+    against code that is correct, which would have sent me chasing a defect that does not exist.
+    """
+    probe = tmp_path / "probe_unconfigured.py"
+    probe.write_text(
+        "import logging, sys\n"
+        "from kw_common import alerting\n"
+        "from kw_common.alerting import ERROR\n"
+        "logging.basicConfig(level=logging.CRITICAL)\n"
+        "assert alerting.current_alerter() is None\n"
+        "class Hostile:\n"
+        "    def __str__(self): raise RuntimeError('no str')\n"
+        "    def __repr__(self): raise RuntimeError('no repr')\n"
+        "cases = {\n"
+        "    'unhashable severity': (['ERROR'], 'svc: t', 'm'),\n"
+        "    'hostile severity':    (Hostile(), 'svc: t', 'm'),\n"
+        "    'hostile title':       (ERROR, Hostile(), 'm'),\n"
+        "    'hostile message':     (ERROR, 'svc: t', Hostile()),\n"
+        "}\n"
+        "for label, args in cases.items():\n"
+        "    got = alerting.notify(*args)\n"
+        "    assert got == {'email': 'skipped', 'ntfy': 'skipped'}, (label, got)\n"
+        "assert alerting.warn_if_unconfigured(Hostile()) == []\n"
+        "sys.stdout.write('SURVIVED')\n",
+        encoding="utf-8")
+
+    result = subprocess.run([sys.executable, probe.name], cwd=tmp_path, capture_output=True,
+                            encoding="utf-8", errors="replace", timeout=60, check=False)
+
+    assert result.stdout.strip() == "SURVIVED", (
+        f"the unconfigured path let a caller's bad argument escape:\nstdout={result.stdout}\n"
+        f"stderr={result.stderr}")
+
+
 def test_configure_replaces_a_previous_default(settings: AlertSettings) -> None:
     first = alerting.configure(settings)
     second = alerting.configure(AlertSettings(service="other"))
@@ -1013,11 +1339,17 @@ def test_everything_in_dunder_all_exists() -> None:
 
 
 def test_the_extracted_surface_is_exported() -> None:
-    """The symbols this library was created to stop six repos from copying."""
-    for name in ["notify", "warn_if_unconfigured", "configure", "AlertConfig", "AlertSettings",
-                 "Alerter", "smtp_port_fault", "read_jsonl_tail", "parse_since",
-                 "MIN_SMTP_PORT", "MAX_SMTP_PORT", "OK", "WARN", "ERROR"]:
-        assert name in alerting.__all__, f"{name} must be part of the public contract"
+    """The symbols this library was created to stop six repos from copying.
+
+    This list is deliberately hardcoded — it is the CONTRACT, so it must be written down
+    independently of `__all__` rather than read from it. A test that read `__all__` here would
+    agree with any `__all__`, including one that had quietly dropped a name.
+    """
+    required = {"notify", "warn_if_unconfigured", "configure", "AlertConfig", "AlertSettings",
+                "Alerter", "smtp_port_fault", "read_jsonl_tail", "parse_since",
+                "MIN_SMTP_PORT", "MAX_SMTP_PORT", "OK", "WARN", "ERROR"}
+    missing = sorted(required - set(alerting.__all__))
+    assert missing == [], f"{missing} must be part of the public contract"
 
 
 def test_the_port_bounds_are_a_tcp_port() -> None:

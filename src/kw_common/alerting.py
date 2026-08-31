@@ -336,6 +336,41 @@ class AlertSettings:
             raise ValueError("AlertSettings.service must be a non-blank name for this service")
         # Normalise once so nothing downstream has to remember to strip it.
         object.__setattr__(self, "service", self.service.strip())
+
+        # ⭐⭐ A BLANK PATH IS REFUSED, NOT TREATED AS "OFF". This is the single likeliest way to
+        # misconfigure this library, and it used to fail SILENTLY in the worst direction.
+        #
+        # The natural port of an environment-driven consumer is
+        # `state_file=os.environ.get("ALERT_STATE_FILE", "")` — and a container platform that
+        # passes every unset optional Variable as an EMPTY STRING makes that the common case, not
+        # the exotic one. Before this check, `""` disabled de-duplication exactly as `None` does,
+        # so every escalating condition re-paged at the caller's full cycle rate with no backoff,
+        # and the one boot line the operator got said "set it to a path, or to None to disable" —
+        # pointing away from the cause, because blank was neither.
+        #
+        # `None` means OFF and is spelled `None`; anything else must be a real path. The two
+        # states are now distinguishable at the only moment a human can act on the difference.
+        for name in ("config_file", "state_file", "error_log"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            # `os.PathLike` accepted and coerced: `Path(...)` is the obvious thing to pass a
+            # public library, and it used to work for `error_log`/`config_file` (which reach
+            # `open()`) while breaking `state_file` (which reaches `.strip()`) — an asymmetry
+            # that showed up as de-duplication silently off plus a traceback per notification.
+            if isinstance(value, os.PathLike):
+                value = os.fspath(value)
+                object.__setattr__(self, name, value)
+            if not isinstance(value, str):
+                raise ValueError(
+                    f"AlertSettings.{name} must be a path, or None to disable it — "
+                    f"got {type(value).__name__}")
+            if not value.strip():
+                raise ValueError(
+                    f"AlertSettings.{name} is blank. Pass None to disable it deliberately; a "
+                    f"blank string is almost always an unset environment variable reaching this "
+                    f"constructor by accident, and silently disabling it is the wrong default.")
+
         for name in ("error_log_max_bytes", "error_log_backups", "max_record_field",
                      "max_tracked_conditions"):
             value = getattr(self, name)
@@ -1074,9 +1109,11 @@ class Alerter:
                 return ("state_file is None, which disables de-duplication — every notify() call "
                         "is delivered, nothing is written to disk, and an escalating condition "
                         "re-pages at its caller's cadence instead of backing off")
-            if not path.strip():
-                return ("state_file is blank — set it to a path, or to None to disable "
-                        "de-duplication")
+            # No "is it blank" branch: `AlertSettings` REFUSES a blank path at construction, so
+            # by the time anything holds an `Alerter` the only two states are None and a real
+            # path. A diagnostic for an unreachable state would be a third answer nobody can act
+            # on — and the version that existed here said "or to None to disable", which was
+            # actively misleading while blank ALSO disabled.
             directory = os.path.dirname(path) or "."
             if not os.path.isdir(directory):
                 return f"state_file points into {directory!r}, which does not exist"
@@ -1102,8 +1139,7 @@ class Alerter:
             if path is None:
                 return ("error_log is None — WARN and ERROR alerts are in the process log only, "
                         "with no small retrievable file to fetch off the host")
-            if not path.strip():
-                return "error_log is blank — set it to a path, or to None to disable the sink"
+            # No "is it blank" branch — see the note in `state_file_problem`.
             directory = os.path.dirname(path) or "."
             if os.path.isdir(directory):
                 if not os.access(directory, os.W_OK):
@@ -1191,10 +1227,15 @@ class Alerter:
         `restart: no` that is a container which never comes back and never says why. The irony
         was that those lines existed precisely to tolerate absurd callers.
         """
-        path = self.settings.error_log
-        if not path:
-            return
         try:
+            # ⛔ INSIDE the guard, including resolving the path. It sat outside, which made the
+            # paragraph above false: `self.settings` is an attribute access, and an attribute
+            # access can run arbitrary code — a duck-typed or lazily-resolved settings object
+            # whose `error_log` property raises would have travelled straight out of `notify()`.
+            # Nothing here is allowed to be the one statement that breaks the invariant.
+            path = self.settings.error_log
+            if not path:
+                return
             record = {
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now())),
                 "severity": _field(severity, self.settings.max_record_field),
@@ -1615,10 +1656,11 @@ def current_alerter() -> Alerter | None:
     return _default
 
 
-def _unconfigured(action: str) -> None:
-    log.error("kw_common.alerting is NOT configured — %s. Call configure(AlertSettings(...)) at "
-              "startup; until then every alert this process raises reaches the process log and "
-              "NOTHING else.", action)
+# ⭐ Every message in the two functions below is formatted LAZILY by `logging` (`%s`/`%r` with
+# arguments) and never by an f-string. An f-string evaluates the caller's `__str__`/`__repr__` at
+# the call site, BEFORE logging is reached, so a hostile argument propagates out; the `%`-style
+# form defers it into `logging`, which prints its own error to stderr and returns. That difference
+# is the whole bug these two functions used to have.
 
 
 def notify(severity: str, title: str, message: str, escalating: bool = False,
@@ -1628,14 +1670,35 @@ def notify(severity: str, title: str, message: str, escalating: bool = False,
     If nothing was configured this still cannot raise, and it still writes the log line — logging
     is not paging, and a caller inside an `except` handler must not be punished for a startup
     mistake. Every channel comes back `"skipped"`, and the reason is stated at ERROR.
+
+    ⭐ The unconfigured branch is held to the SAME never-raises standard as `Alerter.notify`, and
+    it is tested against the same hostile arguments. It previously was not, which was the worst
+    possible place to be lax: the population this branch exists to protect is precisely the
+    process that got its startup wrong, and it died in the caller's `except` handler instead of
+    logging. Everything below is either lazily formatted or inside a guard.
     """
     alerter = _default
     if alerter is None:
-        _unconfigured(f"{severity} {title!r} reached no channel")
-        spec = SEVERITIES.get(severity) or SEVERITIES[ERROR]
-        log.log(spec.log_level, "%s %s — %s", spec.prefix, title, message)
+        _unconfigured_notify(severity, title, message)
         return {name: "skipped" for name, _ in _CHANNELS}
     return alerter.notify(severity, title, message, escalating=escalating, clears=clears)
+
+
+def _unconfigured_notify(severity: object, title: object, message: object) -> None:
+    """Log what an unconfigured process would have alerted about. Never raises."""
+    try:
+        spec = SEVERITIES.get(severity)  # type: ignore[call-overload]
+    except Exception:  # noqa: BLE001 — `dict.get` propagates the key's own `__hash__`
+        # Same reasoning as `Alerter.notify`: an unhashable severity is a caller bug, and a
+        # caller bug must never be able to take down the process it is reporting from.
+        spec = None
+    if spec is None:
+        log.error("unknown alert severity %r — treating as %s", severity, ERROR)
+        spec = SEVERITIES[ERROR]
+    log.error("kw_common.alerting is NOT configured — %s %r reached no channel. Call "
+              "configure(AlertSettings(...)) at startup; until then every alert this process "
+              "raises reaches the process log and NOTHING else.", severity, title)
+    log.log(spec.log_level, "%s %s — %s", spec.prefix, title, message)
 
 
 def warn_if_unconfigured(service: str | None = None) -> list[str]:
@@ -1645,9 +1708,14 @@ def warn_if_unconfigured(service: str | None = None) -> list[str]:
     settings, so the two cannot disagree. It is here because the boot call site usually has the
     name to hand, and because a process that never called `configure()` still deserves a warning
     that says WHICH service went unconfigured.
+
+    Never raises, including for a `service` whose `__str__` does.
     """
     alerter = _default
     if alerter is None:
-        _unconfigured(f"no channel is usable for {service or 'this service'}")
+        # `%r` of the raw object, lazily — not `f"...{service}"`, which evaluates it here.
+        log.error("kw_common.alerting is NOT configured — no channel is usable for %r. Call "
+                  "configure(AlertSettings(...)) at startup; until then every alert this process "
+                  "raises reaches the process log and NOTHING else.", service)
         return []
     return alerter.warn_if_unconfigured()

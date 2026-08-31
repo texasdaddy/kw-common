@@ -25,11 +25,15 @@ import pytest
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "src" / "kw_common" / "alerting.py"
 
-# Anything importing one of these has stopped being a shared library. `reauth` is the module this
-# code was extracted FROM and is the specific regression this guards; the rest are the sibling
-# services that will adopt it.
-CONSUMER_MODULES = ("reauth", "reauth_bot", "app", "tape", "keystone", "cef_tracker", "gambit",
-                    "the_desk", "config", "settings")
+# ⛔ DELIBERATELY NO LIST OF CONSUMER MODULE NAMES HERE. An earlier version enumerated the
+# adopting services by name, which published a private deployment's inventory into a PUBLIC
+# repository — the exact class of disclosure `scripts/check_no_internal_info.py` exists to stop,
+# and one it structurally cannot catch, because a bare project name has no shape to match.
+#
+# The enumeration was never needed. The property that matters is STRONGER and is stated
+# positively below: after importing this module alone, NOTHING outside the standard library is
+# in `sys.modules`. That covers every consumer module, named or not, including ones that do not
+# exist yet — a hardcoded list only ever covers the ones somebody remembered.
 
 
 def test_the_module_source_is_where_the_test_thinks_it_is() -> None:
@@ -88,8 +92,13 @@ def test_the_module_imports_alone_with_no_consumer_in_sys_modules(tmp_path: Path
     assert result.returncode == 0, f"the module did not import alone:\n{result.stderr}"
     loaded = set(json.loads(result.stdout))
 
-    leaked = sorted(loaded & set(CONSUMER_MODULES))
-    assert leaked == [], f"importing alerting dragged in consumer modules: {leaked}"
+    # Stated positively and without naming anyone: nothing outside the standard library came
+    # along. That subsumes "no consumer module" for every consumer, including the ones that do
+    # not exist yet, and it needs no list to maintain.
+    foreign = sorted(m for m in loaded
+                     if m.partition(".")[0] not in sys.stdlib_module_names
+                     and m not in ("alerting", "__main__"))
+    assert foreign == [], f"importing alerting dragged in non-stdlib modules: {foreign}"
     kw = sorted(m for m in loaded if m.startswith("kw_common"))
     assert kw == [], f"the module is not standalone — it pulled in {kw}"
 
@@ -143,6 +152,25 @@ def _module_ast() -> ast.Module:
     return ast.parse(MODULE_PATH.read_text(encoding="utf-8"), filename=str(MODULE_PATH))
 
 
+def _environment_reads(tree: ast.Module) -> list[str]:
+    """Every place `tree` reads the process environment.
+
+    ⭐ THE SHARED IMPLEMENTATION, and that sharing is the point. The positive test below and the
+    negative one after it MUST run the same code: an earlier version re-implemented this walk
+    inline in the negative test, so gutting the real one left the "would it catch anything?"
+    test still passing. It validated a copy, not the guard.
+    """
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in ("environ", "getenv"):
+            value = node.value
+            if isinstance(value, ast.Name) and value.id == "os":
+                offenders.append(f"os.{node.attr} at line {node.lineno}")
+        elif isinstance(node, ast.Name) and node.id in ("getenv", "environ"):
+            offenders.append(f"{node.id} at line {node.lineno}")
+    return offenders
+
+
 def test_the_module_never_reads_the_environment() -> None:
     """⭐ AST, not grep — the docstrings explain that config is injected INSTEAD of read from the
     environment, so a text search would trip on the very sentence documenting the rule.
@@ -151,31 +179,30 @@ def test_the_module_never_reads_the_environment() -> None:
     makes it a hardcoded contract by another spelling. The caller passes values; this module reads
     none of its own.
     """
-    offenders: list[str] = []
-    for node in ast.walk(_module_ast()):
-        if isinstance(node, ast.Attribute) and node.attr in ("environ", "getenv"):
-            value = node.value
-            if isinstance(value, ast.Name) and value.id == "os":
-                offenders.append(f"os.{node.attr} at line {node.lineno}")
-        elif isinstance(node, ast.Name) and node.id in ("getenv", "environ"):
-            offenders.append(f"{node.id} at line {node.lineno}")
+    offenders = _environment_reads(_module_ast())
     assert offenders == [], (
         f"the module reads the environment: {offenders}. Configuration is INJECTED via "
         f"AlertSettings; a consumer passes what it uses.")
 
 
-def test_the_guard_above_would_actually_catch_an_environment_read(tmp_path: Path) -> None:
-    """The negative direction. "No `os.environ` node was found" is equally true of a module that
-    has none and of a walk that looks in the wrong place — feed it a module that DOES read the
-    environment and require the same walk to find it."""
-    planted = tmp_path / "planted.py"
-    planted.write_text("import os\n\n\ndef f() -> str:\n    return os.environ.get('SECRET', '')\n",
-                       encoding="utf-8")
-    tree = ast.parse(planted.read_text(encoding="utf-8"))
-    found = [n for n in ast.walk(tree)
-             if isinstance(n, ast.Attribute) and n.attr in ("environ", "getenv")
-             and isinstance(n.value, ast.Name) and n.value.id == "os"]
-    assert found, "the AST walk cannot see an environment read, so the guard above proves nothing"
+@pytest.mark.parametrize("source", [
+    pytest.param("import os\n\n\ndef f() -> str:\n    return os.environ.get('SECRET', '')\n",
+                 id="os.environ.get"),
+    pytest.param("import os\nX = os.environ['SECRET']\n", id="os.environ-subscript"),
+    pytest.param("import os\n\n\ndef f():\n    return os.getenv('SECRET')\n", id="os.getenv"),
+    pytest.param("from os import getenv\nX = getenv('SECRET')\n", id="bare-getenv"),
+])
+def test_the_guard_above_would_actually_catch_an_environment_read(source: str) -> None:
+    """⭐ THE NEGATIVE DIRECTION, through the REAL guard.
+
+    "No `os.environ` node was found" is equally true of a module that has none and of a walk that
+    looks in the wrong place. This calls `_environment_reads` — the same function the positive
+    test calls — on modules that DO read the environment, so gutting the walk turns this test red
+    as well. Four spellings, because a guard that only recognises one spelling of the thing it
+    forbids is an arms race it loses.
+    """
+    assert _environment_reads(ast.parse(source)), (
+        "the guard cannot see this environment read, so the positive test proves nothing")
 
 
 def test_no_module_level_constant_holds_an_absolute_path() -> None:
@@ -196,14 +223,25 @@ def test_no_module_level_constant_holds_an_absolute_path() -> None:
     assert offenders == [], f"module-level absolute paths must be injected instead: {offenders}"
 
 
-@pytest.mark.parametrize("name", ["notify", "warn_if_unconfigured", "configure", "AlertSettings",
-                                  "AlertConfig", "Alerter", "smtp_port_fault"])
-def test_the_public_names_are_defined_at_module_level(name: str) -> None:
-    """`__all__` is the semver contract, so every name in it has to be a real top-level
-    definition — not something a star-import happens to supply."""
+def test_every_exported_callable_is_defined_at_module_level() -> None:
+    """Every exported FUNCTION OR CLASS is a real top-level definition in this file.
+
+    Scoped honestly: this reads `__all__` and checks the names that resolve to a function or a
+    class, which is what "a real top-level definition" can be asserted about via the AST. The
+    exported CONSTANTS are covered by `test_everything_in_dunder_all_exists` (which resolves
+    every one of them) and by ruff's `F822`, which fails an `__all__` entry that does not exist
+    at all. An earlier version of this test was parametrised over a hardcoded seven of the
+    twenty-eight names while its docstring claimed it covered every one.
+    """
     defined = {
         node.name
         for node in _module_ast().body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
     }
-    assert name in defined
+    import kw_common.alerting as mod
+
+    expected = {name for name in mod.__all__
+                if callable(getattr(mod, name, None)) and not isinstance(getattr(mod, name), str)}
+    missing = sorted(expected - defined)
+    assert missing == [], f"exported but not defined at module level here: {missing}"
+    assert len(expected) >= 7, "the check stopped finding exported callables — it proves nothing"

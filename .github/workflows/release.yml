@@ -111,6 +111,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
+          # `fetch-tags` so the TAG OBJECT itself is in the local repository, not merely the
+          # commit it points at. The annotated-tag check below reads that object with
+          # `git cat-file -t`, and a checkout that resolved the ref to a commit without keeping
+          # the tag would make the check unable to answer — which, on a publish path, must never
+          # be indistinguishable from "it answered yes".
+          fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
@@ -120,6 +127,24 @@ jobs:
       # the tag says one number and the package says another, every consumer's version report is
       # a lie and there is no way to tell from the outside which is right. `__init__.py` is the
       # single source (pyproject reads it dynamically), so this compares the tag against it.
+      # ⭐ ANNOTATED, NOT LIGHTWEIGHT — and enforced, because README.md and CHANGELOG.md both
+      # state it as a fact. `on: push: tags: ["v*"]` fires identically for `git tag v1.0.1`, so
+      # without this step the stated invariant was documentation only and a lightweight tag would
+      # publish a full release. An annotated tag carries a tagger, a date and a message; that is
+      # what makes a release object something you can audit later.
+      - name: The tag must be annotated
+        run: |
+          set -eu
+          kind="$(git cat-file -t "${GITHUB_REF}")"
+          echo "${GITHUB_REF} is a ${kind} object"
+          if [ "$kind" != "tag" ]; then
+            echo "::error::${GITHUB_REF_NAME} is a LIGHTWEIGHT tag. A release must be annotated:"
+            echo "::error::  git tag -d ${GITHUB_REF_NAME}"
+            echo "::error::  git push origin :refs/tags/${GITHUB_REF_NAME}"
+            echo "::error::  git tag -a ${GITHUB_REF_NAME} -m '<what this release is>'"
+            echo "::error::  git push origin ${GITHUB_REF_NAME}"
+            exit 1
+          fi
       - name: The tag must match the package version
         run: |
           set -eu
