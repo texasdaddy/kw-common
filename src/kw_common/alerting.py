@@ -292,6 +292,46 @@ def _now() -> float:
     return time.time()
 
 
+def _usable_path(value: object) -> str | None:
+    """This path setting as a real `str`, or `None` if it is not set to anything usable.
+
+    ⭐⭐ ONE EXPRESSION, EVERY CALL SITE, AND THAT IS THE ENTIRE POINT OF IT EXISTING.
+
+    It returns the NORMALISED value rather than a yes/no, which does two jobs in one call: it
+    answers "is this configured", and it hands the caller a genuine `str`. So a settings object
+    carrying a `Path` is corrected at the boundary instead of being detected at one gate and then
+    breaking at the next — which is precisely how both defects below happened.
+
+    Six places in this module ask "is there a path here", and they must not be able to disagree.
+    They did, twice, and both times the disagreement was silent and pointed the wrong way:
+
+      * `state_file_problem()` normalised with `str(path)` while `_dedup_enabled()` did a raw
+        `path.strip()`, so a `Path` made one report "fine" and the other raise `AttributeError`,
+        which `notify()`'s fail-open guard swallowed — de-duplication OFF, boot report silent.
+      * that was repaired for `state_file` and left for `error_log`, where the diagnostic says
+        the sink is off while `_append_error_record` still attempts the write — on POSIX,
+        creating a file literally named `"   "` in the process's working directory.
+
+    Fixing the second one by hand would have left a third. This is the same reasoning the error
+    log's generation count already uses: when two sides of one question can drift, give them one
+    expression to read rather than a convention to remember.
+
+    `str(...)` because a settings object that bypassed `AlertSettings` may hold a `Path`, a
+    `bytes`, or a `str` subclass whose `strip()` lies — and this must answer, not raise, for all
+    of them.
+    """
+    if value is None:
+        return None
+    try:
+        text = str(value)
+    except Exception:  # noqa: BLE001 — a settings object's __str__ is not ours to trust
+        # An object whose `str()` raises is not a usable path, and deciding that must not become
+        # the failure. Every caller treats None as "this sink is off", which is the safe
+        # direction: the diagnostics report it and nothing tries to open it.
+        return None
+    return text if text.strip() else None
+
+
 # --- injected configuration -------------------------------------------------------------------
 @dataclass(frozen=True)
 class AlertSettings:
@@ -603,9 +643,9 @@ class AlertConfig:
         moving the inbox in it takes effect WITHOUT restarting the service. The cost is one small
         file read per notification.
         """
-        path = settings.config_file
+        path = _usable_path(settings.config_file)
         parsed: dict[str, str] = {}
-        if path:
+        if path is not None:
             try:
                 parsed = _parse_env_file(path)
             except Exception as exc:  # the FILE is the email channel's own config source
@@ -1141,7 +1181,8 @@ class Alerter:
             #
             # The constructor refusal is the PRIMARY guard and catches the common case at boot.
             # This is the second line, for the objects that never went through it.
-            if not str(path).strip():
+            path = _usable_path(path)
+            if path is None:
                 return ("state_file is blank, so de-duplication is OFF — every notify() call is "
                         "delivered and an escalating condition re-pages at its caller's cadence "
                         "instead of backing off. This is almost always an unset environment "
@@ -1174,7 +1215,8 @@ class Alerter:
                         "with no small retrievable file to fetch off the host")
             # The blank backstop, for the same reason and by the same routes — see the note in
             # `state_file_problem`.
-            if not str(path).strip():
+            path = _usable_path(path)
+            if path is None:
                 return ("error_log is blank, so the retrievable sink is OFF — WARN and ERROR "
                         "alerts are in the process log only. This is almost always an unset "
                         "environment variable; pass None to disable the sink deliberately")
@@ -1257,8 +1299,8 @@ class Alerter:
         about how many generations exist. See `read_jsonl_tail` for the raising contract on
         `since_iso`.
         """
-        path = self.settings.error_log
-        if not path:
+        path = _usable_path(self.settings.error_log)
+        if path is None:
             return []
         return read_jsonl_tail(path, limit, since_iso, keep,
                                backups=self.settings.error_log_backups)
@@ -1283,8 +1325,8 @@ class Alerter:
             # access can run arbitrary code — a duck-typed or lazily-resolved settings object
             # whose `error_log` property raises would have travelled straight out of `notify()`.
             # Nothing here is allowed to be the one statement that breaks the invariant.
-            path = self.settings.error_log
-            if not path:
+            path = _usable_path(self.settings.error_log)
+            if path is None:
                 return
             record = {
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(_now())),
@@ -1358,7 +1400,7 @@ class Alerter:
         sides of one question, so they read it from one expression.
         """
         path = self.settings.state_file
-        return bool(path and str(path).strip())
+        return _usable_path(path) is not None
 
     def _read_state(self) -> dict[str, dict]:
         """Currently-firing conditions, keyed by title. A missing or unusable file means "nothing

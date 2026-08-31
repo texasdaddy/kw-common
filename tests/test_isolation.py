@@ -1,7 +1,7 @@
 """The generic-code contract, enforced as tests rather than as a promise.
 
 A module in this library earns its place by satisfying rules a reviewer cannot reliably eyeball.
-These are the two that a green functional suite says NOTHING about:
+These are the ones a green functional suite says NOTHING about:
 
 1. **It imports cleanly in isolation.** Copy the module alone into an empty directory and import
    it: no consumer module, and no other `kw_common` module, may appear in `sys.modules`.
@@ -123,10 +123,12 @@ def test_nothing_but_the_module_itself_is_imported_from_the_sandbox(tmp_path: Pa
     whatever it is called — including when its name collides with a standard-library module,
     which is precisely the case the name-based filter above cannot see.
     """
-    # A decoy named after a stdlib module, so this test fails if the check is ever weakened to
-    # the name-based one. It is NOT imported by `alerting`; the assertion is that the sandbox
-    # contributed nothing but `alerting`, so a future edit that made alerting import a sibling
-    # would be caught regardless of the sibling's name.
+    # ⚠️ No decoy file is planted, and an earlier version of this comment claimed one was. What
+    # the check actually rests on is the ORIGIN filter below: `sys.modules` is filtered to the
+    # modules whose `__file__` lives in the sandbox directory, and exactly one may. A future edit
+    # that made `alerting` import a sibling is caught by that whatever the sibling is called —
+    # no decoy needed, and planting one named after a stdlib module would shadow the real one on
+    # `sys.path` and break the import it is supposed to be observing.
     script = (
         "import sys, json, os\n"
         "import alerting\n"

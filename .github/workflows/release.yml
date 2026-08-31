@@ -204,10 +204,35 @@ jobs:
             echo "::error::Bump __version__ in src/kw_common/__init__.py, or retag."
             exit 1
           fi
+      # ⭐ THE SAME SDIST INSPECTION `ci.yml` RUNS, DUPLICATED HERE ON PURPOSE — this is the job
+      # that UPLOADS the tarball to the Release, and the header of this file promises the
+      # packaging check runs again against the tag's tree. It did not: the check was added to
+      # `ci.yml` alone, so a tag cut directly on a commit that never went through a PR — the
+      # exact case this file's duplication exists for — could publish a tarball nobody inspected.
+      # Adding it to one of the two workflows and not the other is the same fix-the-instance miss
+      # this repository keeps making, so it is stated here rather than assumed.
       - name: Build
         run: |
           python -m pip install --upgrade pip build
           python -m build
+      - name: The sdist carries its fixtures and nothing it should not
+        run: |
+          set -eu
+          sdist="$(ls dist/*.tar.gz)"
+          echo "inspecting ${sdist}"
+          names="$(tar tzf "$sdist")"
+          echo "$names" | grep -q '/tests/conftest.py$' || {
+            echo "::error::the sdist has no tests/conftest.py — its suite ships without the"
+            echo "::error::autouse fixtures it depends on. Check MANIFEST.in."
+            exit 1
+          }
+          if echo "$names" | grep -q '/scripts/'; then
+            echo "::error::the sdist contains scripts/. The leak guard is a CI tool for this"
+            echo "::error::repository and its docstring names other repositories; it must not be"
+            echo "::error::published inside a release artifact. Check MANIFEST.in."
+            exit 1
+          fi
+          echo "sdist contents are as intended"
       # The same check ci.yml runs, repeated here because THIS is the artifact being published.
       - name: Install the built wheel into a clean environment and import it
         run: |

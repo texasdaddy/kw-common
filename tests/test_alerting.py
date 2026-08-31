@@ -1206,7 +1206,11 @@ def test_a_pathlike_whose_fspath_misbehaves_is_refused_as_a_value_error(name: st
             return None  # type: ignore[return-value]
 
     for bad in (Raises(), ReturnsNone()):
-        with pytest.raises(ValueError, match=name):
+        # `match="__fspath__"`, not just the field name: deleting the whole PathLike branch lets
+        # both of these fall through to the generic "must be a path" refusal, which is also a
+        # ValueError mentioning the field — so the looser match was satisfiable by a predicate
+        # other than the one this test names.
+        with pytest.raises(ValueError, match="__fspath__"):
             AlertSettings(service="svc", **{name: bad})  # type: ignore[arg-type]
 
 
@@ -1230,6 +1234,43 @@ def test_the_dedup_check_and_its_diagnostic_cannot_disagree(tmp_path: Path,
     assert alerter.notify(ERROR, "svc: cond", "1")["ntfy"] == "sent"
     assert alerter.notify(ERROR, "svc: cond", "2")["ntfy"] == "suppressed", (
         "de-duplication did not run — the two halves of the state-file check disagree")
+
+
+def test_a_blank_error_log_is_not_written_to_while_the_diagnostic_says_it_is_off(
+        tmp_path: Path, channels: dict[str, Spy], monkeypatch: pytest.MonkeyPatch) -> None:
+    """⭐ THE SIBLING OF THE `state_file` DEFECT, WHICH IS WHY BOTH NOW READ ONE EXPRESSION.
+
+    `error_log_problem()` normalised the value and reported "the retrievable sink is OFF", while
+    `_append_error_record` gated on a bare truthiness check and went ahead and ATTEMPTED the
+    write — on POSIX creating a file literally named `"   "` in the process's working directory,
+    while the boot report said the sink was off.
+
+    Same shape as the `state_file` bug one field over.
+
+    ⚠️ THIS ASSERTS THE WRITE WAS NEVER ATTEMPTED, not that no file appeared. "The directory is
+    still empty" reads like the right assertion and is PLATFORM-DEPENDENT: Windows refuses a
+    filename made of spaces, so with the defect restored `os.open` fails and the directory is
+    empty for the wrong reason. Measured — the earlier version of this test PASSED on this
+    machine against the mutant and would only have bitten on the Linux runner. Recording the
+    call asks the real question on every platform.
+    """
+    monkeypatch.chdir(tmp_path)
+    opened: list[object] = []
+    real_open = alerting.os.open
+
+    def recording_open(path: object, *args: object, **kwargs: object) -> int:
+        opened.append(path)
+        return real_open(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(alerting.os, "open", recording_open)
+    alerter = Alerter(_DuckSettings(error_log="   "))  # type: ignore[arg-type]
+
+    assert "OFF" in alerter.error_log_problem()
+    assert alerter.notify(ERROR, "svc: x", "body")["ntfy"] == "sent"
+    assert alerter.read_errors(limit=0) == []
+    assert opened == [], (
+        f"the diagnostic said the sink was off and the sink tried to open {opened!r} anyway")
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_a_lying_str_subclass_is_still_reported_by_the_backstop() -> None:
