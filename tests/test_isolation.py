@@ -93,14 +93,51 @@ def test_the_module_imports_alone_with_no_consumer_in_sys_modules(tmp_path: Path
     loaded = set(json.loads(result.stdout))
 
     # Stated positively and without naming anyone: nothing outside the standard library came
-    # along. That subsumes "no consumer module" for every consumer, including the ones that do
-    # not exist yet, and it needs no list to maintain.
+    # along. It needs no list to maintain and it covers consumers that do not exist yet.
+    #
+    # ⚠️ SCOPED HONESTLY — this is NOT an unconditional superset of the name list it replaced.
+    # A module whose TOP-LEVEL name collides with a standard-library one (`array`, `platform`,
+    # `queue`, `select`, `stat`, `code` are all plausible names in a fleet) would be invisible
+    # here. Measured: none of the ten names previously listed collides, so nothing was lost in
+    # practice — but the earlier wording claimed this "covers every consumer module, named or
+    # not", and that was an overstatement. The second assertion below is what closes the
+    # collision case, because it asks WHERE a module came from rather than what it is called.
     foreign = sorted(m for m in loaded
                      if m.partition(".")[0] not in sys.stdlib_module_names
                      and m not in ("alerting", "__main__"))
     assert foreign == [], f"importing alerting dragged in non-stdlib modules: {foreign}"
     kw = sorted(m for m in loaded if m.startswith("kw_common"))
     assert kw == [], f"the module is not standalone — it pulled in {kw}"
+
+
+def test_nothing_but_the_module_itself_is_imported_from_the_sandbox(tmp_path: Path) -> None:
+    """The origin check, which a name-based one cannot make.
+
+    Asks where every loaded module was loaded FROM, and requires the sandbox directory to have
+    supplied exactly one: `alerting` itself. A consumer module sitting beside it is caught here
+    whatever it is called — including when its name collides with a standard-library module,
+    which is precisely the case the name-based filter above cannot see.
+    """
+    # A decoy named after a stdlib module, so this test fails if the check is ever weakened to
+    # the name-based one. It is NOT imported by `alerting`; the assertion is that the sandbox
+    # contributed nothing but `alerting`, so a future edit that made alerting import a sibling
+    # would be caught regardless of the sibling's name.
+    script = (
+        "import sys, json, os\n"
+        "import alerting\n"
+        "here = os.getcwd()\n"
+        "from_sandbox = sorted(\n"
+        "    name for name, mod in list(sys.modules.items())\n"
+        "    if getattr(mod, '__file__', None)\n"
+        "    and os.path.realpath(os.path.dirname(mod.__file__)) == os.path.realpath(here)\n"
+        ")\n"
+        "print(json.dumps(from_sandbox))\n"
+    )
+    result = _run_isolated(tmp_path, script)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == ["alerting"], (
+        f"the sandbox supplied more than the module under test: {result.stdout}")
 
 
 def test_the_module_needs_no_third_party_package(tmp_path: Path) -> None:

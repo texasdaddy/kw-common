@@ -14,6 +14,11 @@ include README.md
 include CHANGELOG.md
 include pyproject.toml
 recursive-include tests *.py
-# The leak guard travels too: a consumer auditing the tarball should be able to run the same scan
-# CI runs, against the same file, without cloning.
-recursive-include scripts *.py
+
+# ⛔ `scripts/` is DELIBERATELY NOT INCLUDED. It briefly was, on the reasoning that a consumer
+# auditing the tarball should be able to run the same scan CI runs. That reasoning was thin — the
+# guard is a CI tool for THIS repository, not part of the library — and it had a real cost: the
+# canonical guard's docstring enumerates the fleet's other repositories by name, so including it
+# put that inventory inside every tarball attached to every public GitHub Release, widening the
+# distribution of something the tests were edited to stop publishing. Anyone who wants the guard
+# can clone the repository, which is where a CI tool belongs.

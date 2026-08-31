@@ -350,7 +350,16 @@ class AlertSettings:
         #
         # `None` means OFF and is spelled `None`; anything else must be a real path. The two
         # states are now distinguishable at the only moment a human can act on the difference.
-        for name in ("config_file", "state_file", "error_log"):
+        # What each blank actually costs, so the refusal names the real consequence instead of
+        # telling every field the state_file story.
+        blank_costs = {
+            "config_file": "the email channel is unconfigured and every email alert is skipped",
+            "state_file": "de-duplication is OFF, so an escalating condition re-pages at its "
+                          "caller's cadence instead of backing off",
+            "error_log": "the retrievable sink is OFF, so WARN and ERROR alerts are in the "
+                         "process log only",
+        }
+        for name, cost in blank_costs.items():
             value = getattr(self, name)
             if value is None:
                 continue
@@ -358,8 +367,18 @@ class AlertSettings:
             # public library, and it used to work for `error_log`/`config_file` (which reach
             # `open()`) while breaking `state_file` (which reaches `.strip()`) — an asymmetry
             # that showed up as de-duplication silently off plus a traceback per notification.
+            #
+            # `__fspath__` is caller code and can misbehave: one that RAISES used to propagate
+            # its own exception, and one returning `None` produced a bare `TypeError`. Both
+            # escaped a caller catching `ValueError` around this constructor, which is the only
+            # thing the refusals below invite them to catch.
             if isinstance(value, os.PathLike):
-                value = os.fspath(value)
+                try:
+                    value = os.fspath(value)
+                except Exception as exc:  # __fspath__ is the caller's code and can misbehave
+                    raise ValueError(
+                        f"AlertSettings.{name} is an os.PathLike whose __fspath__ failed "
+                        f"({type(exc).__name__})") from exc
                 object.__setattr__(self, name, value)
             if not isinstance(value, str):
                 raise ValueError(
@@ -367,9 +386,10 @@ class AlertSettings:
                     f"got {type(value).__name__}")
             if not value.strip():
                 raise ValueError(
-                    f"AlertSettings.{name} is blank. Pass None to disable it deliberately; a "
-                    f"blank string is almost always an unset environment variable reaching this "
-                    f"constructor by accident, and silently disabling it is the wrong default.")
+                    f"AlertSettings.{name} is blank, which would mean: {cost}. A blank string is "
+                    f"almost always an unset environment variable reaching this constructor by "
+                    f"accident, so it is refused rather than quietly honoured. Pass None to "
+                    f"disable it deliberately.")
 
         for name in ("error_log_max_bytes", "error_log_backups", "max_record_field",
                      "max_tracked_conditions"):
@@ -1109,11 +1129,24 @@ class Alerter:
                 return ("state_file is None, which disables de-duplication — every notify() call "
                         "is delivered, nothing is written to disk, and an escalating condition "
                         "re-pages at its caller's cadence instead of backing off")
-            # No "is it blank" branch: `AlertSettings` REFUSES a blank path at construction, so
-            # by the time anything holds an `Alerter` the only two states are None and a real
-            # path. A diagnostic for an unreachable state would be a third answer nobody can act
-            # on — and the version that existed here said "or to None to disable", which was
-            # actively misleading while blank ALSO disabled.
+            # ⭐ THE BLANK BRANCH IS A BACKSTOP, AND DELETING IT WAS A MISTAKE WORTH RECORDING.
+            # It was removed once, on the argument that `AlertSettings` now refuses a blank path
+            # so this state is unreachable. That argument is FALSE, and measurably so: an
+            # `Alerter` takes any settings-shaped object and validates nothing, a `@dataclass`
+            # subclass can override `__post_init__`, `object.__setattr__` writes through the
+            # frozen instance, and a `str` subclass whose `strip()` lies passes the public
+            # constructor outright. With the branch gone, all four produced `""` — "no problem" —
+            # while de-duplication was silently OFF. That is strictly worse than the misleading
+            # message it replaced: a wrong diagnostic still says something is wrong.
+            #
+            # The constructor refusal is the PRIMARY guard and catches the common case at boot.
+            # This is the second line, for the objects that never went through it.
+            if not str(path).strip():
+                return ("state_file is blank, so de-duplication is OFF — every notify() call is "
+                        "delivered and an escalating condition re-pages at its caller's cadence "
+                        "instead of backing off. This is almost always an unset environment "
+                        "variable; pass None to disable de-duplication deliberately, or a path "
+                        "to enable it")
             directory = os.path.dirname(path) or "."
             if not os.path.isdir(directory):
                 return f"state_file points into {directory!r}, which does not exist"
@@ -1139,7 +1172,12 @@ class Alerter:
             if path is None:
                 return ("error_log is None — WARN and ERROR alerts are in the process log only, "
                         "with no small retrievable file to fetch off the host")
-            # No "is it blank" branch — see the note in `state_file_problem`.
+            # The blank backstop, for the same reason and by the same routes — see the note in
+            # `state_file_problem`.
+            if not str(path).strip():
+                return ("error_log is blank, so the retrievable sink is OFF — WARN and ERROR "
+                        "alerts are in the process log only. This is almost always an unset "
+                        "environment variable; pass None to disable the sink deliberately")
             directory = os.path.dirname(path) or "."
             if os.path.isdir(directory):
                 if not os.access(directory, os.W_OK):
@@ -1164,7 +1202,19 @@ class Alerter:
         Like `notify()`, this cannot raise: it runs at the top of the service's main loop, so an
         exception here is a boot crash — a restart loop over a mistyped config file.
         """
-        service = self.settings.service
+        try:
+            # ⛔ INSIDE a guard, for exactly the reason `_append_error_record` resolves its path
+            # inside one: `self.settings` is an attribute access, and an attribute access can run
+            # arbitrary code. This was left unguarded when that sibling was fixed — one instance
+            # repaired, the identical pattern one function over untouched, in the function whose
+            # docstring above promises it cannot raise. A duck-typed or lazily-resolved settings
+            # object made THIS the boot crash the paragraph warns about.
+            service = self.settings.service
+        except Exception as exc:  # noqa: BLE001 — a boot check must not be the boot crash
+            log.warning("ALERTING: this service's own name could not be resolved from its "
+                        "settings (%s) — reporting alerting readiness without it",
+                        type(exc).__name__)
+            service = "<unknown service>"
         # FIRST, before the config load — that load has an `except` which returns, and a boot with
         # an unreadable config file is exactly the boot that needs both warnings rather than one.
         problem = self.state_file_problem()

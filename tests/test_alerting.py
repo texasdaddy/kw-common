@@ -526,6 +526,11 @@ class FakeSMTP:
         self.starttls_called = False
         self.login_args: tuple[str, str] | None = None
         self.sent: list[object] = []
+        # ⭐ THE CALL ORDER, not just the call SET. Independent flags cannot answer "did the
+        # password go out before the channel was encrypted" — and that is the question that
+        # matters: swapping `login()` above `starttls()` puts the SMTP app password on an
+        # unencrypted socket, and a fake recording only booleans stays green through it.
+        self.calls: list[str] = []
         FakeSMTP.instances.append(self)
 
     def __enter__(self) -> FakeSMTP:
@@ -535,13 +540,16 @@ class FakeSMTP:
         return None
 
     def starttls(self, context: ssl.SSLContext | None = None) -> None:
+        self.calls.append("starttls")
         self.starttls_called = True
         self.starttls_context = context
 
     def login(self, user: str, password: str) -> None:
+        self.calls.append("login")
         self.login_args = (user, password)
 
     def send_message(self, msg: object) -> None:
+        self.calls.append("send_message")
         self.sent.append(msg)
 
 
@@ -597,6 +605,14 @@ def test_send_email_verifies_the_server_certificate(
     assert ctx.verify_mode is ssl.CERT_REQUIRED
     assert smtp.login_args == ("svc@example.com", "not-a-real-password")
     assert smtp.timeout == alerting.SMTP_TIMEOUT_S, "an SMTP send with no timeout can hang forever"
+
+    # ⭐ THE ORDER, asserted rather than described. An earlier version of this test claimed the
+    # context was checked "BEFORE the login, because the ordering is what makes it matter" while
+    # recording only independent booleans — so swapping `login()` above `starttls()`, which puts
+    # the app password on an unencrypted socket, kept the whole suite green.
+    assert smtp.calls == ["starttls", "login", "send_message"], (
+        f"the SMTP conversation happened in the wrong order: {smtp.calls}. The password must "
+        f"not be sent before STARTTLS has encrypted the channel.")
 
 
 def test_send_email_uses_the_configured_port_and_host(
@@ -1236,6 +1252,90 @@ def test_warn_if_unconfigured_cannot_raise(monkeypatch: pytest.MonkeyPatch,
     assert "ALERTING CONFIG UNREADABLE" in caplog.text
 
 
+class _DuckSettings:
+    """A settings-SHAPED object that never went through `AlertSettings.__post_init__`.
+
+    `Alerter` accepts anything with the right attributes and validates none of them, so this is
+    the shape that reaches the diagnostics' backstops. It is not exotic: a consumer with its own
+    settings class, a test double, or a `@dataclass` subclass overriding `__post_init__` all
+    arrive here.
+    """
+
+    config_file: str | None = None
+    ntfy_url = "https://ntfy.example.com/t"
+    state_file: str | None = None
+    error_log: str | None = None
+    service = "svc"
+    error_log_max_bytes = 1_000_000
+    error_log_backups = 1
+    max_record_field = 4000
+    max_tracked_conditions = 200
+
+    def __init__(self, **over: object) -> None:
+        for k, v in over.items():
+            setattr(self, k, v)
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\t"])
+def test_a_blank_state_file_that_dodged_the_constructor_is_still_reported(blank: str) -> None:
+    """⭐⭐ THE BACKSTOP. `AlertSettings` refuses a blank path, but `Alerter` takes any
+    settings-shaped object and validates nothing — so "the constructor makes this unreachable"
+    is FALSE, and the diagnostic branch that was deleted on that argument is restored.
+
+    Without it this configuration reported `""` — no problem at all — while de-duplication was
+    silently OFF and the service booted with a completely clean alerting report. A wrong
+    diagnostic would have been bad; no diagnostic is worse.
+    """
+    alerter = Alerter(_DuckSettings(state_file=blank))  # type: ignore[arg-type]
+
+    assert alerter._dedup_enabled() is False, "the premise of this test no longer holds"
+    problem = alerter.state_file_problem()
+    assert problem != "", "a blank state_file was reported as no problem at all"
+    assert "de-duplication is OFF" in problem
+    assert "None" in problem, "the message must say how to disable it deliberately"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_error_log_that_dodged_the_constructor_is_still_reported(blank: str) -> None:
+    alerter = Alerter(_DuckSettings(error_log=blank))  # type: ignore[arg-type]
+    problem = alerter.error_log_problem()
+    assert problem != "", "a blank error_log was reported as no problem at all"
+    assert "OFF" in problem
+
+
+def test_the_boot_report_surfaces_a_blank_path_that_dodged_the_constructor(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """The half that an operator actually sees: the backstop has to reach the boot warning, not
+    just be returnable from a method nobody calls."""
+    alerter = Alerter(_DuckSettings(state_file="   "))  # type: ignore[arg-type]
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        alerter.warn_if_unconfigured()
+    assert "ALERTING STATE for svc" in caplog.text
+    assert "de-duplication is OFF" in caplog.text
+
+
+def test_warn_if_unconfigured_survives_a_settings_object_whose_name_raises(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ `warn_if_unconfigured` promises, in its own docstring, that it cannot raise — "an
+    exception here is a boot crash, a restart loop over a mistyped config file".
+
+    It could. `service = self.settings.service` was the first statement and sat outside every
+    guard. `_append_error_record` had the identical pattern and was fixed; this sibling was left
+    behind, which is fixing the instance rather than the class.
+    """
+    class NameRaises(_DuckSettings):
+        @property
+        def service(self) -> str:  # type: ignore[override]
+            raise RuntimeError("this settings object resolves lazily and it failed")
+
+    alerter = Alerter(NameRaises())  # type: ignore[arg-type]
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        ready = alerter.warn_if_unconfigured()  # must not raise
+
+    assert ready == ["ntfy"]
+    assert "could not be resolved" in caplog.text
+
+
 def test_state_file_problem_reports_a_missing_directory(tmp_path: Path) -> None:
     alerter = Alerter(AlertSettings(service="svc",
                                     state_file=str(tmp_path / "nope" / "state.json")))
@@ -1276,6 +1376,28 @@ def test_module_warn_if_unconfigured_without_configure_names_the_service(
     assert "svc" in caplog.text
 
 
+def test_the_unconfigured_path_announces_an_unknown_severity_and_treats_it_as_error(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """The unconfigured path must handle an unknown severity the SAME way `Alerter.notify` does:
+    say so, and fall back to ERROR.
+
+    Both halves were unpinned — a mutation swapping the fallback to `SEVERITIES[OK]` passed the
+    whole suite. That matters beyond consistency: under the stdlib's default configuration the
+    last-resort handler is at WARNING, so an OK-level fallback would DROP the alert line
+    entirely, silently breaking the promise that the log line always goes out.
+    """
+    with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
+        results = alerting.notify("CATASTROPHE", "svc: ?", "body")
+
+    assert results == {"email": "skipped", "ntfy": "skipped"}
+    assert "unknown alert severity" in caplog.text
+    assert "'CATASTROPHE'" in caplog.text, "the raw severity must not be lost"
+    levels = {r.levelno for r in caplog.records}
+    assert logging.ERROR in levels, "the unknown severity did not fall back to ERROR"
+    assert any(r.getMessage().startswith("[ERROR] svc: ?") for r in caplog.records), (
+        "the alert line did not go out with the ERROR prefix")
+
+
 def test_the_unconfigured_path_never_raises_either(tmp_path: Path) -> None:
     """⭐⭐ THE UNCONFIGURED BRANCH IS HELD TO THE SAME STANDARD AS THE CONFIGURED ONE.
 
@@ -1289,15 +1411,23 @@ def test_the_unconfigured_path_never_raises_either(tmp_path: Path) -> None:
     ⚠️ IN A SUBPROCESS, for the same reason as
     `test_notify_does_not_raise_even_when_str_itself_raises`: pytest's log handler overrides
     `handleError` and RE-RAISES formatting errors, while the stdlib prints them to stderr and
-    returns. Measured — an in-process version of this test fails on all four hostile cases
-    against code that is correct, which would have sent me chasing a defect that does not exist.
+    returns. Measured — an in-process version of this test fails on THREE of the four hostile
+    cases against code that is correct (the unhashable severity passes in-process, because the
+    guard leaves `spec = None` and `%r` of a list formats fine).
+
+    ⚠️⚠️ AND AT `DEBUG`, NOT `CRITICAL`. This probe first ran at `logging.CRITICAL`, where
+    `log.error` is below the threshold, so `isEnabledFor` returns False and **no `LogRecord` is
+    ever built** — the hostile `__repr__` was never invoked and the test proved only the
+    call-site half (no eager f-strings), never reaching logging's formatter at all. Measured:
+    at CRITICAL the hostile object's `__repr__`/`__str__` are called 0 and 0 times; at DEBUG,
+    9 and 3. A probe that cannot reach the code path it is named for is not a probe.
     """
     probe = tmp_path / "probe_unconfigured.py"
     probe.write_text(
         "import logging, sys\n"
         "from kw_common import alerting\n"
         "from kw_common.alerting import ERROR\n"
-        "logging.basicConfig(level=logging.CRITICAL)\n"
+        "logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)\n"
         "assert alerting.current_alerter() is None\n"
         "class Hostile:\n"
         "    def __str__(self): raise RuntimeError('no str')\n"

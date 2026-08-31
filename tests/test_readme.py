@@ -20,8 +20,6 @@ import builtins
 import re
 from pathlib import Path
 
-import pytest
-
 README = Path(__file__).resolve().parents[1] / "README.md"
 
 
@@ -95,10 +93,28 @@ def test_everything_the_quickstart_imports_from_the_library_really_exists() -> N
     assert checked >= 5, "no kw_common imports were checked — this test proves nothing"
 
 
-@pytest.mark.parametrize("claim", [
-    "pip install git+https://github.com/texasdaddy/kw-common@v1.0.0",
-    "Never pin a branch",
-])
-def test_the_install_instructions_are_present(claim: str) -> None:
-    """Criterion: the README carries the install line and the pin-an-exact-tag rule."""
-    assert claim in README.read_text(encoding="utf-8")
+def test_the_pin_an_exact_tag_rule_is_stated() -> None:
+    assert "Never pin a branch" in README.read_text(encoding="utf-8")
+
+
+def test_the_install_line_names_the_version_this_package_actually_is() -> None:
+    """⭐ DERIVED FROM `kw_common.__version__`, NOT PINNED TO A LITERAL.
+
+    An earlier version hardcoded `v1.0.0` here, which got the incentive exactly backwards:
+    bumping `__version__` and forgetting the README left the suite GREEN — so the README went on
+    telling every new consumer to pin a superseded tag — while UPDATING the README to match a
+    bump turned the suite RED. The test punished the correct action and rewarded the omission.
+
+    Read from the package, it becomes the version-drift guard the README says exists.
+    """
+    import kw_common
+
+    expected = f"@v{kw_common.__version__}"
+    text = README.read_text(encoding="utf-8")
+    install_lines = [ln for ln in text.splitlines()
+                     if "github.com/texasdaddy/kw-common@" in ln]
+    assert install_lines, "the README no longer shows an install line to check"
+    stale = [ln for ln in install_lines if expected not in ln]
+    assert stale == [], (
+        f"the README pins a version that is not this package's ({kw_common.__version__}): "
+        f"{stale}")

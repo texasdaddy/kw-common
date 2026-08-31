@@ -135,7 +135,26 @@ jobs:
       - name: The tag must be annotated
         run: |
           set -eu
-          kind="$(git cat-file -t "${GITHUB_REF}")"
+          # ⛔ THREE OUTCOMES, NOT TWO, and each says what actually happened. Every one of them
+          # fails closed — an unanswerable check must never read as a pass on a publish path —
+          # but a failure that misdescribes itself sends the next person to fix the wrong thing.
+          #
+          # `|| true` on the substitution because `set -e` would otherwise abort here on an
+          # unresolvable ref, printing a bare `fatal:` instead of the guidance below.
+          if [ "${GITHUB_REF}" = "${GITHUB_REF#refs/tags/}" ]; then
+            # workflow_dispatch on a BRANCH. The file documents that entry point, so it is a real
+            # path — and telling someone to `git tag -d main` would be actively harmful advice.
+            echo "::error::${GITHUB_REF} is not a tag ref. This workflow publishes a release from"
+            echo "::error::an annotated v* TAG; re-run it with 'ref' set to the tag."
+            exit 1
+          fi
+          kind="$(git cat-file -t "${GITHUB_REF}" 2>/dev/null || true)"
+          if [ -z "$kind" ]; then
+            echo "::error::${GITHUB_REF} could not be resolved in this checkout, so whether it is"
+            echo "::error::annotated cannot be determined. This is an environment failure, not a"
+            echo "::error::verdict on the tag — the checkout needs fetch-depth: 0 + fetch-tags."
+            exit 1
+          fi
           echo "${GITHUB_REF} is a ${kind} object"
           if [ "$kind" != "tag" ]; then
             echo "::error::${GITHUB_REF_NAME} is a LIGHTWEIGHT tag. A release must be annotated:"
