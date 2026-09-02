@@ -110,6 +110,28 @@ ADOPTER NOTES
     - **Key a condition by the CONDITION, not the occurrence.** A title carrying an instance id
       ("backup failed for job-1234") makes every occurrence a new condition, so nothing is ever
       de-duplicated and the state file grows until pruning starts dropping the oldest.
+    - **Use an `https://` ntfy topic URL.** A topic URL is a WRITE CAPABILITY — whoever observes
+      it can page the operator from then on — so `http://` is refused by default and the channel
+      counts as unconfigured. `AlertSettings(allow_cleartext_ntfy=True)` is the supported opt-in
+      for a self-hosted endpoint on a trusted network. Userinfo (`https://user:pass@host/topic`)
+      is refused outright: `urllib` cannot send it, and its failure printed the password.
+
+WHAT THIS MODULE WILL NOT PUT IN A LOG
+    Its own configuration. The failure paths here are reached BY an exception raised inside
+    third-party code that was holding this module's settings, and several stdlib exceptions quote
+    the value that upset them — so a misconfigured channel used to write a credential into the
+    process log on EVERY alert, repeating forever, in the log an operator is most likely to paste
+    into a bug report. Three things hold the line, in order of how much they are trusted:
+
+    1. **Refusals at the source.** A URL with userinfo and a non-ASCII SMTP credential are both
+       rejected before the code that would quote them is reached. Neither ever worked.
+    2. **Redaction of what remains** (`_redact`), covering `SMTP_PASSWORD` and the topic URL.
+       Read its docstring for what it does NOT catch, which is the part that matters.
+    3. **Shape, never value**, wherever this module describes a rejected setting itself — see
+       `_fault_shape`.
+
+    None of this reaches what a CALLER puts in a title or a message. Sanitise at the raise site,
+    where the value is understood.
 
 INVARIANTS
     - `notify()` NEVER raises. Alerting that can crash its caller is worse than no alerting.
@@ -332,6 +354,127 @@ def _usable_path(value: object) -> str | None:
     return text if text.strip() else None
 
 
+def _opted_into_cleartext(settings: object) -> bool:
+    """Has this settings object EXPLICITLY opted in to a cleartext (`http://`) ntfy topic?
+
+    ⭐ `is True`, NOT `bool(...)`, and the difference is the whole point. This answers a SECURITY
+    question, and an `Alerter` takes any settings-shaped object without validating it — the same
+    population `state_file_problem()`'s blank backstop exists for. `AlertSettings` refuses a
+    non-bool at construction (`"false"` is TRUE to Python, so honouring it would opt a deployment
+    IN by reading its opt-out), but an object that never went through that constructor gets its
+    value read here. Under `bool(...)` the string `"false"`, `"0"` and `"no"` would each opt in.
+    Only the literal `True` does.
+
+    A missing attribute means "not opted in", and so does an attribute access that RAISES: this
+    runs on the alerting path, and a settings object with a misbehaving property must not be able
+    to turn a refusal into an exception — or into an opt-in.
+    """
+    try:
+        return getattr(settings, "allow_cleartext_ntfy", False) is True
+    except Exception:  # noqa: BLE001 — an attribute access is the caller's code
+        return False
+
+
+# --- keeping configured secrets out of the log ---------------------------------------------------
+_REDACTED = "<redacted>"
+
+
+def _safe_text(exc: BaseException) -> str:
+    """`str(exc)` for an exception this module did not raise, without trusting its `__str__`.
+
+    The failure path is reached BY an exception, so it is the one place where calling more of a
+    third party's code is least excusable. `%s`-lazy formatting used to defer this into stdlib
+    logging, which SWALLOWS the second failure and drops the record entirely — the alert's only
+    surviving trace vanishing because the exception object was hostile.
+    """
+    try:
+        return str(exc)
+    except Exception:  # noqa: BLE001 — a hostile __str__ must not become the failure
+        return "<an exception whose str() raised>"
+
+
+def _secret_values(cfg: AlertConfig) -> list[str]:
+    """Every value in THIS config that must not appear in a log line.
+
+    Two things, and the reasoning differs for each:
+
+    * **`SMTP_PASSWORD`** — a secret in the ordinary sense.
+    * **The ntfy topic URL, its path and any userinfo** — a topic URL is a WRITE CAPABILITY, not
+      an address: whoever holds it can page the operator. The module already refuses to echo it
+      from `ntfy_ready()`'s own failure branches; this is the same rule applied to text that
+      arrives from somewhere else.
+
+    The HOST is deliberately NOT in the set. It is the half of the URL with real diagnostic value
+    ("connection refused", a DNS failure name the host), it is not itself the capability, and
+    redacting it would push an operator towards turning this off.
+    """
+    secrets: list[str] = []
+
+    def add(value: object) -> None:
+        if isinstance(value, str) and value.strip():
+            secrets.append(value)
+
+    email = cfg.email or {}
+    add(email.get("SMTP_PASSWORD") if isinstance(email, dict) else None)
+
+    url = cfg.ntfy_url
+    if isinstance(url, str) and url.strip():
+        add(url)
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            # Unparseable — the full-URL entry above still stands, and `ntfy_ready()` has already
+            # disabled this channel. Do not let a URL this module refused to use break redaction
+            # of the password, which is in the same set.
+            parts = None
+        if parts is not None:
+            # `netloc.rpartition("@")` and not `parts.username`/`parts.password`: those decode
+            # percent-escapes, so what they return is not necessarily the text an exception
+            # message would be quoting. The raw slice is what appears verbatim.
+            userinfo = parts.netloc.rpartition("@")[0]
+            add(userinfo)
+            add(userinfo.partition(":")[2])
+            # The topic itself, in BOTH the shapes an exception quotes it in: as the selector
+            # (`/topic`, which is what `http.client` carries) and bare (`topic`, which is what a
+            # message naming the topic uses). Covering only the first left the second live.
+            # `"/"` alone is not a secret and would redact every slash in the message, which is
+            # the over-redaction that makes an operator stop reading the line.
+            topic = parts.path.strip("/")
+            if topic:
+                add(parts.path)
+                add(topic)
+    return secrets
+
+
+def _redact(text: str, cfg: AlertConfig) -> str:
+    """`text` with every configured secret replaced. A BACKSTOP — read what it does NOT do.
+
+    ⚠️ IT CATCHES A SECRET QUOTED VERBATIM, AND ONLY THAT. A message that renders a secret in any
+    TRANSFORMED shape — one character as an escaped `repr` plus its offset, a hash, base64, a
+    length — passes straight through, because a substring replacement cannot see it. That is not
+    a hypothetical gap: it is exactly the second of the two demonstrated leaks (issue #2's repro
+    B, `UnicodeEncodeError` on a non-ASCII SMTP password), which is why BOTH demonstrated cases
+    are closed at their SOURCE — userinfo refused in `ntfy_ready()`, a non-ASCII credential
+    refused in `_send_email()` — rather than left to this function. Do not weaken either of those
+    on the strength of this one.
+
+    Over-redaction is the safe direction and is deliberately not guarded against: a one-character
+    password redacts every occurrence of that character and leaves an unreadable line. Unreadable
+    is a bad log line; a printed credential is an incident.
+    """
+    try:
+        secrets = _secret_values(cfg)
+    except Exception:  # noqa: BLE001 — if the secrets cannot be enumerated, nothing is safe
+        # The text CANNOT be shown, because the question "does it contain a secret" is now
+        # unanswerable. Suppressing it costs a diagnostic; printing it may cost a credential.
+        return "<suppressed: this config's secrets could not be enumerated for redaction>"
+    # Longest first, so a secret that CONTAINS another (a URL and its own path) is replaced whole
+    # rather than being broken into a redacted fragment plus a leftover tail of itself.
+    for secret in sorted(set(secrets), key=len, reverse=True):
+        text = text.replace(secret, _REDACTED)
+    return text
+
+
 # --- injected configuration -------------------------------------------------------------------
 @dataclass(frozen=True)
 class AlertSettings:
@@ -349,9 +492,14 @@ class AlertSettings:
     `ntfy_url`     the FULL ntfy topic URL (`https://ntfy.example.com/<topic>`). A bare topic is
                    REJECTED, loudly: `urllib` raises `unknown url type: '<topic>'` on every send,
                    so the channel is dead while looking configured. `""` means unconfigured.
+                   `http://` needs `allow_cleartext_ntfy=True`; userinfo is never accepted.
     `state_file`   where firing-condition state is persisted. `None` disables de-duplication
                    entirely — nothing is read, nothing is written, every call is delivered.
     `error_log`    path for the retrievable JSONL error log. `None` disables that sink.
+
+    `allow_cleartext_ntfy` opts a deployment IN to an `http://` topic URL. Defaults to `False`,
+                   which turns a cleartext topic into an unconfigured channel. See `ntfy_ready()`
+                   for why a topic URL is treated as a credential rather than an address.
 
     The remaining fields are the sizing knobs. They are constructor arguments rather than module
     constants a consumer is expected to edit after install, because an edited install is a fork.
@@ -366,6 +514,11 @@ class AlertSettings:
     error_log_backups: int = ERROR_LOG_BACKUPS
     max_record_field: int = MAX_RECORD_FIELD
     max_tracked_conditions: int = MAX_TRACKED_CONDITIONS
+    # ⚠️ APPENDED, not filed next to `ntfy_url` where it belongs by subject. A dataclass field's
+    # POSITION is part of the constructor signature, so inserting one mid-list silently rebinds
+    # every positional argument after it in code this library does not get to see. Readability
+    # inside this file is not worth that; the docstring above groups it where a reader looks.
+    allow_cleartext_ntfy: bool = False
 
     def __post_init__(self) -> None:
         # Raising here is deliberate and does NOT weaken the "notify() never raises" invariant:
@@ -436,6 +589,17 @@ class AlertSettings:
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:
                 raise ValueError(f"AlertSettings.{name} must be a positive integer, got {value!r}")
+
+        # A REAL bool, not a truthy value. This one field decides whether a topic capability is
+        # allowed to cross the wire in the clear, and the way it gets set wrong is the same way
+        # every blank path above gets set wrong: straight out of a container Variable. The string
+        # `"false"` is TRUE to Python, so a deployment that spelled its opt-out correctly in the
+        # template would have silently opted IN. Refuse the string and make the operator convert.
+        if not isinstance(self.allow_cleartext_ntfy, bool):
+            raise ValueError(
+                "AlertSettings.allow_cleartext_ntfy must be True or False, got "
+                f"{type(self.allow_cleartext_ntfy).__name__} — note that a non-empty string such "
+                f"as 'false' is TRUE to Python, so it is refused rather than honoured backwards")
 
 
 # --- the shared config file --------------------------------------------------------------------
@@ -634,6 +798,9 @@ class AlertConfig:
     ntfy_url: str = ""
     email: dict[str, str] | None = None
     config_file: str | None = None  # where `email` came from, for diagnostics only
+    # Appended for the same reason `AlertSettings.allow_cleartext_ntfy` is: a field's position is
+    # the constructor signature. `AlertConfig(url, email, path)` still means what it meant.
+    allow_cleartext_ntfy: bool = False
 
     @classmethod
     def load(cls, settings: AlertSettings) -> AlertConfig:
@@ -662,13 +829,28 @@ class AlertConfig:
                 parsed = {}
         return cls(ntfy_url=settings.ntfy_url or "",
                    email={k: parsed.get(k, "").strip() for k in EMAIL_KEYS},
-                   config_file=path)
+                   config_file=path,
+                   allow_cleartext_ntfy=_opted_into_cleartext(settings))
 
     # --- readiness (blank gating) ---------------------------------------------------------
     def ntfy_ready(self) -> bool:
-        """True only for a FULL http(s) URL. A bare topic is the live failure this guards:
-        urllib raises `unknown url type: '<topic>'` on every send, so the channel is dead while
-        looking configured. Reject it here, loudly, and let the boot warning see it as unset."""
+        """True only for a full topic URL this module is willing to send to.
+
+        Four things are refused, each of them loudly and each leaving the boot warning to see the
+        channel as unset rather than letting it fail per-alert forever:
+
+        * **whitespace or a control character** — survives `urlsplit`, raises out of
+          `http.client` on every send, and the message quotes the path;
+        * **a bare topic** (no scheme/host) — `unknown url type: '<topic>'` on every send, so the
+          channel is dead while looking configured;
+        * **userinfo** (`user:password@host`) — never worked, and its failure printed the
+          password;
+        * **`http://`**, unless `AlertSettings(allow_cleartext_ntfy=True)` — a topic URL is a
+          write capability.
+
+        NOTHING here echoes the URL. It is a capability, so every branch names the shape of the
+        problem and stops there.
+        """
         if not self.ntfy_url:
             return False
         if _UNSAFE_IN_URL.search(self.ntfy_url):
@@ -690,11 +872,41 @@ class AlertConfig:
             log.error("the ntfy URL is not parseable (%s) — ntfy alerts are DISABLED "
                       "until it is fixed", type(exc).__name__)
             return False
-        if parts.scheme in ("http", "https") and parts.netloc:
-            return True
-        log.error("the ntfy URL must be the FULL topic URL (https://<host>/<topic>), not a "
-                  "bare topic — ntfy alerts are DISABLED until it is fixed")
-        return False
+        if parts.scheme not in ("http", "https") or not parts.netloc:
+            log.error("the ntfy URL must be the FULL topic URL (https://<host>/<topic>), not a "
+                      "bare topic — ntfy alerts are DISABLED until it is fixed")
+            return False
+        if "@" in parts.netloc:
+            # ⭐ USERINFO IS REFUSED, AND IT COSTS NOTHING TO REFUSE. `urllib` puts the whole
+            # netloc — userinfo included — into the Host it hands `http.client`, which then sees
+            # two colons and raises `InvalidURL` QUOTING THE NETLOC. So a `user:password@host`
+            # topic URL never worked: it failed on every send, and the failure log printed the
+            # password. The channel was dead while looking configured, which is the same shape as
+            # the bare-topic case above, so it gets the same answer — refused ONCE at readiness,
+            # visible in the boot report, instead of an exception per alert forever.
+            #
+            # The message names the SHAPE, never the value: this is a capability.
+            log.error("the ntfy URL carries userinfo (user:password@host), which urllib cannot "
+                      "send and whose failure would print it — ntfy alerts are DISABLED until it "
+                      "is fixed. Put an ntfy token in a header-bearing proxy, not in the URL.")
+            return False
+        if parts.scheme == "http" and not self.allow_cleartext_ntfy:
+            # ⭐ A TOPIC URL IS A WRITE CAPABILITY, NOT AN ADDRESS. Anyone who observes it can
+            # page the operator from then on, and over cleartext the URL, the Title (which is
+            # where operators put the identifying half of the message) and the body all cross the
+            # wire in the clear. The exposure is permanent in a way an intercepted alert is not.
+            #
+            # Secure by DEFAULT, with a supported opt-in, rather than refused outright: a
+            # self-hosted ntfy on a trusted network is a real deployment, and a library that
+            # simply turns such a channel off leaves the operator with no path except a fork.
+            # `AlertSettings(allow_cleartext_ntfy=True)` is that path.
+            log.error("the ntfy URL is http:// — a topic URL is a write capability, and over "
+                      "cleartext it and every alert Title are readable by anything on the path. "
+                      "ntfy alerts are DISABLED. Use https://, or pass "
+                      "AlertSettings(allow_cleartext_ntfy=True) to accept the exposure "
+                      "deliberately on a trusted network.")
+            return False
+        return True
 
     def email_ready(self) -> bool:
         email = self.email or {}
@@ -805,6 +1017,30 @@ class AlertConfig:
 # --- channels ------------------------------------------------------------------------------
 def _send_email(cfg: AlertConfig, spec: SeveritySpec, title: str, message: str) -> None:
     email = cfg.email or {}
+    # ⭐ REFUSED HERE, BEFORE smtplib IS HANDED THE CREDENTIAL — because smtplib's own refusal
+    # PRINTS PART OF IT. `SMTP.auth` does `("\0%s\0%s" % (user, password)).encode("ascii")`, so a
+    # single non-ASCII character in either value raises
+    #     UnicodeEncodeError: 'ascii' codec can't encode character '\xe4' in position 6
+    # — the character itself, plus an offset that converts directly to an index into the password
+    # once the (unsecret) username's length is known. That message then reached the failure log on
+    # every alert, forever.
+    #
+    # Redaction cannot catch this one: the character is rendered as an escaped `repr`, not as the
+    # substring it came from, so `_redact` has nothing to match. The only containment that works
+    # is to never let the value reach the code that quotes it. Same answer, same reason, as
+    # `_fault_shape` gives for `SMTP_PORT`: name the setting and its length, never its value.
+    for key in ("SMTP_USER", "SMTP_PASSWORD"):
+        value = email.get(key, "")
+        try:
+            value.encode("ascii")
+        except UnicodeEncodeError:
+            # `from None`: chaining would hang the original exception — the one that quotes the
+            # character — off `__cause__`, where any handler rendering a traceback prints it. The
+            # point of raising our own is that the original never travels.
+            raise ValueError(
+                f"{key} contains a non-ASCII character, which SMTP AUTH cannot carry: "
+                f"{_fault_shape(value)} is REJECTED and this alert is not being emailed. "
+                f"Re-set it to an ASCII value.") from None
     msg = EmailMessage()
     msg["Subject"] = f"{spec.prefix} {title}"
     msg["From"] = email["EMAIL_FROM"]
@@ -824,6 +1060,34 @@ def _send_email(cfg: AlertConfig, spec: SeveritySpec, title: str, message: str) 
         smtp.send_message(msg)
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """A redirect handler that refuses every redirect.
+
+    ⭐ A PUBLISH ENDPOINT HAS NO BUSINESS REDIRECTING, and following one hands the alert to a host
+    the operator never configured. `urlopen` re-issues the request AT THE NEW LOCATION WITH THE
+    HEADERS INTACT — including `Title`, which is `[ERROR] <service>: <title>` and is where an
+    operator puts the identifying half of the message. The target need not share the original
+    host or even the scheme, so an `https` topic can be handed to a cleartext one by a single
+    `302` from a compromised or merely misconfigured endpoint. `ntfy_ready()` validates the URL
+    the OPERATOR chose; it has nothing to say about where that server then points.
+
+    Returning `None` here makes `HTTPRedirectHandler.http_error_3xx` decline, so the `3xx` falls
+    through to `HTTPDefaultErrorHandler` and is raised as an ordinary `HTTPError` — i.e. it
+    becomes a visible channel failure, which is the correct reading of an ntfy endpoint that has
+    started redirecting.
+    """
+
+    def redirect_request(self, req: object, fp: object, code: int, msg: str,
+                         headers: object, newurl: str) -> None:
+        return None
+
+
+# Built once, at import, exactly as `urlopen` builds its own default opener on first use — the
+# same handler set, with the redirect handler replaced. `build_opener` drops a default class when
+# a passed handler subclasses it, which is what makes the substitution total rather than additive.
+_NTFY_OPENER = urllib.request.build_opener(_RefuseRedirects)
+
+
 def _post_ntfy(cfg: AlertConfig, spec: SeveritySpec, title: str, message: str) -> None:
     # Header values are encoded latin-1 by http.client, so the Title stays ASCII and the emoji
     # is carried by the Tags header as a NAME (ntfy renders `white_check_mark` as ✅). Putting
@@ -841,7 +1105,16 @@ def _post_ntfy(cfg: AlertConfig, spec: SeveritySpec, title: str, message: str) -
     )
     # The scheme is validated in `AlertConfig.ntfy_ready()`, which the dispatcher calls before it
     # ever reaches this function — an unvalidated URL here could be a `file://` read.
-    urllib.request.urlopen(req, timeout=NTFY_TIMEOUT_S).read()  # noqa: S310 — scheme is gated
+    #
+    # `_NTFY_OPENER`, never `urlopen`: the module-level opener is the one that refuses redirects.
+    # `urlopen` uses a DIFFERENT, shared opener that follows them.
+    #
+    # CLOSED, not just read. The response holds the socket, and dropping it leaves the close to
+    # the garbage collector — measured as a `ResourceWarning` from the first test that drove this
+    # against a real server. On a service alerting every cycle that is a slow leak of file
+    # descriptors on the one path that runs when things are already going wrong.
+    with _NTFY_OPENER.open(req, timeout=NTFY_TIMEOUT_S) as response:
+        response.read()
 
 
 _CHANNELS: tuple[tuple[str, Callable[[AlertConfig, SeveritySpec, str, str], None]], ...] = (
@@ -1609,15 +1882,21 @@ class Alerter:
                 results[name] = "sent"
             except Exception as exc:  # noqa: BLE001 — one dead channel must not silence the other
                 results[name] = "failed"
+                # ⭐ REDACTED, BOTH BRANCHES. The exception here was raised by third-party code
+                # holding this module's configuration, and several stdlib exceptions quote the
+                # value that upset them. This log line repeats on EVERY alert, in the log an
+                # operator is most likely to paste into a bug report. See `_redact` for what that
+                # backstop does and does not reach.
+                detail = _redact(_safe_text(exc), cfg)
                 if _is_cert_failure(exc):
                     # Louder than a transient outage on purpose: a certificate that does not
                     # verify is the signature of something sitting between this service and the
                     # server.
                     log.error("%s alert failed TLS VERIFICATION — the server's certificate did "
                               "not validate, which is what an intercepted connection looks "
-                              "like: %s", name, exc)
+                              "like: %s", name, detail)
                 else:
-                    log.warning("%s alert failed: %s: %s", name, type(exc).__name__, exc)
+                    log.warning("%s alert failed: %s: %s", name, type(exc).__name__, detail)
         return results
 
     def notify(self, severity: str, title: str, message: str, escalating: bool = False,
@@ -1724,8 +2003,18 @@ class Alerter:
             # Reading the config can fail in ways no individual channel is responsible for (an
             # unreadable mount, a file in the wrong encoding). Every one of those used to travel
             # out of here into a caller that is often already inside an `except` block.
+            #
+            # ⭐ REDACTED TOO — the SIBLING of the two lines in `_dispatch`, and fixing those
+            # while leaving this one would have been half a fix. Redacted against a config built
+            # from the settings alone, because reaching here means the real load is what failed:
+            # the ntfy URL is available (it is a plain setting) and the SMTP password is not (it
+            # lives in the file that could not be read, so it is not in this message either).
+            try:
+                partial = AlertConfig(ntfy_url=str(getattr(self.settings, "ntfy_url", "") or ""))
+            except Exception:  # noqa: BLE001 — the settings object is why we are already here
+                partial = AlertConfig()
             log.error("alerting failed before any channel could be tried: %s: %s",
-                      type(exc).__name__, exc)
+                      type(exc).__name__, _redact(_safe_text(exc), partial))
             results = {name: "failed" for name, _ in _CHANNELS}
 
         if recognised and severity != OK and not any(r == "sent" for r in results.values()):

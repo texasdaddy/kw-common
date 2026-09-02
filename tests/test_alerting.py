@@ -10,13 +10,21 @@ is asked, or a test that asserts only that a call happened, proves nothing.
 
 from __future__ import annotations
 
+import contextlib
+import http.server
 import json
 import logging
+import os
 import ssl
+import stat
 import subprocess
 import sys
+import threading
 import urllib.error
+import urllib.request
+from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
@@ -354,12 +362,8 @@ def test_email_readiness_never_names_the_password(
     assert AlertConfig.load(settings).email["SMTP_PASSWORD"] == secret  # type: ignore[index]
 
 
-@pytest.mark.parametrize("url", [
-    "https://ntfy.example.com/topic",
-    "http://ntfy.example.com/topic",
-])
-def test_a_full_topic_url_is_ready(url: str) -> None:
-    assert AlertConfig(ntfy_url=url).ntfy_ready() is True
+def test_a_full_topic_url_is_ready() -> None:
+    assert AlertConfig(ntfy_url="https://ntfy.example.com/topic").ntfy_ready() is True
 
 
 @pytest.mark.parametrize("url", [
@@ -370,12 +374,86 @@ def test_a_full_topic_url_is_ready(url: str) -> None:
     "https://ntfy.example.com/to pic",
     "https://ntfy.example.com/\x00topic",
     "https://[::1/topic",
+    # Userinfo, both halves and the degenerate forms. urllib hands the WHOLE netloc to
+    # http.client as the Host, which sees two colons and raises `InvalidURL` quoting it — so
+    # every one of these was a channel that failed on every send and printed what it carried.
+    "https://alertuser:hunter2@ntfy.example.com/topic",
+    "https://alertuser@ntfy.example.com/topic",
+    "https://:hunter2@ntfy.example.com/topic",
 ])
 def test_an_unusable_ntfy_url_is_not_ready(url: str) -> None:
     """Including the two that RAISE rather than return False in a naive implementation: a control
     character (http.client `InvalidURL`, whose message quotes the topic) and an unclosed IPv6
     bracket (`urlsplit` raises `ValueError`)."""
     assert AlertConfig(ntfy_url=url).ntfy_ready() is False
+
+
+# ---------------------------------------------------------------- cleartext ntfy (issue #3)
+def test_a_cleartext_topic_url_is_not_ready_by_default(caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ THE DEFAULT IS THE WHOLE FIX. A topic URL is a write capability, so `http://` exposes
+    it — and every alert Title — to anything on the path, permanently. v1.0.0 accepted it."""
+    cfg = AlertConfig(ntfy_url="http://ntfy.example.com/topic")
+    with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
+        assert cfg.ntfy_ready() is False
+    assert "http://" in caplog.text, "the refusal must say WHICH scheme it refused"
+    assert "allow_cleartext_ntfy" in caplog.text, "and how to opt in deliberately"
+
+
+def test_a_cleartext_topic_url_is_ready_when_the_deployment_opts_in() -> None:
+    """The opt-in is a real path, not a token gesture: a self-hosted ntfy on a trusted network is
+    a supported deployment, and a library that only refuses leaves a fork as the alternative."""
+    cfg = AlertConfig(ntfy_url="http://ntfy.example.com/topic", allow_cleartext_ntfy=True)
+    assert cfg.ntfy_ready() is True
+
+
+def test_opting_in_to_cleartext_does_not_re_admit_anything_else() -> None:
+    """The opt-in is scoped to the SCHEME. It must not become a blanket "skip the checks" flag —
+    a userinfo URL and a bare topic stay refused, because neither has anything to do with it."""
+    for url in ("http://alertuser:hunter2@ntfy.example.com/topic", "a-bare-topic",
+                "ftp://ntfy.example.com/topic", "http://ntfy.example.com/to pic"):
+        assert AlertConfig(ntfy_url=url, allow_cleartext_ntfy=True).ntfy_ready() is False
+
+
+def test_the_cleartext_opt_in_travels_from_the_settings_to_the_config() -> None:
+    """`AlertConfig.load()` is the only route the flag takes in production. A field that the
+    settings hold and the config never reads is a setting that does nothing."""
+    common = {"service": "svc", "ntfy_url": "http://ntfy.example.com/topic"}
+    assert AlertConfig.load(AlertSettings(**common)).allow_cleartext_ntfy is False
+    assert AlertConfig.load(
+        AlertSettings(**common, allow_cleartext_ntfy=True)).allow_cleartext_ntfy is True
+    # And end-to-end through the readiness check, which is what the dispatcher actually asks.
+    assert AlertConfig.load(AlertSettings(**common)).ntfy_ready() is False
+    assert AlertConfig.load(AlertSettings(**common, allow_cleartext_ntfy=True)).ntfy_ready() is True
+
+
+@pytest.mark.parametrize("value", ["false", "False", "0", "no", "", 0, 1, None])
+def test_the_cleartext_opt_in_refuses_a_non_bool(value: object) -> None:
+    """⭐ `"false"` IS TRUE TO PYTHON. This flag is set from a container Variable like every other
+    setting here, and honouring the string would opt a deployment IN by reading its opt-OUT.
+    `0`/`1`/`None` are refused for the same reason: this decides an exposure, so it is spelled."""
+    with pytest.raises(ValueError, match="allow_cleartext_ntfy"):
+        AlertSettings(service="svc", allow_cleartext_ntfy=value)  # type: ignore[arg-type]
+
+
+def test_a_duck_typed_settings_object_cannot_opt_in_by_accident() -> None:
+    """`Alerter` accepts any settings-shaped object and validates nothing — the population the
+    blank-path backstops exist for. Only the literal `True` opts in; a truthy string does not,
+    and an attribute whose access RAISES is not an opt-in either."""
+    class Truthy:
+        service = "svc"
+        ntfy_url = "http://ntfy.example.com/topic"
+        config_file = state_file = error_log = None
+        allow_cleartext_ntfy = "false"   # truthy, and means the opposite
+
+    class Exploding(Truthy):
+        @property
+        def allow_cleartext_ntfy(self) -> bool:
+            raise RuntimeError("boom")
+
+    for obj in (Truthy(), Exploding()):
+        cfg = AlertConfig.load(obj)  # type: ignore[arg-type]
+        assert cfg.allow_cleartext_ntfy is False
+        assert cfg.ntfy_ready() is False
 
 
 def test_a_readiness_check_that_raises_disables_only_its_own_channel(
@@ -637,13 +715,31 @@ def test_post_ntfy_sends_the_body_and_the_severity_headers(
         captured["headers"] = dict(req.headers)  # type: ignore[attr-defined]
         captured["timeout"] = timeout
 
+        # A context manager, because a real `HTTPResponse` is one and `_post_ntfy` closes the
+        # response rather than leaving the socket to the collector.
         class Response:
             def read(self) -> bytes:
                 return b"ok"
 
+            def __enter__(self) -> Response:
+                return self
+
+            def __exit__(self, *_exc: object) -> None:
+                return None
+
         return Response()
 
-    monkeypatch.setattr(alerting.urllib.request, "urlopen", fake_urlopen)
+    # ⭐ THE OPENER, NOT `urlopen`. `_post_ntfy` sends through the module-level opener that
+    # refuses redirects; a spy on `urlopen` records nothing and every assertion below reads an
+    # empty dict.
+    #
+    # ⚠️ THE MODULE ATTRIBUTE, NOT `setattr(alerting._NTFY_OPENER, "open", ...)`. That form
+    # LEAKS ACROSS TESTS and it cost a debugging round: `monkeypatch` restores by writing the
+    # old value back, and the old value of an INSTANCE's `open` is the bound method it inherited
+    # from the class — so the undo installs a permanent instance attribute. Captured while
+    # `conftest` had the class patched to refuse, that permanent attribute is the refusal, and
+    # every later test that opts out of the network block still gets it.
+    monkeypatch.setattr(alerting, "_NTFY_OPENER", SimpleNamespace(open=fake_urlopen))
     cfg = AlertConfig(ntfy_url="https://ntfy.example.com/svc")
 
     alerting._post_ntfy(cfg, alerting.SEVERITIES[ERROR], "svc: down", "connection refused")
@@ -666,18 +762,311 @@ def test_post_ntfy_keeps_the_title_header_ascii(monkeypatch: pytest.MonkeyPatch)
     def fake_urlopen(req: object, timeout: float | None = None) -> object:
         seen.update(dict(req.headers))  # type: ignore[attr-defined]
 
+        # A context manager, because a real `HTTPResponse` is one and `_post_ntfy` closes the
+        # response rather than leaving the socket to the collector.
         class Response:
             def read(self) -> bytes:
                 return b"ok"
 
+            def __enter__(self) -> Response:
+                return self
+
+            def __exit__(self, *_exc: object) -> None:
+                return None
+
         return Response()
 
-    monkeypatch.setattr(alerting.urllib.request, "urlopen", fake_urlopen)
+    # ⭐ THE OPENER, NOT `urlopen`. `_post_ntfy` sends through the module-level opener that
+    # refuses redirects; a spy on `urlopen` records nothing and every assertion below reads an
+    # empty dict.
+    #
+    # ⚠️ THE MODULE ATTRIBUTE, NOT `setattr(alerting._NTFY_OPENER, "open", ...)`. That form
+    # LEAKS ACROSS TESTS and it cost a debugging round: `monkeypatch` restores by writing the
+    # old value back, and the old value of an INSTANCE's `open` is the bound method it inherited
+    # from the class — so the undo installs a permanent instance attribute. Captured while
+    # `conftest` had the class patched to refuse, that permanent attribute is the refusal, and
+    # every later test that opts out of the network block still gets it.
+    monkeypatch.setattr(alerting, "_NTFY_OPENER", SimpleNamespace(open=fake_urlopen))
     for severity in (OK, WARN, ERROR):
         alerting._post_ntfy(AlertConfig(ntfy_url="https://ntfy.example.com/t"),
                             alerting.SEVERITIES[severity], "svc: x", "m")
         for name, value in seen.items():
             assert str(value).isascii(), f"{name} header is not latin-1 safe: {value!r}"
+
+
+# ======================================= no credential reaches any sink on a failure path (#2)
+# ⭐⭐ THE CONTAINMENT PROPERTY, AND IT IS ASSERTED ON EVERY SINK. A fault report reaches FOUR
+# places — the container log, the email body, the ntfy body, and the persistent error-log file on
+# disk — so a test that greps only the log is a quarter of a guard.
+#
+# The two values below are planted into the config and are the only strings these tests look for.
+# They are shaped like what they stand in for and are visibly synthetic.
+CANARY_PASSWORD = "pw-CANARY-8f3a1c9d"  # noqa: S105 — a fixture value, and the point of the test
+CANARY_TOPIC = "topic-CANARY-2b7e5a"
+
+
+class QuotingFailure(RuntimeError):
+    """Stands in for the real thing: a third-party exception that quotes the configuration that
+    upset it. `http.client.InvalidURL` quotes the netloc; `UnicodeEncodeError` quotes a character
+    of the password. Using a stand-in keeps the test about CONTAINMENT rather than about which
+    stdlib version phrases which message how."""
+
+
+def _sinks(tmp_path: Path, smtp: FakeSMTP, request: object) -> dict[str, str]:
+    """The four places a report lands, as text. Named, so a failure says WHICH sink leaked."""
+    (msg,) = smtp.sent
+    # The ntfy sink is the BODY and the HEADERS. `full_url` is deliberately excluded: the topic
+    # is the address being posted to, and finding it there is the channel working.
+    ntfy = (request.data or b"").decode("utf-8", "replace") + repr(dict(request.headers))
+    log_path = tmp_path / "logs" / "errors.log"
+    return {
+        "the email message": str(msg),
+        "the ntfy request body/headers": ntfy,
+        "the persistent error log": log_path.read_text(encoding="utf-8"),
+    }
+
+
+def test_a_channel_failure_puts_no_credential_into_any_of_the_four_sinks(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐⭐ ISSUE #2. A misconfigured channel used to write its credential into the process log on
+    EVERY alert — repeating forever, in the log an operator is most likely to paste into a bug
+    report.
+
+    Both canaries are genuinely in the exception the channel raises (asserted, so this cannot
+    pass vacuously), and both must be absent from all four sinks. The diagnostic value is asserted
+    in the same breath: the exception TYPE survives, and something was actually replaced — a
+    "fix" that logged nothing at all would satisfy the absence half alone.
+    """
+    settings = AlertSettings(
+        service="svc",
+        config_file=str(tmp_path / "alerting.env"),
+        ntfy_url=f"https://ntfy.example.com/{CANARY_TOPIC}",
+        error_log=str(tmp_path / "logs" / "errors.log"),
+    )
+    write_email_config(settings, SMTP_PASSWORD=CANARY_PASSWORD)
+    # The REAL channels, not the autouse spies: what is under test is what the shipped send path
+    # does with an exception it did not raise.
+    monkeypatch.setattr(alerting, "_CHANNELS",
+                        (("email", alerting._send_email), ("ntfy", alerting._post_ntfy)))
+    monkeypatch.setattr(alerting.smtplib, "SMTP", FakeSMTP)
+    FakeSMTP.instances = []
+
+    attempted: list[object] = []
+
+    def failing_open(req: object, timeout: float | None = None) -> object:
+        attempted.append(req)
+        raise QuotingFailure(
+            f"cannot POST to {req.full_url!r} — rejected credentials "  # type: ignore[attr-defined]
+            f"{CANARY_PASSWORD!r}")
+
+    # The module attribute, never the instance's `open` — see the note on the spy above.
+    monkeypatch.setattr(alerting, "_NTFY_OPENER", SimpleNamespace(open=failing_open))
+
+    with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
+        results = Alerter(settings).notify(ERROR, "svc: db unreachable", "no route to host")
+
+    assert results == {"email": "sent", "ntfy": "failed"}
+    (smtp,) = FakeSMTP.instances
+    (request,) = attempted
+
+    # VACUITY GUARD. Rebuild the exception the channel raised and confirm both canaries really are
+    # in its text — otherwise every absence below is trivially true.
+    with pytest.raises(QuotingFailure) as raised:
+        failing_open(request)
+    assert CANARY_PASSWORD in str(raised.value)
+    assert CANARY_TOPIC in str(raised.value)
+
+    sinks = dict(_sinks(tmp_path, smtp, request), **{"the process log": caplog.text})
+    assert len(sinks) == 4, f"a sink went missing from this test: {sorted(sinks)}"
+    for name, text in sinks.items():
+        assert CANARY_PASSWORD not in text, f"the SMTP password reached {name}"
+        assert CANARY_TOPIC not in text, f"the ntfy topic reached {name}"
+
+    # ...and the log line is still worth reading.
+    assert "ntfy alert failed" in caplog.text
+    assert "QuotingFailure" in caplog.text, "the exception TYPE is the diagnostic that survives"
+    assert "<redacted>" in caplog.text, (
+        "nothing was replaced — an empty message would satisfy the absence assertions above "
+        "without redacting anything")
+
+
+def test_the_tls_branch_is_redacted_too(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """The certificate branch logs the exception in FULL on purpose — an unverified certificate is
+    the signature of interception — which makes it the branch most likely to be left unredacted.
+    It is a sibling of the ordinary failure line and was fixed with it."""
+    settings = AlertSettings(service="svc", config_file=str(tmp_path / "alerting.env"),
+                             ntfy_url=f"https://ntfy.example.com/{CANARY_TOPIC}")
+    write_email_config(settings, SMTP_PASSWORD=CANARY_PASSWORD)
+    monkeypatch.setattr(alerting, "_CHANNELS", (("email", alerting._send_email),))
+
+    def exploding(*_a: object, **_k: object) -> object:
+        raise urllib.error.URLError(
+            ssl.SSLCertVerificationError(f"cert for {CANARY_TOPIC} rejected {CANARY_PASSWORD}"))
+
+    monkeypatch.setattr(alerting.smtplib, "SMTP", exploding)
+    with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
+        assert Alerter(settings).notify(ERROR, "t", "m") == {"email": "failed"}
+
+    assert "TLS VERIFICATION" in caplog.text, "the loud branch is the one that must have run"
+    assert CANARY_PASSWORD not in caplog.text
+    assert CANARY_TOPIC not in caplog.text
+
+
+def test_the_pre_channel_failure_log_is_redacted_too(
+        monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ THE SIBLING SITE. `notify()` has its own handler for a failure that happens BEFORE any
+    channel is tried, and it rendered the exception verbatim exactly like the two in `_dispatch`.
+    Fixing the reported instances and leaving this one would have been half a fix."""
+    url = f"https://ntfy.example.com/{CANARY_TOPIC}"
+
+    def exploding_dispatch(*_a: object, **_k: object) -> dict[str, str]:
+        raise RuntimeError(f"the mount holding {url} went away")
+
+    monkeypatch.setattr(alerting.Alerter, "_dispatch", exploding_dispatch)
+    with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
+        Alerter(AlertSettings(service="svc", ntfy_url=url)).notify(ERROR, "t", "m")
+
+    assert "before any channel could be tried" in caplog.text
+    assert CANARY_TOPIC not in caplog.text
+    assert "<redacted>" in caplog.text
+
+
+def test_a_non_ascii_smtp_credential_is_refused_before_smtplib_sees_it(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ ISSUE #2 REPRO B, CLOSED AT THE SOURCE — redaction cannot reach this one.
+
+    `smtplib.SMTP.auth` encodes `"\\0<user>\\0<password>"` as ASCII, so one non-ASCII character
+    raises `UnicodeEncodeError: ... can't encode character '\\xe4' in position 6`. That prints the
+    character itself plus an offset that converts directly to an index into the password — and it
+    is rendered as an escaped `repr`, not as the substring it came from, so a substring
+    redaction has nothing to match. The only containment that works is to never hand the value to
+    the code that quotes it.
+    """
+    settings = AlertSettings(service="svc", config_file=str(tmp_path / "alerting.env"))
+    write_email_config(settings, SMTP_PASSWORD="pässwörd-CANARY")  # noqa: S106 — the fixture value
+    monkeypatch.setattr(alerting, "_CHANNELS", (("email", alerting._send_email),))
+    monkeypatch.setattr(alerting.smtplib, "SMTP", FakeSMTP)
+    FakeSMTP.instances = []
+
+    with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
+        assert Alerter(settings).notify(ERROR, "t", "m") == {"email": "failed"}
+
+    # Not one byte of the credential went anywhere: no connection was even opened.
+    assert FakeSMTP.instances == [], "the refusal must happen BEFORE a socket is opened"
+    assert "SMTP_PASSWORD" in caplog.text, "the SETTING is named, which is the actionable half"
+    assert "15-character value" in caplog.text, "its shape is named, exactly like SMTP_PORT's"
+    for fragment in ("ä", "ö", "\\xe4", "\\xf6", "position "):
+        assert fragment not in caplog.text, f"{fragment!r} reached the log"
+
+
+def test_the_same_refusal_covers_the_user_not_only_the_password(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """`auth` encodes BOTH halves in one string, so a non-ASCII USERNAME raises the identical
+    error — and its offset then locates a character of the username rather than the password.
+    Fixing one field and not its neighbour is the recurring miss in this module."""
+    settings = AlertSettings(service="svc", config_file=str(tmp_path / "alerting.env"))
+    write_email_config(settings, SMTP_USER="jörg@example.com")
+    monkeypatch.setattr(alerting, "_CHANNELS", (("email", alerting._send_email),))
+    monkeypatch.setattr(alerting.smtplib, "SMTP", FakeSMTP)
+    FakeSMTP.instances = []
+
+    with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
+        assert Alerter(settings).notify(ERROR, "t", "m") == {"email": "failed"}
+    assert FakeSMTP.instances == []
+    assert "SMTP_USER" in caplog.text
+    assert "ö" not in caplog.text
+
+
+def test_an_ascii_credential_still_sends(
+        settings: AlertSettings, monkeypatch: pytest.MonkeyPatch,
+        fake_smtp: type[FakeSMTP]) -> None:
+    """The negative direction. A refusal that refused everything would pass every assertion
+    above."""
+    write_email_config(settings)
+    monkeypatch.setattr(alerting, "_CHANNELS", (("email", alerting._send_email),))
+    assert Alerter(settings).notify(ERROR, "t", "m") == {"email": "sent"}
+    (smtp,) = fake_smtp.instances
+    assert smtp.calls == ["starttls", "login", "send_message"]
+
+
+# ------------------------------------------------------------------- `_redact` on its own
+def test_redaction_keeps_the_host_which_is_the_diagnostic_half() -> None:
+    """The host is NOT in the secret set, deliberately: it is where the diagnostic value lives
+    ("connection refused", a DNS failure), and it is not itself the capability. Redacting it
+    would push an operator towards turning this off."""
+    cfg = AlertConfig(ntfy_url="https://ntfy.example.com/secret-topic")
+    text = alerting._redact("<urlopen error [Errno -2] Name or service not known: "
+                            "'ntfy.example.com'>", cfg)
+    assert text == ("<urlopen error [Errno -2] Name or service not known: 'ntfy.example.com'>")
+
+
+@pytest.mark.parametrize("quoted", [
+    "https://user:hunter2@ntfy.example.com/secret-topic",  # the whole URL
+    "user:hunter2",                                        # the raw userinfo
+    "hunter2",                                             # just its password half
+    "/secret-topic",                                       # just the topic path
+])
+def test_redaction_covers_each_part_of_a_topic_url_that_an_exception_might_quote(
+        quoted: str) -> None:
+    """An exception rarely quotes the whole URL. `http.client.InvalidURL` quotes the NETLOC;
+    another might quote the selector. Each piece is the capability, or part of it."""
+    cfg = AlertConfig(ntfy_url="https://user:hunter2@ntfy.example.com/secret-topic")
+    assert quoted not in alerting._redact(f"failed on {quoted}", cfg)
+
+
+def test_a_bare_root_path_is_not_treated_as_a_secret() -> None:
+    """`"/"` is not a topic. Redacting it would replace every slash in the message, which is the
+    over-redaction that makes an operator stop reading the line."""
+    cfg = AlertConfig(ntfy_url="https://ntfy.example.com/")
+    assert alerting._redact("could not write /var/log/x", cfg) == "could not write /var/log/x"
+
+
+def test_redaction_replaces_the_longest_match_first() -> None:
+    """A secret that CONTAINS another (the URL and its own path) must be replaced whole, not
+    broken into a redacted fragment plus a leftover tail of the same secret."""
+    cfg = AlertConfig(ntfy_url="https://ntfy.example.com/secret-topic")
+    out = alerting._redact("POST https://ntfy.example.com/secret-topic failed", cfg)
+    assert "secret-topic" not in out
+    assert out == "POST <redacted> failed"
+
+
+def test_redaction_suppresses_the_text_when_the_secrets_cannot_be_enumerated() -> None:
+    """If the question "does this contain a secret" cannot be answered, the answer is not "print
+    it". Costing a diagnostic beats printing a credential."""
+    class Hostile:
+        email = None
+
+        @property
+        def ntfy_url(self) -> str:
+            raise RuntimeError("boom")
+
+    out = alerting._redact("anything at all", Hostile())  # type: ignore[arg-type]
+    assert "anything at all" not in out
+    assert "could not be enumerated" in out
+
+
+def test_a_hostile_exception_does_not_take_the_log_line_with_it(
+        monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """`str(exc)` is now called eagerly, so an exception whose `__str__` raises would have become
+    the failure. It is guarded, and the record still goes out naming the channel and the type."""
+    class Hostile(RuntimeError):
+        def __str__(self) -> str:
+            raise ValueError("no")
+
+    def exploding(*_a: object, **_k: object) -> None:
+        raise Hostile()
+
+    monkeypatch.setattr(alerting, "_CHANNELS", (("ntfy", exploding),))
+    settings = AlertSettings(service="svc", ntfy_url="https://ntfy.example.com/t")
+    with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
+        assert Alerter(settings).notify(ERROR, "t", "m") == {"ntfy": "failed"}
+    assert "ntfy alert failed" in caplog.text
+    assert "Hostile" in caplog.text
 
 
 # ============================================================ edge-trigger / escalate / clears
@@ -1584,6 +1973,237 @@ def test_configure_replaces_a_previous_default(settings: AlertSettings) -> None:
     second = alerting.configure(AlertSettings(service="other"))
     assert alerting.current_alerter() is second
     assert second is not first
+
+
+# =============================================== the ntfy channel follows no redirect (#4)
+# These are the only tests in this suite that open a socket, and they are marked
+# `allow_loopback` to say so. They have to: what is under test is what `urllib`'s OWN handler
+# stack does with a real `3xx`, and a stub cannot answer that — a spy on the opener would be
+# asserting that the test's own fake refused to redirect.
+@contextlib.contextmanager
+def _loopback_server(handler: type) -> Iterator[http.server.HTTPServer]:
+    server = http.server.HTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=10)
+
+
+class _Recorder(http.server.BaseHTTPRequestHandler):
+    """Records what it was actually POSTed. `received` is a class attribute so the test can read
+    it without holding the instance."""
+
+    received: ClassVar[list[tuple[str, str | None, bytes]]] = []
+
+    def do_POST(self) -> None:
+        length = int(self.headers.get("Content-Length") or 0)
+        _Recorder.received.append((self.path, self.headers.get("Title"), self.rfile.read(length)))
+        self.send_response(200)
+        self.send_header("Content-Length", "2")
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, *_a: object) -> None:
+        return None
+
+
+def _redirector_to(port: int) -> type:
+    class _Redirector(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{port}/exfil")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def log_message(self, *_a: object) -> None:
+            return None
+
+    return _Redirector
+
+
+@pytest.fixture
+def _direct_to_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the shipped opener reach 127.0.0.1 directly whatever this machine's proxy settings
+    are. `ProxyHandler.proxy_open` consults `urllib.request.proxy_bypass`, which reads the
+    environment (and on Windows the registry), so without this the test is config-dependent — it
+    would pass here and route through a proxy on a differently-configured runner. Nothing about
+    the redirect handler under test is affected."""
+    monkeypatch.setattr(urllib.request, "proxy_bypass", lambda host: True)
+
+
+@pytest.mark.allow_loopback
+@pytest.mark.usefixtures("_direct_to_loopback")
+def test_post_ntfy_refuses_to_follow_a_redirect() -> None:
+    """⭐⭐ ISSUE #4. `urlopen` re-issues a redirected request WITH THE HEADERS INTACT, so a `302`
+    from the topic host delivers the alert `Title` — `[ERROR] <service>: <title>`, the most
+    identifying part of the message — to a host the operator never configured, over any scheme
+    the redirect names.
+
+    The assertion is on the TARGET, not on the exception: what matters is that the second server
+    received nothing at all.
+    """
+    _Recorder.received = []
+    with (_loopback_server(_Recorder) as target,
+          _loopback_server(_redirector_to(target.server_port)) as redirector):
+        cfg = AlertConfig(ntfy_url=f"http://127.0.0.1:{redirector.server_port}/topic",
+                          allow_cleartext_ntfy=True)
+        assert cfg.ntfy_ready() is True
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            alerting._post_ntfy(cfg, alerting.SEVERITIES[ERROR],
+                                "svc: db password rotation failed", "body")
+        # `HTTPError` IS a response and holds the socket; dropping it leaves the close to the
+        # collector, which `filterwarnings = ["error"]` turns into a session failure.
+        raised.value.close()
+    assert raised.value.code == 302, "a refused redirect must surface as the 3xx it was"
+    assert _Recorder.received == [], (
+        f"the redirect target received the alert: {_Recorder.received}")
+
+
+@pytest.mark.allow_loopback
+@pytest.mark.usefixtures("_direct_to_loopback")
+def test_post_ntfy_still_delivers_when_the_server_does_not_redirect() -> None:
+    """⭐ THE NEGATIVE DIRECTION, and it is the half that makes the test above mean something: an
+    opener that refused EVERY request would satisfy "the target received nothing" perfectly."""
+    _Recorder.received = []
+    with _loopback_server(_Recorder) as target:
+        cfg = AlertConfig(ntfy_url=f"http://127.0.0.1:{target.server_port}/topic",
+                          allow_cleartext_ntfy=True)
+        alerting._post_ntfy(cfg, alerting.SEVERITIES[ERROR], "svc: down", "no route to host")
+    assert _Recorder.received == [("/topic", "[ERROR] svc: down", b"no route to host")]
+
+
+def test_the_ntfy_opener_has_no_redirect_handler_that_follows() -> None:
+    """The structural half, so a regression is legible without a socket: `build_opener` drops the
+    stock `HTTPRedirectHandler` only because ours subclasses it. Substituting a handler that does
+    NOT subclass it would leave both installed, and the stock one would win."""
+    handlers = [h for h in alerting._NTFY_OPENER.handlers
+                if isinstance(h, urllib.request.HTTPRedirectHandler)]
+    assert len(handlers) == 1, f"expected exactly one redirect handler, got {handlers}"
+    assert isinstance(handlers[0], alerting._RefuseRedirects)
+    assert handlers[0].redirect_request(None, None, 302, "Found", None, "http://elsewhere") is None
+
+
+# ============================================= the error log's file modes (#6 item 1, POSIX)
+# ⭐ THE ONE MUTATION SURVIVOR WITH REAL CONSEQUENCE. `_restrict()` is a security control with a
+# six-line justification and, until this section, no verification at all: gutting it to `pass`
+# survived a 127-mutation sweep, and so did removing the deliberately redundant post-write call.
+# It is untestable on the Windows dev box, where `chmod` is near-inert — but CI runs
+# `ubuntu-latest`, where it is exact. Skipped rather than weakened, so the assertions stay real.
+posix_only = pytest.mark.skipif(
+    os.name != "posix", reason="POSIX permission bits; Windows chmod cannot express them")
+
+
+@pytest.fixture
+def _exact_modes() -> Iterator[None]:
+    """`umask` subtracts from every mode a file is CREATED with, so without this the assertions
+    below measure the runner's umask as much as the code. Zeroed and restored."""
+    previous = os.umask(0)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+@posix_only
+def test_restrict_narrows_a_file_that_already_exists(tmp_path: Path) -> None:
+    """The whole reason `_restrict` exists: `os.open(..., mode)` is ignored for a path that is
+    already there, so on any upgrade path a file written 0644 by an earlier build stays readable
+    by everything on the host forever."""
+    path = tmp_path / "errors.log"
+    path.write_text("{}\n", encoding="utf-8")
+    os.chmod(path, 0o644)
+    alerting._restrict(str(path), 0o600)
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@posix_only
+def test_restrict_narrows_a_directory_that_already_exists(tmp_path: Path) -> None:
+    """`makedirs(exist_ok=True)` never chmods, so a directory an operator created over SMB keeps
+    its wide mode while the docstring claims 0o700."""
+    directory = tmp_path / "logs"
+    directory.mkdir(mode=0o755)
+    # Setting the WIDE mode is the precondition under test, not a mistake — hence the suppression
+    # below. `mkdir`'s own mode is subject to the umask, so it is set explicitly here.
+    os.chmod(directory, 0o755)  # noqa: S103
+    alerting._restrict(str(directory), 0o700)
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+
+def test_restrict_is_silent_for_a_path_that_is_not_there(tmp_path: Path) -> None:
+    alerting._restrict(str(tmp_path / "nope" / "errors.log"), 0o600)  # must not raise
+
+
+def test_restrict_is_silent_when_chmod_refuses(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A filesystem that does not model these bits, or a file owned by someone else. Never worth
+    failing an alert over — and `notify()` must not learn to raise here."""
+    path = tmp_path / "errors.log"
+    path.write_text("x", encoding="utf-8")
+
+    def refuse(*_a: object, **_k: object) -> None:
+        raise PermissionError("not yours")
+
+    monkeypatch.setattr(alerting.os, "chmod", refuse)
+    alerting._restrict(str(path), 0o600)  # must not raise
+
+
+@posix_only
+@pytest.mark.usefixtures("_exact_modes")
+def test_a_new_error_log_and_its_directory_are_created_narrow(tmp_path: Path) -> None:
+    """The fresh-container case: nothing exists, and the first record must not land wide."""
+    directory = tmp_path / "logs"
+    settings = AlertSettings(service="svc", error_log=str(directory / "errors.log"))
+    Alerter(settings).notify(ERROR, "svc: down", "no route to host")
+
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+    assert stat.S_IMODE((directory / "errors.log").stat().st_mode) == 0o600
+
+
+@posix_only
+@pytest.mark.usefixtures("_exact_modes")
+def test_an_existing_wide_error_log_and_directory_are_narrowed_on_write(tmp_path: Path) -> None:
+    """⭐ THE MUTATION THAT SURVIVED. Both already exist and both are wide, so every `mode=`
+    argument in `_append_error_record` is inert and ONLY `_restrict` can fix it. Gutting
+    `_restrict` to `pass` reddens exactly here."""
+    directory = tmp_path / "logs"
+    directory.mkdir()
+    os.chmod(directory, 0o755)  # noqa: S103 — the WIDE precondition is the point of this test
+    path = directory / "errors.log"
+    path.write_text("", encoding="utf-8")
+    os.chmod(path, 0o644)
+
+    settings = AlertSettings(service="svc", error_log=str(path))
+    Alerter(settings).notify(ERROR, "svc: down", "no route to host")
+
+    assert stat.S_IMODE(directory.stat().st_mode) == 0o700, (
+        "the directory stayed group/world-readable")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600, "the log stayed group/world-readable"
+    assert "svc: down" in path.read_text(encoding="utf-8"), "and the record was still written"
+
+
+@posix_only
+@pytest.mark.usefixtures("_exact_modes")
+def test_the_post_write_restrict_is_load_bearing(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """⭐ THE DELIBERATELY REDUNDANT CALL, pinned. On the very FIRST alert the file does not exist
+    yet, so the `_restrict` BEFORE the write cannot narrow it and the mode comes only from
+    `os.open`. The call after the write is what covers `os.open`'s mode being wrong — which is
+    exactly what this simulates. Removing it reddens here and nowhere else.
+    """
+    real_open = os.open
+
+    def wide_open(path: object, flags: int, mode: int = 0o777) -> int:
+        return real_open(path, flags, 0o666)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(alerting.os, "open", wide_open)
+    path = tmp_path / "errors.log"
+    Alerter(AlertSettings(service="svc", error_log=str(path))).notify(ERROR, "t", "m")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 # ====================================================================== the public API surface

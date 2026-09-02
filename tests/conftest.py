@@ -24,12 +24,27 @@ class NetworkAccessInTests(RuntimeError):
 
 
 @pytest.fixture(autouse=True)
-def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
+def _no_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
     """Make a real send impossible for every test in this suite.
 
     Deliberately raises rather than returning a stub: a stub that answers whatever it is asked
     would let a test "pass" while proving nothing about what was actually sent.
+
+    ⭐ `OpenerDirector.open` IS BLOCKED, NOT ONLY `urlopen` — and that gap was live, measured.
+    `urlopen` is one opener among many; the ntfy channel now sends through a module-level opener
+    of its own (the one that refuses redirects), so patching `urlopen` stopped covering the path
+    that actually sends. Three tests walked straight past this fixture into a real DNS lookup —
+    precisely the failure the module docstring above describes, one release later. Blocking the
+    CLASS method covers every opener, including one a future change builds. A test may still
+    shadow `open` on its own opener INSTANCE, which is what a spy does.
+
+    `@pytest.mark.allow_loopback` opts a test out. Exactly one kind of test needs it: the
+    redirect refusal cannot be proved against a stub, because what is under test is what
+    `urllib`'s own handler stack does with a real `3xx`.
     """
+    if request.node.get_closest_marker("allow_loopback"):
+        return
+
     def refuse(*args: object, **kwargs: object) -> object:
         raise NetworkAccessInTests(
             "a test tried to open a real connection — replace the channels with spies "
@@ -37,6 +52,7 @@ def _no_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(smtplib, "SMTP", refuse)
     monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", refuse)
 
 
 @pytest.fixture(autouse=True)

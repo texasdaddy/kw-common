@@ -16,13 +16,13 @@ no port, no alignment audit, and no "which copy is the good one" question to ans
 Consumers install from git at an **exact tag** — never a branch:
 
 ```
-pip install git+https://github.com/texasdaddy/kw-common@v1.0.0
+pip install git+https://github.com/texasdaddy/kw-common@v1.0.1
 ```
 
 In a `requirements.in` / `requirements.txt`:
 
 ```
-kw-common @ git+https://github.com/texasdaddy/kw-common@v1.0.0
+kw-common @ git+https://github.com/texasdaddy/kw-common@v1.0.1
 ```
 
 ⛔ **Never pin a branch.** `@main` makes every rebuild of every consumer a silent, unreviewed
@@ -48,7 +48,7 @@ from kw_common.alerting import (
 configure(AlertSettings(
     service="my-service",
     config_file="/etc/my-service/alerting.env",       # email settings; None = no email channel
-    ntfy_url="https://ntfy.example.com/my-topic",     # "" = no ntfy channel
+    ntfy_url="https://ntfy.example.com/my-topic",     # https only; "" = no ntfy channel
     state_file="/data/my-service/alert-state.json",   # None = de-duplication OFF
     error_log="/data/my-service/logs/errors.log",     # None = no error-log sink
 ))

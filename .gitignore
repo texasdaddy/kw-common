@@ -7,7 +7,10 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-.venv/
+# `.venv*/`, not `.venv/`: this project is tested on two interpreters, so a working tree
+# routinely holds `.venv` beside `.venv310`. The narrower pattern left the second one UNTRACKED
+# and therefore visible to `git add -A`.
+.venv*/
 venv/
 
 # Tooling caches
