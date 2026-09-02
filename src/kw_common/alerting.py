@@ -988,6 +988,21 @@ class AlertConfig:
             # runs `_get_hostport` and `_validate_host` — the exact code the send path runs —
             # and OPENS NOTHING (no socket exists until `.connect()`).
             #
+            # ⚠️ ONE SHAPE IS STILL ADMITTED ON SOME INTERPRETERS, scoped here rather than
+            # claimed closed. A BRACKETED-IPv6 host carrying colon-bearing userinfo —
+            # `https://tok:secret[::1]/topic` — is refused only because `urlsplit` raises
+            # `Invalid IPv6 URL`, and that comes from `urllib.parse._check_bracketed_netloc`, a
+            # CPython hardening shipped in a PATCH release. Measured: present on 3.10.20 and
+            # 3.14.7, ABSENT on 3.12.0 — and `requires-python = ">=3.10"` admits both. Where it
+            # is absent, such a URL reports READY and is dead on every send.
+            #
+            # Left alone deliberately. The CREDENTIAL half does not occur: the send fails with
+            # `getaddrinfo failed`, which names neither the host nor the userinfo (measured on
+            # 3.12.0), so the containment property holds on every interpreter in range. Only the
+            # "dead while looking configured" half gets through, for a shape an operator has to
+            # construct on purpose. Closing it would mean a FOURTH host-shape predicate, and
+            # predicates are precisely what this check has already been wrong about twice.
+            #
             # The latin-1 check is the other half, and it corrects a claim this file made and had
             # wrong: a non-ASCII host is NOT IDNA-encoded on this path. `urllib` pre-adds the
             # `Host` header, so `putrequest`'s IDNA branch is skipped (`skip_host=1`) and

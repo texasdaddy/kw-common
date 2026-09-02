@@ -529,6 +529,11 @@ def test_ntfy_readiness_never_echoes_the_url_on_any_refusal(
     `LogRecord.lineno` is the branch identity, so a row that drifts onto a neighbour collides and
     fails. That is the difference between a table of branches and a table of hopes.
 
+    ⚠️ ITS ONE LIMIT, stated rather than left to be discovered: `lineno` is the line the `log`
+    call sits on, so routing these refusals through a shared helper would collapse them all onto
+    the helper's line and this test would report a collision that is not one. No such helper
+    exists; if one is ever added, pass `stacklevel=2` so the record keeps naming the caller.
+
     `_redact` does not backstop this. It operates on channel-FAILURE text; readiness logging
     never passes through it.
     """

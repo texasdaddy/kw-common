@@ -79,10 +79,21 @@ def _no_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
     # paragraph refuses). Adding `SMTP_SSL` by name then left `LMTP`, a third subclass, doing the
     # same thing — fixing the instance and not the class, one round apart. This asks the module
     # which of its names are SMTP classes, so a fourth cannot appear behind the guard's back.
+    #
+    # ⚠️ NO `assert` HERE, and that is deliberate. A sanity check on what the sweep found belongs
+    # in a TEST, not in an autouse fixture: `smtplib` defines `SMTP_SSL` only under
+    # `if _have_ssl:`, so on a build without ssl — or after any upstream rename — an assertion
+    # here ERRORS EVERY TEST IN THE SUITE, turning a one-name upstream change into 260 failures
+    # that read like a broken harness. `test_no_network.py::test_the_block_refuses_every_smtp_class`
+    # names all three and fails as ONE legible test instead.
+    #
+    # ⛔ THE NAMES ARE COLLECTED BEFORE ANY PATCHING, and the two steps must not interleave:
+    # patching `smtplib.SMTP` replaces it with a FUNCTION, so the next `issubclass(obj,
+    # smtplib.SMTP)` raises `TypeError: issubclass() arg 2 must be a class`. Measured — written
+    # the interleaved way it errored all 262 tests at once.
+    real_smtp = smtplib.SMTP
     smtp_classes = [name for name, obj in vars(smtplib).items()
-                    if isinstance(obj, type) and issubclass(obj, smtplib.SMTP)]
-    assert "SMTP" in smtp_classes and "SMTP_SSL" in smtp_classes and "LMTP" in smtp_classes, (
-        f"the SMTP class sweep found {smtp_classes} — it is no longer finding what it is for")
+                    if isinstance(obj, type) and issubclass(obj, real_smtp)]
     for name in smtp_classes:
         monkeypatch.setattr(smtplib, name, refuse)
     monkeypatch.setattr(urllib.request, "urlopen", refuse)
