@@ -16,13 +16,13 @@ no port, no alignment audit, and no "which copy is the good one" question to ans
 Consumers install from git at an **exact tag** — never a branch:
 
 ```
-pip install git+https://github.com/texasdaddy/kw-common@v1.0.0
+pip install git+https://github.com/texasdaddy/kw-common@v1.0.1
 ```
 
 In a `requirements.in` / `requirements.txt`:
 
 ```
-kw-common @ git+https://github.com/texasdaddy/kw-common@v1.0.0
+kw-common @ git+https://github.com/texasdaddy/kw-common@v1.0.1
 ```
 
 ⛔ **Never pin a branch.** `@main` makes every rebuild of every consumer a silent, unreviewed
@@ -48,7 +48,7 @@ from kw_common.alerting import (
 configure(AlertSettings(
     service="my-service",
     config_file="/etc/my-service/alerting.env",       # email settings; None = no email channel
-    ntfy_url="https://ntfy.example.com/my-topic",     # "" = no ntfy channel
+    ntfy_url="https://ntfy.example.com/my-topic",     # https only; "" = no ntfy channel
     state_file="/data/my-service/alert-state.json",   # None = de-duplication OFF
     error_log="/data/my-service/logs/errors.log",     # None = no error-log sink
 ))
@@ -62,6 +62,13 @@ notify(OK, "my-service: backup ok", "12.4 GB", clears="my-service: backup failed
 Everything the module needs is passed in. It reads no environment variable and has no default
 path — see the contract below, and the module's own docstring for the full behaviour (severities,
 `escalating=`, `clears=`, and the error log's exposure warning).
+
+⚠️ **An ntfy topic URL must be `https://`.** It is a *write capability*, not an address: anyone who
+observes it can page you from then on, and over cleartext the URL, the alert `Title` and the body
+are all readable by anything on the path. A `http://` URL turns the channel off, loudly, at boot.
+For a self-hosted endpoint on a trusted network, `AlertSettings(allow_cleartext_ntfy=True)` is the
+supported way to accept that exposure deliberately. Userinfo (`https://user:pass@host/topic`) is
+refused outright — `urllib` cannot send it, and its failure printed the password.
 
 ## The generic-code contract
 

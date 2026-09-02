@@ -89,3 +89,11 @@ testpaths = ["tests"]
 # a per-test ceiling turns that into a fast, legible failure.
 addopts = "-q --timeout=60"
 filterwarnings = ["error"]
+markers = [
+    # Opts a test out of the autouse network block in `tests/conftest.py`. It exists for the
+    # redirect-refusal tests, which have to drive `urllib`'s real handler stack against a
+    # loopback server — a stub cannot answer what urllib does with a `3xx`. Registered here
+    # because `filterwarnings = ["error"]` turns an unknown mark into a failure, which is what
+    # keeps this list honest.
+    "allow_loopback: may connect to 127.0.0.1 AND NOWHERE ELSE — conftest._no_network narrows the block for this test rather than lifting it",
+]
