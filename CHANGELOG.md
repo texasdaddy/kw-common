@@ -68,8 +68,16 @@ removes them rather than carrying them forward into six copies.
   reads it.
 - Verification for `_restrict()`, the 0600/0700 narrowing (#6, item 1) — a security control that
   had a six-line justification and no test at all: gutting it to `pass` survived a 127-mutation
-  sweep, and so did removing the deliberately redundant post-write call. POSIX-only, so these run
-  on the CI matrix rather than on a Windows worktree, where `chmod` cannot express the bits.
+  sweep, and so did removing the deliberately redundant post-write call. The two tests that need
+  real mode bits are POSIX-only and run on the CI matrix rather than on a Windows worktree, where
+  `chmod` cannot express them; the two that assert *behaviour* (that `chmod` is not attempted on
+  a missing path, and that a refused `chmod` stays silent) run everywhere. Measured on
+  `ubuntu-latest`: 5 of 7 mutations caught, and the 2 survivors are the deliberate redundancies
+  (`os.makedirs`' and `os.open`'s `mode=` arguments, each reaching the same end state as the
+  `_restrict` call beside it).
+- A test for the suite's own no-network property (`tests/test_no_network.py`). It was a guard with
+  no test, and four mutations of it — including lifting the block entirely — left the whole suite
+  green.
 
 ### Fixed
 

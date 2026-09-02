@@ -504,35 +504,51 @@ def test_ntfy_readiness_never_echoes_the_url_on_any_refusal(
     `test_email_readiness_never_names_the_password` has pinned this for the email channel since
     v1.0.0. The ntfy channel — where the URL IS the capability, and where issue #2's repro A was
     a refusal message printing exactly that — had no counterpart: every ntfy readiness test
-    asserted only `is False`. Measured during verification: mutating ANY of the five refusal
-    branches to log `self.ntfy_url` survived the entire suite, so the docstring's "NOTHING here
-    echoes the URL" was an unverified claim on the exact line that matters most.
+    asserted only `is False`. Measured during verification: mutating ANY refusal branch to log
+    `self.ntfy_url` survived the entire suite, so the docstring's "NOTHING here echoes the URL"
+    was an unverified claim on the exact line that matters most.
+
+    ⭐ ONE URL PER BRANCH, AND THE MESSAGES MUST BE DISTINCT. Counting records alone does not
+    establish per-branch coverage — measured, two of the URLs in the first version of this test
+    landed on the SAME branch and the count was satisfied anyway, so a branch could stop being
+    exercised with nothing going red. Requiring the seven messages to be pairwise distinct is
+    what makes each row of the table below a branch rather than a hope.
 
     `_redact` does not backstop this. It operates on channel-FAILURE text; readiness logging
     never passes through it.
     """
     secret = "hunter2"  # noqa: S105 — the fixture value, and the point of the test
     topic = "the-capability-topic"
-    urls = [
-        f"https://ntfy.example.com/{topic} with a space",       # the unsafe-character branch
-        f"a-bare-{topic}",                                       # the bare-topic branch
-        f"https://[::1/{topic}",                                 # the urlsplit-ValueError branch
-        f"https://alertuser:{secret}@ntfy.example.com/{topic}",  # userinfo
-        f"https://alertuser:{secret}%40ntfy.example.com/{topic}",  # userinfo, percent-encoded
-        f"https://ntfy.example.com/{topic}-töpic",               # non-ASCII topic
-        f"http://ntfy.example.com/{topic}",                      # cleartext
+    # (what this row exercises, a URL that reaches it). Every REACHABLE refusal branch in
+    # `ntfy_ready()` appears exactly once. The eighth branch — `Request(...)` itself raising —
+    # is not here because no input was found that reaches it; see its comment in the module.
+    branches = [
+        ("unsafe character in the raw URL", f"https://ntfy.example.com/{topic} with a space"),
+        ("bare topic / non-http scheme", f"a-bare-{topic}"),
+        ("urlsplit raises", f"https://[::1/{topic}"),
+        ("non-ASCII topic", f"https://ntfy.example.com/{topic}-töpic"),
+        ("userinfo in the decoded host", f"https://alertuser:{secret}@ntfy.example.com/{topic}"),
+        ("a host http.client refuses", f"https://tok:{secret}%2540ntfy.example.com/{topic}"),
+        ("cleartext", f"http://ntfy.example.com/{topic}"),
     ]
-    with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
-        for url in urls:
+    messages: dict[str, str] = {}
+    for label, url in branches:
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
             assert AlertConfig(ntfy_url=url).ntfy_ready() is False, url
+        # VACUITY GUARD: this URL really did produce a refusal line, so the absence assertions
+        # below are answering a question that could have gone the other way.
+        assert len(caplog.records) == 1, (
+            f"{label}: expected exactly one refusal line, got "
+            f"{[r.getMessage()[:60] for r in caplog.records]}")
+        messages[label] = caplog.records[0].getMessage()
 
-    # VACUITY GUARD: every one of those really did produce a refusal line, so the absence
-    # assertions below are answering a question that could have gone the other way.
-    assert len(caplog.records) == len(urls), (
-        f"expected one refusal line per URL, got {len(caplog.records)} for {len(urls)} URLs")
-    assert secret not in caplog.text, "a refusal message printed the ntfy credential"
-    assert topic not in caplog.text, "a refusal message printed the topic, which is a capability"
-    assert "ntfy.example.com" not in caplog.text, "a refusal message printed the endpoint"
+    assert len(set(messages.values())) == len(branches), (
+        f"two rows landed on the SAME refusal branch, so one branch is unexercised: {messages}")
+    for label, message in messages.items():
+        assert secret not in message, f"{label}: the refusal printed the ntfy credential"
+        assert topic not in message, f"{label}: the refusal printed the topic, a capability"
+        assert "ntfy.example.com" not in message, f"{label}: the refusal printed the endpoint"
 
 
 # ---------------------------------------------------------------- cleartext ntfy (issue #3)

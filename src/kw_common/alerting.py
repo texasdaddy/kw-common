@@ -941,6 +941,14 @@ class AlertConfig:
             # Same reasoning as the `urlsplit` guard above, and the same discipline: the class
             # name only. `Request` raises `ValueError` for a URL it cannot type, and its message
             # quotes the URL.
+            #
+            # ⚠️ BELIEVED UNREACHABLE, and said out loud rather than left to imply coverage: once
+            # the scheme/netloc check above has passed, no input was found that makes `Request`
+            # raise (~20 candidates tried during verification — odd ports, `%ff` hosts, `[v1...]`,
+            # a bare `%`, IDNA forms). It is kept because `Request` is third-party code on the
+            # alerting path and a readiness check that throws takes the OTHER channel's
+            # notification with it. It is the one refusal branch with no test, for want of an
+            # input that reaches it.
             log.error("the ntfy URL could not be parsed the way the send path parses it (%s) — "
                       "ntfy alerts are DISABLED until it is fixed", type(exc).__name__)
             return False

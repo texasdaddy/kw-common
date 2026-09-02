@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import smtplib
 import urllib.request
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -43,8 +44,23 @@ def _no_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
     against a stub, because what is under test is what `urllib`'s own handler stack does with a
     real `3xx` — and an opt-out that simply returned would have been the first way for a test to
     walk out of the property this file's docstring calls "impossible rather than remembered", for
-    ANY host. So under the marker `smtplib` stays blocked outright and the opener is allowed
-    through ONLY to `127.0.0.1`, which is what the marker's name promises.
+    ANY host. So under the marker `smtplib` stays blocked and the opener is allowed through only
+    to a loopback host.
+
+    ⚠️ WHAT THIS DOES NOT COVER, stated because a guard that implies coverage it lacks is worse
+    than none. All three were measured:
+
+    * **Only the opener layer.** A test that calls `http.client`, `socket.create_connection` or
+      `socket.getaddrinfo` directly reaches the real stack. That is deliberate — those are what
+      `_post_ntfy`'s loopback tests need underneath them — but it means this is not a sandbox.
+    * **`smtplib` is blocked by NAME.** `smtplib.SMTP` and `SMTP_SSL` are replaced, so the shipped
+      module (which uses `smtplib.SMTP`) cannot connect; a test that did
+      `from smtplib import SMTP` at import time would hold the real class and escape.
+    * **A configured proxy defeats the loopback check.** `ProxyHandler` rewrites the destination
+      INSIDE `open()`, after this wrapper has judged the URL, and `Request.set_proxy` leaves
+      `full_url` untouched — so on a machine with `http_proxy` set, a "loopback" request leaves
+      the machine. The two tests that use this marker patch `urllib.request.proxy_bypass` for
+      exactly that reason (see `_direct_to_loopback`); the fixture alone does not guarantee it.
     """
     def refuse(*args: object, **kwargs: object) -> object:
         raise NetworkAccessInTests(
@@ -52,6 +68,10 @@ def _no_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
             "(see the `channels` fixture) instead of letting one reach the network")
 
     monkeypatch.setattr(smtplib, "SMTP", refuse)
+    # SMTP_SSL too: it SUBCLASSES SMTP, so replacing only `SMTP` left `SMTP_SSL(...)` returning a
+    # half-built object with `sock=None` rather than raising — the "stub that answers whatever it
+    # is asked" this fixture's second paragraph exists to refuse.
+    monkeypatch.setattr(smtplib, "SMTP_SSL", refuse)
     monkeypatch.setattr(urllib.request, "urlopen", refuse)
 
     if not request.node.get_closest_marker("allow_loopback"):
@@ -61,11 +81,19 @@ def _no_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
     real_open = urllib.request.OpenerDirector.open
 
     def loopback_only(self: object, fullurl: object, *args: object, **kwargs: object) -> object:
-        url = getattr(fullurl, "full_url", fullurl)
-        if not str(url).startswith(("http://127.0.0.1:", "http://127.0.0.1/")):
+        # By HOST, not by a literal prefix. The prefix form permitted exactly one spelling of one
+        # address over one scheme — refusing `http://127.0.0.1` with no port, `https://`,
+        # `localhost`, `[::1]` and every other 127/8 address, any of which a later test could
+        # legitimately want.
+        url = str(getattr(fullurl, "full_url", fullurl))
+        try:
+            host = urlsplit(url).hostname or ""
+        except ValueError:
+            host = ""
+        if host not in {"localhost", "::1"} and not host.startswith("127."):
             raise NetworkAccessInTests(
-                f"@pytest.mark.allow_loopback permits 127.0.0.1 and nothing else; this test "
-                f"tried to reach {str(url)[:60]!r}")
+                f"@pytest.mark.allow_loopback permits a loopback host and nothing else; this "
+                f"test tried to reach {url[:60]!r}")
         return real_open(self, fullurl, *args, **kwargs)
 
     monkeypatch.setattr(urllib.request.OpenerDirector, "open", loopback_only)
