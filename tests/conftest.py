@@ -38,13 +38,14 @@ def _no_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
     CLASS method covers every opener, including one a future change builds. A test may still
     shadow `open` on its own opener INSTANCE, which is what a spy does.
 
-    `@pytest.mark.allow_loopback` opts a test out. Exactly one kind of test needs it: the
-    redirect refusal cannot be proved against a stub, because what is under test is what
-    `urllib`'s own handler stack does with a real `3xx`.
+    `@pytest.mark.allow_loopback` narrows the block instead of lifting it, and the difference is
+    the point. Exactly one kind of test needs the opt-out — the redirect refusal cannot be proved
+    against a stub, because what is under test is what `urllib`'s own handler stack does with a
+    real `3xx` — and an opt-out that simply returned would have been the first way for a test to
+    walk out of the property this file's docstring calls "impossible rather than remembered", for
+    ANY host. So under the marker `smtplib` stays blocked outright and the opener is allowed
+    through ONLY to `127.0.0.1`, which is what the marker's name promises.
     """
-    if request.node.get_closest_marker("allow_loopback"):
-        return
-
     def refuse(*args: object, **kwargs: object) -> object:
         raise NetworkAccessInTests(
             "a test tried to open a real connection — replace the channels with spies "
@@ -52,7 +53,22 @@ def _no_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.setattr(smtplib, "SMTP", refuse)
     monkeypatch.setattr(urllib.request, "urlopen", refuse)
-    monkeypatch.setattr(urllib.request.OpenerDirector, "open", refuse)
+
+    if not request.node.get_closest_marker("allow_loopback"):
+        monkeypatch.setattr(urllib.request.OpenerDirector, "open", refuse)
+        return
+
+    real_open = urllib.request.OpenerDirector.open
+
+    def loopback_only(self: object, fullurl: object, *args: object, **kwargs: object) -> object:
+        url = getattr(fullurl, "full_url", fullurl)
+        if not str(url).startswith(("http://127.0.0.1:", "http://127.0.0.1/")):
+            raise NetworkAccessInTests(
+                f"@pytest.mark.allow_loopback permits 127.0.0.1 and nothing else; this test "
+                f"tried to reach {str(url)[:60]!r}")
+        return real_open(self, fullurl, *args, **kwargs)
+
+    monkeypatch.setattr(urllib.request.OpenerDirector, "open", loopback_only)
 
 
 @pytest.fixture(autouse=True)

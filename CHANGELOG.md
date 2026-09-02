@@ -27,7 +27,16 @@ removes them rather than carrying them forward into six copies.
   - `ntfy_ready()` now refuses a URL carrying **userinfo** (`https://user:pass@host/topic`). Such
     a URL never worked — `urllib` hands the whole netloc to `http.client`, which raises
     `InvalidURL` **quoting it** — so this converts a channel that failed on every send while
-    printing its password into one refusal at boot.
+    printing its password into one refusal at boot. The host is judged **as the send path
+    resolves it**: `urlsplit` returns the raw netloc while `urllib.request.Request` `unquote`s
+    it, so a URL written `https://user:pw%40host/topic` has no `@` for a naive check to see and
+    still arrives at `http.client` as `user:pw@host`. Asking the send path's own parser closes
+    that whole class rather than enumerating escapes; `%20` and `%0d` went the same way.
+  - `ntfy_ready()` now refuses a **non-ASCII topic path or query**. `http.client` ASCII-encodes
+    the request line, and its `UnicodeEncodeError` prints the offending character plus an index
+    into the topic — the ntfy sibling of the SMTP refusal below, and equally beyond redaction's
+    reach. Percent-encode the topic. A non-ASCII **host** is still accepted: `http.client`
+    IDNA-encodes it, so it genuinely works.
   - `_send_email()` now refuses a **non-ASCII `SMTP_USER` or `SMTP_PASSWORD`** before `smtplib`
     sees it. `SMTP.auth` encodes both as ASCII, and its `UnicodeEncodeError` prints the offending
     character plus an offset into the value. The refusal names the setting and its length, exactly
@@ -57,6 +66,10 @@ removes them rather than carrying them forward into six copies.
 - The suite's network block covered `urlopen` only, so the ntfy channel's own opener walked
   straight past it into a real DNS lookup. It now blocks `OpenerDirector.open`, which covers every
   opener.
+- The ntfy opener is built **on first send, not at import**, matching `urlopen`'s own timing.
+  `build_opener()` constructs a `ProxyHandler` that snapshots `getproxies()` when it is built, so
+  building it at import would have silently dropped proxying for any consumer that resolves its
+  proxy environment in `main()`. The only thing this opener changes is redirect handling.
 
 ### Notes for adopters
 
@@ -73,10 +86,13 @@ removes them rather than carrying them forward into six copies.
   **in** by reading its own opt-out. Port it as
   `allow_cleartext_ntfy=os.environ.get("ALLOW_CLEARTEXT_NTFY", "") == "1"`, not as
   `bool(os.environ.get(...))`.
-- ⚠️ **An ntfy URL carrying userinfo now disables the channel** instead of failing on every send.
-  If a deployment appears to lose ntfy at this version, this is the likeliest cause — and that
-  channel was never delivering. ntfy authentication belongs in a header (a token via a proxy), not
-  in the URL.
+- ⚠️ **An ntfy URL carrying userinfo now disables the channel** — including a percent-encoded one
+  (`user:pw%40host`) — instead of failing on every send. If a deployment appears to lose ntfy at
+  this version, this is the likeliest cause, and that channel was never delivering. ntfy
+  authentication belongs in a header (a token via a proxy), not in the URL.
+- ⚠️ **A non-ASCII ntfy topic now disables the channel** instead of failing on every send. It
+  never delivered either. Percent-encode the topic (`/geheim-t%C3%B6pic`); a non-ASCII hostname is
+  unaffected.
 - ⚠️ **A non-ASCII `SMTP_USER` or `SMTP_PASSWORD` now fails the email channel with a named
   refusal** rather than an opaque `UnicodeEncodeError` per send. Neither ever authenticated: SMTP
   AUTH cannot carry them. The value is not echoed; its length is.

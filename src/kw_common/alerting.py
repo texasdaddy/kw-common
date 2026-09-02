@@ -127,8 +127,11 @@ WHAT THIS MODULE WILL NOT PUT IN A LOG
        rejected before the code that would quote them is reached. Neither ever worked.
     2. **Redaction of what remains** (`_redact`), covering `SMTP_PASSWORD` and the topic URL.
        Read its docstring for what it does NOT catch, which is the part that matters.
-    3. **Shape, never value**, wherever this module describes a rejected setting itself — see
-       `_fault_shape`.
+    3. **Shape, never value**, wherever this module describes a setting the ALERTING PATH
+       rejected — see `_fault_shape`. Scoped deliberately: `AlertSettings.__post_init__` does
+       echo the value of a rejected integer sizing knob, which is a construction-time refusal an
+       operator sees once at boot, not a line that repeats per alert. Say the rule where it
+       binds rather than stating it absolutely and being wrong one function away.
 
     None of this reaches what a CALLER puts in a title or a message. Sanitise at the raise site,
     where the value is understood.
@@ -404,9 +407,13 @@ def _secret_values(cfg: AlertConfig) -> list[str]:
       from `ntfy_ready()`'s own failure branches; this is the same rule applied to text that
       arrives from somewhere else.
 
-    The HOST is deliberately NOT in the set. It is the half of the URL with real diagnostic value
-    ("connection refused", a DNS failure name the host), it is not itself the capability, and
-    redacting it would push an operator towards turning this off.
+    The HOST is deliberately NOT in the set: it is not itself the capability, and it is the half
+    of the URL an operator needs in order to act. The example this used to give was wrong and is
+    worth correcting rather than deleting — MEASURED, neither `ConnectionRefusedError` nor
+    `socket.gaierror` names the host in its message, so "connection refused and DNS failures name
+    the host" was false. What DOES name it is `SSLCertVerificationError`'s hostname-mismatch form
+    ("certificate is not valid for 'x'") — which lands in the TLS branch, the one place a host is
+    the whole diagnosis. That is the reason to keep it; the old one was not.
     """
     secrets: list[str] = []
 
@@ -415,7 +422,14 @@ def _secret_values(cfg: AlertConfig) -> list[str]:
             secrets.append(value)
 
     email = cfg.email or {}
-    add(email.get("SMTP_PASSWORD") if isinstance(email, dict) else None)
+    # ⭐ `.get`, UNGUARDED — and NOT `isinstance(email, dict)`, which is what this was. The send
+    # path reads this mapping with `.get()` and nothing more, so any Mapping sends perfectly well
+    # while an `isinstance(dict)` gate made the REDACTOR skip its password entirely: two sides of
+    # one question able to disagree, the shape `_usable_path` exists to prevent one function over.
+    # Unguarded because an object whose `.get` raises leaves "does this text hold a secret"
+    # UNANSWERABLE, and `_redact`'s own handler turns that into suppressing the text — which is
+    # the safe direction. Catching it here would silently redact nothing instead.
+    add(email.get("SMTP_PASSWORD"))
 
     url = cfg.ntfy_url
     if isinstance(url, str) and url.strip():
@@ -450,17 +464,23 @@ def _redact(text: str, cfg: AlertConfig) -> str:
     """`text` with every configured secret replaced. A BACKSTOP — read what it does NOT do.
 
     ⚠️ IT CATCHES A SECRET QUOTED VERBATIM, AND ONLY THAT. A message that renders a secret in any
-    TRANSFORMED shape — one character as an escaped `repr` plus its offset, a hash, base64, a
-    length — passes straight through, because a substring replacement cannot see it. That is not
-    a hypothetical gap: it is exactly the second of the two demonstrated leaks (issue #2's repro
-    B, `UnicodeEncodeError` on a non-ASCII SMTP password), which is why BOTH demonstrated cases
-    are closed at their SOURCE — userinfo refused in `ntfy_ready()`, a non-ASCII credential
-    refused in `_send_email()` — rather than left to this function. Do not weaken either of those
-    on the strength of this one.
+    TRANSFORMED shape — one character as an escaped `repr` plus its offset, a percent-DEcoded
+    spelling of what was configured percent-encoded, a hash, base64, a length — passes straight
+    through, because a substring replacement cannot see it. That is not a hypothetical gap: every
+    leak found in this module so far has been of exactly that shape, which is why each one is
+    closed at its SOURCE in `ntfy_ready()` / `_send_email()` rather than left to this function.
+    Do not weaken any of those on the strength of this one.
 
-    Over-redaction is the safe direction and is deliberately not guarded against: a one-character
-    password redacts every occurrence of that character and leaves an unreadable line. Unreadable
-    is a bad log line; a printed credential is an incident.
+    Two more limits, both measured, both inherent to substring replacement:
+
+    * **A repeating-pattern secret can leave a FRAGMENT.** `str.replace` does not rescan what it
+      has produced, so a password `abab` in the text `ababab` yields `<redacted>ab`. Half a secret
+      is not a whole one, and re-scanning does not fix it (the remainder is no longer the secret).
+    * **Over-redaction crosses channels.** The secrets come from ONE config, so an ntfy topic
+      named `alerts` redacts that word out of the EMAIL channel's diagnostic too. Over-redaction
+      is the safe direction and is deliberately not guarded against — a one-character password
+      leaves an unreadable line, and unreadable is a bad log line where printed is an incident —
+      but the cost lands on a line that had nothing to do with the secret.
     """
     try:
         secrets = _secret_values(cfg)
@@ -836,7 +856,7 @@ class AlertConfig:
     def ntfy_ready(self) -> bool:
         """True only for a full topic URL this module is willing to send to.
 
-        Four things are refused, each of them loudly and each leaving the boot warning to see the
+        Five things are refused, each of them loudly and each leaving the boot warning to see the
         channel as unset rather than letting it fail per-alert forever:
 
         * **whitespace or a control character** — survives `urlsplit`, raises out of
@@ -845,8 +865,24 @@ class AlertConfig:
           channel is dead while looking configured;
         * **userinfo** (`user:password@host`) — never worked, and its failure printed the
           password;
+        * **a non-ASCII topic path** — `http.client` ASCII-encodes the request line, and its
+          `UnicodeEncodeError` prints the offending character plus an index into the topic;
         * **`http://`**, unless `AlertSettings(allow_cleartext_ntfy=True)` — a topic URL is a
           write capability.
+
+        ⭐⭐ THE HOST IS JUDGED AS THE SEND PATH WILL SEE IT, NOT AS IT IS WRITTEN, and that is the
+        difference between this check working and merely appearing to. `urlsplit` returns the RAW
+        netloc; `urllib.request.Request` then does `unquote(self.host)` before `http.client` gets
+        it. So the two disagree on every percent-escape, and a URL written
+        `https://user:pw%40host/topic` has NO `@` for a raw check to see while arriving at
+        `http.client` as `user:pw@host` — the identical `InvalidURL: nonnumeric port: 'pw@host'`,
+        printing the password, on every alert, with the boot report saying "ntfy ready".
+        Measured; two independent verification passes found it the same way. `%20` and `%0d`
+        walked past the control-character check for the same reason.
+
+        Enumerating the escapes would be an arms race. Asking the SEND PATH'S OWN PARSER what the
+        host will be is not: `Request(url).host` is the exact expression `_post_ntfy`'s request
+        uses, so the two cannot drift.
 
         NOTHING here echoes the URL. It is a capability, so every branch names the shape of the
         problem and stops there.
@@ -876,7 +912,35 @@ class AlertConfig:
             log.error("the ntfy URL must be the FULL topic URL (https://<host>/<topic>), not a "
                       "bare topic — ntfy alerts are DISABLED until it is fixed")
             return False
-        if "@" in parts.netloc:
+        if not parts.path.isascii() or not parts.query.isascii():
+            # ⭐ THE SMTP CREDENTIAL REFUSAL'S MISSING SIBLING. `http.client` encodes the request
+            # line as ASCII, so one non-ASCII character in the topic raises
+            # `UnicodeEncodeError: ... can't encode character '\xf6' in position 14` — the
+            # character, plus an index into the topic, which is a capability. It is rendered as an
+            # escaped `repr`, so `_redact` structurally cannot reach it, exactly as for the SMTP
+            # password. `_send_email` refuses its own; this refuses ntfy's, and the asymmetry
+            # between them was the defect.
+            #
+            # The HOST is deliberately not covered here: `http.client` IDNA-encodes it, so a
+            # non-ASCII hostname genuinely works and refusing it would be a false refusal.
+            log.error("the ntfy URL's topic contains a non-ASCII character, which http.client "
+                      "cannot put in a request line and whose failure would print it — ntfy "
+                      "alerts are DISABLED until it is fixed. Percent-encode the topic.")
+            return False
+        try:
+            # THE SEND PATH'S OWN PARSE. See the docstring: `urlsplit` reads the raw netloc and
+            # this reads the `unquote`d one, which is what `http.client` is handed.
+            # Suppressed below because nothing is OPENED here: this constructs the request object
+            # purely to read how its parser resolves the host, which is the whole point.
+            host = urllib.request.Request(self.ntfy_url).host or ""  # noqa: S310
+        except Exception as exc:  # noqa: BLE001 — a readiness check must not raise; see below
+            # Same reasoning as the `urlsplit` guard above, and the same discipline: the class
+            # name only. `Request` raises `ValueError` for a URL it cannot type, and its message
+            # quotes the URL.
+            log.error("the ntfy URL could not be parsed the way the send path parses it (%s) — "
+                      "ntfy alerts are DISABLED until it is fixed", type(exc).__name__)
+            return False
+        if "@" in host or _UNSAFE_IN_URL.search(host):
             # ⭐ USERINFO IS REFUSED, AND IT COSTS NOTHING TO REFUSE. `urllib` puts the whole
             # netloc — userinfo included — into the Host it hands `http.client`, which then sees
             # two colons and raises `InvalidURL` QUOTING THE NETLOC. So a `user:password@host`
@@ -885,10 +949,15 @@ class AlertConfig:
             # the bare-topic case above, so it gets the same answer — refused ONCE at readiness,
             # visible in the boot report, instead of an exception per alert forever.
             #
+            # `_UNSAFE_IN_URL` is applied to the DECODED host as well as to the raw URL above,
+            # because `%0d`/`%20` are invisible to the raw check and arrive at `http.client` as a
+            # carriage return and a space — the second of which it also quotes back.
+            #
             # The message names the SHAPE, never the value: this is a capability.
-            log.error("the ntfy URL carries userinfo (user:password@host), which urllib cannot "
-                      "send and whose failure would print it — ntfy alerts are DISABLED until it "
-                      "is fixed. Put an ntfy token in a header-bearing proxy, not in the URL.")
+            log.error("the ntfy URL carries userinfo (user:password@host) or a character that "
+                      "cannot appear in a host, which urllib cannot send and whose failure would "
+                      "print it — ntfy alerts are DISABLED until it is fixed. Put an ntfy token "
+                      "in a header-bearing proxy, not in the URL.")
             return False
         if parts.scheme == "http" and not self.allow_cleartext_ntfy:
             # ⭐ A TOPIC URL IS A WRITE CAPABILITY, NOT AN ADDRESS. Anyone who observes it can
@@ -1082,10 +1151,28 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
-# Built once, at import, exactly as `urlopen` builds its own default opener on first use — the
-# same handler set, with the redirect handler replaced. `build_opener` drops a default class when
-# a passed handler subclasses it, which is what makes the substitution total rather than additive.
-_NTFY_OPENER = urllib.request.build_opener(_RefuseRedirects)
+# ⭐ BUILT LAZILY, ON FIRST SEND — NOT AT IMPORT, and the difference is measurable.
+# `build_opener()` constructs a `ProxyHandler()`, which SNAPSHOTS `getproxies()` at the moment it
+# is built. `urlopen` builds its default opener on first use, so a consumer that resolves its
+# proxy environment in `main()` — after `import kw_common.alerting` — was still proxied. Built at
+# import, this opener captured the environment as it was BEFORE that, and such a consumer lost
+# ntfy proxying entirely: a behaviour change nobody asked for, in a patch release. Matching
+# `urlopen`'s timing means the ONLY thing this opener changes is the redirect handling.
+#
+# The race is benign and is the same one `urlopen` has: two threads may each build one, and the
+# loser's is simply discarded.
+_NTFY_OPENER: urllib.request.OpenerDirector | None = None
+
+
+def _ntfy_opener() -> urllib.request.OpenerDirector:
+    """The opener `_post_ntfy` sends through: `urlopen`'s handler set with the redirect handler
+    replaced. `build_opener` DROPS a default class when a passed handler subclasses it, which is
+    what makes `_RefuseRedirects` a substitution rather than an addition — two redirect handlers
+    would leave the stock one free to follow."""
+    global _NTFY_OPENER
+    if _NTFY_OPENER is None:
+        _NTFY_OPENER = urllib.request.build_opener(_RefuseRedirects)
+    return _NTFY_OPENER
 
 
 def _post_ntfy(cfg: AlertConfig, spec: SeveritySpec, title: str, message: str) -> None:
@@ -1106,14 +1193,18 @@ def _post_ntfy(cfg: AlertConfig, spec: SeveritySpec, title: str, message: str) -
     # The scheme is validated in `AlertConfig.ntfy_ready()`, which the dispatcher calls before it
     # ever reaches this function — an unvalidated URL here could be a `file://` read.
     #
-    # `_NTFY_OPENER`, never `urlopen`: the module-level opener is the one that refuses redirects.
-    # `urlopen` uses a DIFFERENT, shared opener that follows them.
+    # `_ntfy_opener()`, never `urlopen`: that opener is the one that refuses redirects. `urlopen`
+    # uses a DIFFERENT, shared opener that follows them.
     #
-    # CLOSED, not just read. The response holds the socket, and dropping it leaves the close to
-    # the garbage collector — measured as a `ResourceWarning` from the first test that drove this
-    # against a real server. On a service alerting every cycle that is a slow leak of file
-    # descriptors on the one path that runs when things are already going wrong.
-    with _NTFY_OPENER.open(req, timeout=NTFY_TIMEOUT_S) as response:
+    # CLOSED, not just read — but honestly scoped, because the first version of this comment
+    # claimed a measurement it did not have. `http.client` DOES close the connection itself once
+    # a body with a known `Content-Length` is fully consumed by `.read()`, and dropping the `with`
+    # was measured NOT to reproduce a `ResourceWarning`. (The warning that prompted this came from
+    # the `HTTPError` a refused redirect raises, which is also a response holding a socket — the
+    # TEST closes that one.) The `with` stays because the auto-close depends on the server
+    # sending a length and on the read completing, neither of which this code controls; it is
+    # correct defensive practice, not a fix for a reproduced leak.
+    with _ntfy_opener().open(req, timeout=NTFY_TIMEOUT_S) as response:
         response.read()
 
 

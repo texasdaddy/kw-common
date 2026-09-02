@@ -63,6 +63,13 @@ Everything the module needs is passed in. It reads no environment variable and h
 path — see the contract below, and the module's own docstring for the full behaviour (severities,
 `escalating=`, `clears=`, and the error log's exposure warning).
 
+⚠️ **An ntfy topic URL must be `https://`.** It is a *write capability*, not an address: anyone who
+observes it can page you from then on, and over cleartext the URL, the alert `Title` and the body
+are all readable by anything on the path. A `http://` URL turns the channel off, loudly, at boot.
+For a self-hosted endpoint on a trusted network, `AlertSettings(allow_cleartext_ntfy=True)` is the
+supported way to accept that exposure deliberately. Userinfo (`https://user:pass@host/topic`) is
+refused outright — `urllib` cannot send it, and its failure printed the password.
+
 ## The generic-code contract
 
 Every module here satisfies all of the following. A module that cannot is not ready to live in a

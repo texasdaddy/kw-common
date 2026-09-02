@@ -380,12 +380,68 @@ def test_a_full_topic_url_is_ready() -> None:
     "https://alertuser:hunter2@ntfy.example.com/topic",
     "https://alertuser@ntfy.example.com/topic",
     "https://:hunter2@ntfy.example.com/topic",
+    # ⭐⭐ PERCENT-ENCODED, which is where the FIRST version of this guard was bypassed.
+    # `urlsplit` returns the RAW netloc, so none of these contains an `@` for a raw check to see
+    # — but `urllib.request.Request` does `unquote(self.host)`, so http.client receives exactly
+    # the userinfo above and raises exactly the same password-quoting `InvalidURL`. Two
+    # independent verification passes found this the same way; judging the raw string while the
+    # send path uses the decoded one was the defect.
+    "https://alertuser:hunter2%40ntfy.example.com/topic",
+    "https://alertuser%3Ahunter2%40ntfy.example.com/topic",
+    # Same divergence against the control-character check: `%0d` and `%20` are invisible to a
+    # raw scan and arrive decoded.
+    "https://ntfy.example.com%0d/topic",
+    "https://ntfy.example%20com/topic",
+    # A non-ASCII topic: http.client ASCII-encodes the request line, and its UnicodeEncodeError
+    # prints the character plus an index INTO THE TOPIC — the ntfy sibling of the SMTP
+    # credential refusal, and equally unreachable by redaction.
+    "https://ntfy.example.com/geheim-töpic",
+    "https://ntfy.example.com/topic?priorität=5",
 ])
 def test_an_unusable_ntfy_url_is_not_ready(url: str) -> None:
     """Including the two that RAISE rather than return False in a naive implementation: a control
     character (http.client `InvalidURL`, whose message quotes the topic) and an unclosed IPv6
     bracket (`urlsplit` raises `ValueError`)."""
     assert AlertConfig(ntfy_url=url).ntfy_ready() is False
+
+
+def test_ntfy_readiness_never_echoes_the_url_on_any_refusal(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐⭐ THE EMAIL SIDE'S MISSING SIBLING, and the claim it enforces is the whole reason the
+    userinfo branch exists.
+
+    `test_email_readiness_never_names_the_password` has pinned this for the email channel since
+    v1.0.0. The ntfy channel — where the URL IS the capability, and where issue #2's repro A was
+    a refusal message printing exactly that — had no counterpart: every ntfy readiness test
+    asserted only `is False`. Measured during verification: mutating ANY of the five refusal
+    branches to log `self.ntfy_url` survived the entire suite, so the docstring's "NOTHING here
+    echoes the URL" was an unverified claim on the exact line that matters most.
+
+    `_redact` does not backstop this. It operates on channel-FAILURE text; readiness logging
+    never passes through it.
+    """
+    secret = "hunter2"  # noqa: S105 — the fixture value, and the point of the test
+    topic = "the-capability-topic"
+    urls = [
+        f"https://ntfy.example.com/{topic} with a space",       # the unsafe-character branch
+        f"a-bare-{topic}",                                       # the bare-topic branch
+        f"https://[::1/{topic}",                                 # the urlsplit-ValueError branch
+        f"https://alertuser:{secret}@ntfy.example.com/{topic}",  # userinfo
+        f"https://alertuser:{secret}%40ntfy.example.com/{topic}",  # userinfo, percent-encoded
+        f"https://ntfy.example.com/{topic}-töpic",               # non-ASCII topic
+        f"http://ntfy.example.com/{topic}",                      # cleartext
+    ]
+    with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
+        for url in urls:
+            assert AlertConfig(ntfy_url=url).ntfy_ready() is False, url
+
+    # VACUITY GUARD: every one of those really did produce a refusal line, so the absence
+    # assertions below are answering a question that could have gone the other way.
+    assert len(caplog.records) == len(urls), (
+        f"expected one refusal line per URL, got {len(caplog.records)} for {len(urls)} URLs")
+    assert secret not in caplog.text, "a refusal message printed the ntfy credential"
+    assert topic not in caplog.text, "a refusal message printed the topic, which is a capability"
+    assert "ntfy.example.com" not in caplog.text, "a refusal message printed the endpoint"
 
 
 # ---------------------------------------------------------------- cleartext ntfy (issue #3)
@@ -739,6 +795,7 @@ def test_post_ntfy_sends_the_body_and_the_severity_headers(
     # from the class — so the undo installs a permanent instance attribute. Captured while
     # `conftest` had the class patched to refuse, that permanent attribute is the refusal, and
     # every later test that opts out of the network block still gets it.
+    # (`_ntfy_opener()` returns this the moment it is not None, so the lazy build never runs.)
     monkeypatch.setattr(alerting, "_NTFY_OPENER", SimpleNamespace(open=fake_urlopen))
     cfg = AlertConfig(ntfy_url="https://ntfy.example.com/svc")
 
@@ -786,6 +843,7 @@ def test_post_ntfy_keeps_the_title_header_ascii(monkeypatch: pytest.MonkeyPatch)
     # from the class — so the undo installs a permanent instance attribute. Captured while
     # `conftest` had the class patched to refuse, that permanent attribute is the refusal, and
     # every later test that opts out of the network block still gets it.
+    # (`_ntfy_opener()` returns this the moment it is not None, so the lazy build never runs.)
     monkeypatch.setattr(alerting, "_NTFY_OPENER", SimpleNamespace(open=fake_urlopen))
     for severity in (OK, WARN, ERROR):
         alerting._post_ntfy(AlertConfig(ntfy_url="https://ntfy.example.com/t"),
@@ -795,9 +853,17 @@ def test_post_ntfy_keeps_the_title_header_ascii(monkeypatch: pytest.MonkeyPatch)
 
 
 # ======================================= no credential reaches any sink on a failure path (#2)
-# ⭐⭐ THE CONTAINMENT PROPERTY, AND IT IS ASSERTED ON EVERY SINK. A fault report reaches FOUR
-# places — the container log, the email body, the ntfy body, and the persistent error-log file on
-# disk — so a test that greps only the log is a quarter of a guard.
+# ⭐⭐ THE CONTAINMENT PROPERTY, ASSERTED ON EVERY SINK. A fault report reaches FOUR places — the
+# container log, the email body, the ntfy body, and the persistent error-log file on disk — so a
+# test that greps only the log is a quarter of a guard.
+#
+# ⚠️ HONEST SCOPE, because the sentence above reads stronger than what it currently MEASURES.
+# Today the module formats channel-failure detail into a log record and nowhere else, so with
+# `_redact` gutted it is the PROCESS LOG assertion that fails and the other three cannot. They
+# are not decoration: they are the regression guard for the change that routes a fault report
+# into an alert body or the error log — which is exactly the shape a boot/fault report takes,
+# and the reason the acceptance criterion names four sinks rather than one. Read them as "this
+# must never become true", not as "this caught something today".
 #
 # The two values below are planted into the config and are the only strings these tests look for.
 # They are shaped like what they stand in for and are visibly synthetic.
@@ -2081,7 +2147,7 @@ def test_the_ntfy_opener_has_no_redirect_handler_that_follows() -> None:
     """The structural half, so a regression is legible without a socket: `build_opener` drops the
     stock `HTTPRedirectHandler` only because ours subclasses it. Substituting a handler that does
     NOT subclass it would leave both installed, and the stock one would win."""
-    handlers = [h for h in alerting._NTFY_OPENER.handlers
+    handlers = [h for h in alerting._ntfy_opener().handlers
                 if isinstance(h, urllib.request.HTTPRedirectHandler)]
     assert len(handlers) == 1, f"expected exactly one redirect handler, got {handlers}"
     assert isinstance(handlers[0], alerting._RefuseRedirects)
@@ -2100,8 +2166,16 @@ posix_only = pytest.mark.skipif(
 
 @pytest.fixture
 def _exact_modes() -> Iterator[None]:
-    """`umask` subtracts from every mode a file is CREATED with, so without this the assertions
-    below measure the runner's umask as much as the code. Zeroed and restored."""
+    """`umask` subtracts from every mode a file is CREATED with. Zeroed and restored.
+
+    ⚠️ SCOPED, because the obvious claim ("without this the assertions measure the runner's
+    umask") is false for most of them and was measured to be: every mode these tests assert is
+    set by an unconditional `chmod` AFTER creation, and `chmod` is absolute, so those outcomes
+    are umask-independent already. It is load-bearing for exactly one test —
+    `test_the_post_write_restrict_is_load_bearing`, whose mutant SURVIVES at a restrictive umask
+    like 0o077 because the creation mode is masked down to 0o600 anyway. ubuntu-latest's default
+    is 0o022, so today it changes nothing about what CI catches; it is what keeps that one test
+    honest on a hardened runner or in a container that sets its own umask."""
     previous = os.umask(0)
     try:
         yield
@@ -2134,8 +2208,24 @@ def test_restrict_narrows_a_directory_that_already_exists(tmp_path: Path) -> Non
     assert stat.S_IMODE(directory.stat().st_mode) == 0o700
 
 
-def test_restrict_is_silent_for_a_path_that_is_not_there(tmp_path: Path) -> None:
+def test_restrict_does_not_even_try_to_chmod_a_path_that_is_not_there(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """⭐ ASSERTS THE EXISTENCE GUARD, not merely that nothing raised. The first version of this
+    test only called `_restrict` on a missing path and required no exception — which the
+    `except OSError` below it satisfies all by itself, since `chmod` on a missing path raises
+    `FileNotFoundError`. Measured: removing `if os.path.exists(path)` SURVIVED it. Recording
+    whether `chmod` was ATTEMPTED is what makes the guard the thing under test."""
+    attempts: list[object] = []
+    monkeypatch.setattr(alerting.os, "chmod", lambda *a, **k: attempts.append(a))
     alerting._restrict(str(tmp_path / "nope" / "errors.log"), 0o600)  # must not raise
+    assert attempts == [], "chmod was attempted on a path that does not exist"
+
+    # The negative direction, through the same spy: an existing path IS chmod'ed, so the
+    # assertion above is not simply true of a `_restrict` that does nothing at all.
+    real = tmp_path / "errors.log"
+    real.write_text("x", encoding="utf-8")
+    alerting._restrict(str(real), 0o600)
+    assert attempts == [(str(real), 0o600)]
 
 
 def test_restrict_is_silent_when_chmod_refuses(
@@ -2168,8 +2258,10 @@ def test_a_new_error_log_and_its_directory_are_created_narrow(tmp_path: Path) ->
 @pytest.mark.usefixtures("_exact_modes")
 def test_an_existing_wide_error_log_and_directory_are_narrowed_on_write(tmp_path: Path) -> None:
     """⭐ THE MUTATION THAT SURVIVED. Both already exist and both are wide, so every `mode=`
-    argument in `_append_error_record` is inert and ONLY `_restrict` can fix it. Gutting
-    `_restrict` to `pass` reddens exactly here."""
+    argument in `_append_error_record` is inert and ONLY `_restrict` can fix it — which is what
+    makes this the test that a gutted `_restrict` cannot get past. (It is not the ONLY one that
+    reddens on that mutation, measured: `test_the_post_write_restrict_is_load_bearing` goes red
+    too, because it also runs through `_restrict`.)"""
     directory = tmp_path / "logs"
     directory.mkdir()
     os.chmod(directory, 0o755)  # noqa: S103 — the WIDE precondition is the point of this test
@@ -2184,6 +2276,32 @@ def test_an_existing_wide_error_log_and_directory_are_narrowed_on_write(tmp_path
         "the directory stayed group/world-readable")
     assert stat.S_IMODE(path.stat().st_mode) == 0o600, "the log stayed group/world-readable"
     assert "svc: down" in path.read_text(encoding="utf-8"), "and the record was still written"
+
+
+@posix_only
+@pytest.mark.usefixtures("_exact_modes")
+def test_a_rolled_generation_keeps_the_narrow_mode(tmp_path: Path) -> None:
+    """⭐ THE BACKUP GENERATIONS, which carry the same message bodies the 0600 exists to protect.
+
+    `_restrict(path, 0o600)` runs BEFORE `_roll_error_log`, so `os.replace` carries the narrow
+    mode onto `errors.log.1`. Nothing ever narrows a `.N` generation again — so if those two
+    statements were ever swapped, an inherited-wide log would roll to a permanently
+    world-readable backup, and (measured during verification) all three end-to-end mode tests
+    above would stay green while it happened. This is the test that notices.
+    """
+    path = tmp_path / "errors.log"
+    path.write_text("x" * 200 + "\n", encoding="utf-8")
+    os.chmod(path, 0o644)
+
+    settings = AlertSettings(service="svc", error_log=str(path), error_log_max_bytes=50)
+    Alerter(settings).notify(ERROR, "svc: down", "no route to host")
+
+    rolled = tmp_path / "errors.log.1"
+    assert rolled.exists(), "the log did not roll, so this test proved nothing"
+    assert stat.S_IMODE(rolled.stat().st_mode) == 0o600, (
+        "the rolled generation kept the wide mode — it holds the same alert bodies as the live "
+        "file and nothing will ever narrow it again")
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 @posix_only
