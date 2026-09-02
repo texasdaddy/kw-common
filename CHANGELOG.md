@@ -77,7 +77,11 @@ removes them rather than carrying them forward into six copies.
   `_restrict` call beside it).
 - A test for the suite's own no-network property (`tests/test_no_network.py`). It was a guard with
   no test, and four mutations of it — including lifting the block entirely — left the whole suite
-  green.
+  green. The block now blocks every `smtplib.SMTP` subclass by walking the module rather than by a
+  hand-written list (`SMTP_SSL` and then `LMTP` were each found un-blocked one round apart, which
+  is the same fix-the-instance-not-the-class miss twice), and its loopback opt-out parses the host
+  as an address instead of matching text — a `startswith("127.")` form admitted
+  `127.evil.example`, a DNS name resolved off the machine.
 
 ### Fixed
 

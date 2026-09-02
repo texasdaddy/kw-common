@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import smtplib
 import urllib.request
 from urllib.parse import urlsplit
@@ -53,25 +54,37 @@ def _no_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
     * **Only the opener layer.** A test that calls `http.client`, `socket.create_connection` or
       `socket.getaddrinfo` directly reaches the real stack. That is deliberate — those are what
       `_post_ntfy`'s loopback tests need underneath them — but it means this is not a sandbox.
-    * **`smtplib` is blocked by NAME.** `smtplib.SMTP` and `SMTP_SSL` are replaced, so the shipped
-      module (which uses `smtplib.SMTP`) cannot connect; a test that did
-      `from smtplib import SMTP` at import time would hold the real class and escape.
+    * **Everything is blocked by NAME, so an import-time ALIAS escapes.** A test module doing
+      `from smtplib import SMTP` or `from urllib.request import urlopen` at import time holds the
+      real object and walks past this. The shipped module uses the attribute spellings, so it
+      cannot connect; a future test that aliases can. Same for an `OpenerDirector` SUBCLASS that
+      overrides `open` — the patch is on the base class.
     * **A configured proxy defeats the loopback check.** `ProxyHandler` rewrites the destination
       INSIDE `open()`, after this wrapper has judged the URL, and `Request.set_proxy` leaves
       `full_url` untouched — so on a machine with `http_proxy` set, a "loopback" request leaves
       the machine. The two tests that use this marker patch `urllib.request.proxy_bypass` for
       exactly that reason (see `_direct_to_loopback`); the fixture alone does not guarantee it.
+    * **`pytestmark = pytest.mark.allow_loopback` at MODULE scope narrows the block for the whole
+      file.** `get_closest_marker` honours module-level marks. That is one line, so put the marker
+      on the individual test that needs it.
     """
     def refuse(*args: object, **kwargs: object) -> object:
         raise NetworkAccessInTests(
             "a test tried to open a real connection — replace the channels with spies "
             "(see the `channels` fixture) instead of letting one reach the network")
 
-    monkeypatch.setattr(smtplib, "SMTP", refuse)
-    # SMTP_SSL too: it SUBCLASSES SMTP, so replacing only `SMTP` left `SMTP_SSL(...)` returning a
-    # half-built object with `sock=None` rather than raising — the "stub that answers whatever it
-    # is asked" this fixture's second paragraph exists to refuse.
-    monkeypatch.setattr(smtplib, "SMTP_SSL", refuse)
+    # ⭐ EVERY `SMTP` SUBCLASS, FOUND BY WALKING THE MODULE — not a hand-written list of names.
+    # The list started as `SMTP`, which left `SMTP_SSL(...)` RETURNING a half-built object with
+    # `sock=None` instead of raising (the "stub that answers whatever it is asked" the second
+    # paragraph refuses). Adding `SMTP_SSL` by name then left `LMTP`, a third subclass, doing the
+    # same thing — fixing the instance and not the class, one round apart. This asks the module
+    # which of its names are SMTP classes, so a fourth cannot appear behind the guard's back.
+    smtp_classes = [name for name, obj in vars(smtplib).items()
+                    if isinstance(obj, type) and issubclass(obj, smtplib.SMTP)]
+    assert "SMTP" in smtp_classes and "SMTP_SSL" in smtp_classes and "LMTP" in smtp_classes, (
+        f"the SMTP class sweep found {smtp_classes} — it is no longer finding what it is for")
+    for name in smtp_classes:
+        monkeypatch.setattr(smtplib, name, refuse)
     monkeypatch.setattr(urllib.request, "urlopen", refuse)
 
     if not request.node.get_closest_marker("allow_loopback"):
@@ -81,19 +94,27 @@ def _no_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
     real_open = urllib.request.OpenerDirector.open
 
     def loopback_only(self: object, fullurl: object, *args: object, **kwargs: object) -> object:
-        # By HOST, not by a literal prefix. The prefix form permitted exactly one spelling of one
-        # address over one scheme — refusing `http://127.0.0.1` with no port, `https://`,
-        # `localhost`, `[::1]` and every other 127/8 address, any of which a later test could
-        # legitimately want.
+        # ⭐ PARSED AS AN ADDRESS, not matched as text. A literal prefix permitted exactly one
+        # spelling of one address over one scheme; widening it to `startswith("127.")` then
+        # permitted `127.evil.example.com` — a DNS NAME, resolved off this machine — because a
+        # string prefix on a hostname is not a loopback test. `ipaddress` answers the actual
+        # question, and covers `::1`, `127.0.0.2` and every other 127/8 address for free.
         url = str(getattr(fullurl, "full_url", fullurl))
         try:
             host = urlsplit(url).hostname or ""
         except ValueError:
             host = ""
-        if host not in {"localhost", "::1"} and not host.startswith("127."):
+        try:
+            loopback = ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            # Not an IP literal. `localhost` is the one NAME allowed, because RFC 6761 reserves
+            # it — any other name would have to be resolved to be judged, and resolving it is
+            # already the thing this block exists to prevent.
+            loopback = host == "localhost"
+        if not loopback:
             raise NetworkAccessInTests(
-                f"@pytest.mark.allow_loopback permits a loopback host and nothing else; this "
-                f"test tried to reach {url[:60]!r}")
+                f"@pytest.mark.allow_loopback permits a loopback address (or `localhost`) and "
+                f"nothing else; this test tried to reach {url[:60]!r}")
         return real_open(self, fullurl, *args, **kwargs)
 
     monkeypatch.setattr(urllib.request.OpenerDirector, "open", loopback_only)

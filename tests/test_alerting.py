@@ -405,6 +405,13 @@ def test_a_full_topic_url_is_ready() -> None:
     # raw scan and arrive decoded.
     "https://ntfy.example.com%0d/topic",
     "https://ntfy.example%20com/topic",
+    # ⭐ THE ONE CASE THAT PINS `_UNSAFE_IN_URL.search(host)`. That term is defence-in-depth: an
+    # 8,304-URL sweep with it removed produced ZERO leaking URLs, because the `HTTPConnection` +
+    # latin-1 pair subsumes it for every input that leaks. It is kept anyway, so it is pinned
+    # here rather than left as a term nothing would notice disappearing. A percent-encoded NBSP
+    # decodes to `\xa0`: latin-1-encodable, and accepted by `http.client`'s own host validation
+    # (whose class is only `[\x00-\x20\x7f]`), so this term is the only thing that refuses it.
+    "https://ntfy.example.com%C2%A0/topic",
     # A non-ASCII topic: http.client ASCII-encodes the request line, and its UnicodeEncodeError
     # prints the character plus an index INTO THE TOPIC — the ntfy sibling of the SMTP
     # credential refusal, and equally unreachable by redaction.
@@ -508,11 +515,19 @@ def test_ntfy_readiness_never_echoes_the_url_on_any_refusal(
     `self.ntfy_url` survived the entire suite, so the docstring's "NOTHING here echoes the URL"
     was an unverified claim on the exact line that matters most.
 
-    ⭐ ONE URL PER BRANCH, AND THE MESSAGES MUST BE DISTINCT. Counting records alone does not
-    establish per-branch coverage — measured, two of the URLs in the first version of this test
-    landed on the SAME branch and the count was satisfied anyway, so a branch could stop being
-    exercised with nothing going red. Requiring the seven messages to be pairwise distinct is
-    what makes each row of the table below a branch rather than a hope.
+    ⭐ ONE URL PER BRANCH, AND THE BRANCHES ARE IDENTIFIED BY SOURCE LINE. Two weaker forms were
+    tried and both were measured to fail:
+
+    * **Counting records** does not establish per-branch coverage — two URLs landed on the SAME
+      branch and the count was satisfied anyway.
+    * **Requiring the messages to be pairwise DISTINCT** does not either, because three of the
+      refusal messages interpolate `type(exc).__name__`: two rows can share a branch and still
+      render different text. Demonstrated — swapping one row for a non-latin-1 host moved it onto
+      the same `except` as another row, the userinfo branch silently stopped being exercised, and
+      every assertion here stayed green.
+
+    `LogRecord.lineno` is the branch identity, so a row that drifts onto a neighbour collides and
+    fails. That is the difference between a table of branches and a table of hopes.
 
     `_redact` does not backstop this. It operates on channel-FAILURE text; readiness logging
     never passes through it.
@@ -532,6 +547,7 @@ def test_ntfy_readiness_never_echoes_the_url_on_any_refusal(
         ("cleartext", f"http://ntfy.example.com/{topic}"),
     ]
     messages: dict[str, str] = {}
+    lines: dict[str, int] = {}
     for label, url in branches:
         caplog.clear()
         with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
@@ -542,9 +558,10 @@ def test_ntfy_readiness_never_echoes_the_url_on_any_refusal(
             f"{label}: expected exactly one refusal line, got "
             f"{[r.getMessage()[:60] for r in caplog.records]}")
         messages[label] = caplog.records[0].getMessage()
+        lines[label] = caplog.records[0].lineno
 
-    assert len(set(messages.values())) == len(branches), (
-        f"two rows landed on the SAME refusal branch, so one branch is unexercised: {messages}")
+    assert len(set(lines.values())) == len(branches), (
+        f"two rows landed on the SAME refusal branch, so one branch is unexercised: {lines}")
     for label, message in messages.items():
         assert secret not in message, f"{label}: the refusal printed the ntfy credential"
         assert topic not in message, f"{label}: the refusal printed the topic, a capability"
