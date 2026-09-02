@@ -11,6 +11,7 @@ is asked, or a test that asserts only that a call happened, proves nothing.
 from __future__ import annotations
 
 import contextlib
+import http.client
 import http.server
 import json
 import logging
@@ -388,6 +389,18 @@ def test_a_full_topic_url_is_ready() -> None:
     # send path uses the decoded one was the defect.
     "https://alertuser:hunter2%40ntfy.example.com/topic",
     "https://alertuser%3Ahunter2%40ntfy.example.com/topic",
+    # ⭐⭐ DOUBLE-encoded, and the two that carry no `@` AT ALL — the second, deeper bypass.
+    # `Request.host` unquotes exactly ONCE, so `%2540` becomes `%40` and never an `@`; and
+    # `http.client` has never looked for an `@` in the first place. `_get_hostport` splits on the
+    # LAST COLON and raises `InvalidURL: nonnumeric port: '<the rest>'`, so the colon is the
+    # trigger and the `@` was incidental. Each of these reported READY and then printed what
+    # follows the colon on every alert, forever.
+    "https://tok:hunter2%2540ntfy.example.com/topic",
+    "https://tok:hunter2/topic",
+    "https://ntfy.example.com:abc/topic",
+    # A host outside latin-1. `urllib` pre-adds the `Host` header, so `putrequest`'s IDNA branch
+    # never runs and `putheader` encodes latin-1 — the `UnicodeEncodeError` quotes the character.
+    "https://例.example/topic",
     # Same divergence against the control-character check: `%0d` and `%20` are invisible to a
     # raw scan and arrive decoded.
     "https://ntfy.example.com%0d/topic",
@@ -403,6 +416,84 @@ def test_an_unusable_ntfy_url_is_not_ready(url: str) -> None:
     character (http.client `InvalidURL`, whose message quotes the topic) and an unclosed IPv6
     bracket (`urlsplit` raises `ValueError`)."""
     assert AlertConfig(ntfy_url=url).ntfy_ready() is False
+
+
+READY_CORPUS = [
+    # Must be READY: ordinary, and every legitimate shape a refusal could over-reach into.
+    "https://ntfy.example.com/topic",
+    "https://ntfy.example.com/a/b/c?priority=5",
+    "https://ntfy.example.com:8443/topic",
+    "https://[::1]/topic",
+    "https://[::1]:8443/topic",
+    "https://ntfy.example.com/geheim-t%C3%B6pic",
+    "https://nötify.example/topic",          # non-ASCII but latin-1: it does go out
+    "https://ntfy.example.com/",
+    "https://ntfy.example.com",
+    "https://ntfy.example.com/topic#fräg",   # the fragment never reaches the request line
+    # Must NOT be ready — every bypass found during verification, plus the ordinary refusals.
+    "https://alertuser:hunter2@ntfy.example.com/topic",
+    "https://alertuser:hunter2%40ntfy.example.com/topic",
+    "https://tok:hunter2%2540ntfy.example.com/topic",
+    "https://tok:hunter2%%34%30ntfy.example.com/topic",
+    "https://tok:hunter2/topic",
+    "https://tok@ntfy.example.com/topic",
+    "https://ntfy.example.com:abc/topic",
+    "https://ntfy.example.com%0d:8443/topic",
+    "https://ntfy.example%20com/topic",
+    "https://例.example/topic",
+    "https://\U0001f600.example/topic",
+    "https://ntfy.example.com/geheim-töpic",
+]
+
+
+def test_readiness_never_admits_a_host_the_send_path_will_refuse() -> None:
+    """⭐⭐ THE DRIFT GUARD, and the reason this is a PROPERTY test rather than another list.
+
+    Twice now, this check was written as a PREDICATE THAT IMITATES the send path and twice the
+    imitation was wrong in the same direction: first `"@" in urlsplit(url).netloc` (which reads
+    the raw netloc while `urllib` reads the `unquote`d one), then `"@" in host` (while
+    `http.client` never looks for `@` at all — `_get_hostport` splits on the last colon). Both
+    times the result was READY at boot, `InvalidURL` quoting the credential on every send, and a
+    redactor that structurally could not reach the decoded spelling.
+
+    So this asserts the RELATION instead of a list of spellings: **`ntfy_ready()` may only say
+    True for a host `http.client` will actually accept.** The implication is one-directional on
+    purpose — readiness also refuses things the send path would tolerate (cleartext, userinfo
+    with no colon, a non-ASCII topic), and that is allowed.
+
+    Constructing `HTTPConnection` opens nothing; it runs `_get_hostport` and `_validate_host`,
+    which is precisely the code a send would run.
+    """
+    checked_ready = 0
+    for url in READY_CORPUS:
+        ready = AlertConfig(ntfy_url=url).ntfy_ready()
+        if not ready:
+            continue
+        checked_ready += 1
+        # The suppression below is because nothing is OPENED: the request is constructed
+        # purely to read how its parser resolves the host.
+        host = urllib.request.Request(url).host or ""  # noqa: S310
+        host.encode("latin-1")                  # what putheader will do with the Host header
+        http.client.HTTPConnection(host)        # what the send path does with host:port
+    assert checked_ready >= 10, (
+        f"only {checked_ready} URLs were READY — the corpus no longer exercises the direction "
+        f"this test is about")
+
+
+def test_the_bypass_corpus_really_contains_hosts_the_send_path_refuses() -> None:
+    """The vacuity guard for the test above: if every URL in the corpus were acceptable to
+    `http.client`, the assertion there could not fail however wrong `ntfy_ready()` became."""
+    refused = 0
+    for url in READY_CORPUS:
+        try:
+            host = urllib.request.Request(url).host or ""  # noqa: S310 — nothing is opened
+            host.encode("latin-1")
+            http.client.HTTPConnection(host)
+        except Exception:  # noqa: BLE001 — any refusal from the send path counts
+            refused += 1
+    assert refused >= 6, (
+        f"only {refused} corpus URLs are refused by the send path; the drift guard above would "
+        f"pass vacuously")
 
 
 def test_ntfy_readiness_never_echoes_the_url_on_any_refusal(

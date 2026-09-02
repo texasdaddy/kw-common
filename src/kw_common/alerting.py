@@ -174,6 +174,7 @@ THE RETRIEVABLE ERROR LOG (`error_log=`)
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
@@ -921,8 +922,11 @@ class AlertConfig:
             # password. `_send_email` refuses its own; this refuses ntfy's, and the asymmetry
             # between them was the defect.
             #
-            # The HOST is deliberately not covered here: `http.client` IDNA-encodes it, so a
-            # non-ASCII hostname genuinely works and refusing it would be a false refusal.
+            # The HOST is not covered HERE — it is covered below, by the latin-1 check, which is
+            # the constraint that actually binds on this path. (An earlier version of this
+            # comment claimed `http.client` IDNA-encodes the host so a non-ASCII hostname works.
+            # Measured: it does not, because `urllib` pre-adds the `Host` header and the IDNA
+            # branch is skipped.)
             log.error("the ntfy URL's topic contains a non-ASCII character, which http.client "
                       "cannot put in a request line and whose failure would print it — ntfy "
                       "alerts are DISABLED until it is fixed. Percent-encode the topic.")
@@ -942,22 +946,55 @@ class AlertConfig:
             return False
         if "@" in host or _UNSAFE_IN_URL.search(host):
             # ⭐ USERINFO IS REFUSED, AND IT COSTS NOTHING TO REFUSE. `urllib` puts the whole
-            # netloc — userinfo included — into the Host it hands `http.client`, which then sees
-            # two colons and raises `InvalidURL` QUOTING THE NETLOC. So a `user:password@host`
-            # topic URL never worked: it failed on every send, and the failure log printed the
-            # password. The channel was dead while looking configured, which is the same shape as
-            # the bare-topic case above, so it gets the same answer — refused ONCE at readiness,
-            # visible in the boot report, instead of an exception per alert forever.
+            # netloc — userinfo included — into the Host it hands `http.client`. A
+            # `user:password@host` URL never worked: it failed on every send, and the failure log
+            # printed the password. `user@host` (no colon) fails differently — it resolves
+            # nowhere — but it is equally dead while looking configured, so it gets the same
+            # answer: refused ONCE at readiness, visible in the boot report.
             #
             # `_UNSAFE_IN_URL` is applied to the DECODED host as well as to the raw URL above,
             # because `%0d`/`%20` are invisible to the raw check and arrive at `http.client` as a
-            # carriage return and a space — the second of which it also quotes back.
+            # carriage return and a space.
             #
             # The message names the SHAPE, never the value: this is a capability.
             log.error("the ntfy URL carries userinfo (user:password@host) or a character that "
                       "cannot appear in a host, which urllib cannot send and whose failure would "
                       "print it — ntfy alerts are DISABLED until it is fixed. Put an ntfy token "
                       "in a header-bearing proxy, not in the URL.")
+            return False
+        try:
+            # ⭐⭐ THE SEND PATH'S OWN VALIDATOR, NOT A PREDICATE THAT IMITATES IT — and the
+            # difference is a second, deeper bypass of exactly the same defect.
+            #
+            # Checking `"@" in host` looked like the userinfo rule, but `http.client` has never
+            # looked for an `@`: `_get_hostport` splits on the LAST COLON and raises
+            # `InvalidURL: nonnumeric port: '<the rest>'`. The `@` was incidental; the COLON is
+            # the trigger. So every one of these reported READY and then printed its own
+            # configuration on every alert, forever:
+            #
+            #     https://tok:hunter2%2540host/t   host is unquoted ONCE, so %2540 -> %40, not @
+            #     https://tok:hunter2/t            no `@` anywhere at all
+            #     https://host:abc/t               an ordinary port typo
+            #
+            # Imitating a rule is an arms race; ASKING is not. Constructing the connection object
+            # runs `_get_hostport` and `_validate_host` — the exact code the send path runs —
+            # and OPENS NOTHING (no socket exists until `.connect()`).
+            #
+            # The latin-1 check is the other half, and it corrects a claim this file made and had
+            # wrong: a non-ASCII host is NOT IDNA-encoded on this path. `urllib` pre-adds the
+            # `Host` header, so `putrequest`'s IDNA branch is skipped (`skip_host=1`) and
+            # `putheader` encodes latin-1 — measured. A host outside latin-1 is therefore READY
+            # and permanently dead, and its `UnicodeEncodeError` quotes the character, which is
+            # the leak shape the topic check above exists to stop.
+            host.encode("latin-1")
+            http.client.HTTPConnection(host)
+        except Exception as exc:  # noqa: BLE001 — a readiness check must never raise
+            # Class name only. `InvalidURL`'s message QUOTES the offending part of the host,
+            # which is the credential this whole branch exists to keep out of the log.
+            log.error("the ntfy URL's host is not one http.client can send to (%s) — ntfy alerts "
+                      "are DISABLED until it is fixed. Check for a stray ':' (a non-numeric port "
+                      "is the usual cause) or a character outside latin-1.",
+                      type(exc).__name__)
             return False
         if parts.scheme == "http" and not self.allow_cleartext_ntfy:
             # ⭐ A TOPIC URL IS A WRITE CAPABILITY, NOT AN ADDRESS. Anyone who observes it can

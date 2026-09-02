@@ -32,6 +32,18 @@ removes them rather than carrying them forward into six copies.
     it, so a URL written `https://user:pw%40host/topic` has no `@` for a naive check to see and
     still arrives at `http.client` as `user:pw@host`. Asking the send path's own parser closes
     that whole class rather than enumerating escapes; `%20` and `%0d` went the same way.
+    The host is then handed to **`http.client` itself** to accept or refuse, rather than to a
+    predicate imitating it. `http.client` has never looked for an `@`: `_get_hostport` splits on
+    the LAST COLON and raises `InvalidURL` quoting what follows it — so the colon is the trigger
+    and the `@` was incidental, and `https://tok:hunter2%2540host/t`, `https://tok:hunter2/t`
+    (no `@` anywhere) and an ordinary port typo `https://host:abc/t` each reported ready and then
+    printed their own configuration on every alert. Constructing the connection object runs the
+    real `_get_hostport`/`_validate_host` and opens no socket.
+  - **A host outside latin-1 is refused.** `urllib` pre-adds the `Host` header, so
+    `putrequest`'s IDNA branch never runs and `putheader` encodes latin-1 — measured, correcting
+    an earlier claim in this file that a non-ASCII hostname "genuinely works". Such a host was
+    ready and permanently dead, with a `UnicodeEncodeError` quoting the character. A latin-1
+    hostname (`nötify.example`) is still accepted, because it does go out.
   - `ntfy_ready()` now refuses a **non-ASCII topic path or query**. `http.client` ASCII-encodes
     the request line, and its `UnicodeEncodeError` prints the offending character plus an index
     into the topic — the ntfy sibling of the SMTP refusal below, and equally beyond redaction's
