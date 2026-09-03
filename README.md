@@ -16,13 +16,13 @@ no port, no alignment audit, and no "which copy is the good one" question to ans
 Consumers install from git at an **exact tag** — never a branch:
 
 ```
-pip install git+https://github.com/texasdaddy/kw-common@v1.1.0
+pip install git+https://github.com/texasdaddy/kw-common@v1.2.0
 ```
 
 In a `requirements.in` / `requirements.txt`:
 
 ```
-kw-common @ git+https://github.com/texasdaddy/kw-common@v1.1.0
+kw-common @ git+https://github.com/texasdaddy/kw-common@v1.2.0
 ```
 
 ⛔ **Never pin a branch.** `@main` makes every rebuild of every consumer a silent, unreviewed
@@ -37,9 +37,12 @@ the release notes name every consumer that needs a code change.
 | Module | What it is |
 | --- | --- |
 | `kw_common.alerting` | The `notify(severity, title, message)` contract: fan-out to email + ntfy, edge-trigger vs. escalating de-duplication, and a small retrievable JSONL error log. |
+| `kw_common.alerting_env` | The deployment layer `alerting` refuses to be: one shared config file plus three variables in, `AlertSettings` out — and the boot check that refuses to start when they are wrong. |
 | `kw_common.leakguard` | The internal-information leak guard: shape-based scans of the tracked tree, the index, and the commits a push publishes — plus the `kw-leak-guard` command. |
 
-Modules are **independently importable**. `import kw_common` pulls in nothing; take what you need:
+`import kw_common` pulls in nothing, and no module drags in one you did not ask for — `alerting`
+and `leakguard` share not a line. (`alerting_env` is the one deliberate dependency: it RETURNS an
+`AlertSettings`, so it imports `alerting` and nothing else.) Take what you need:
 
 ```python
 from kw_common.alerting import (
@@ -71,13 +74,89 @@ For a self-hosted endpoint on a trusted network, `AlertSettings(allow_cleartext_
 supported way to accept that exposure deliberately. Userinfo (`https://user:pass@host/topic`) is
 refused outright — `urllib` cannot send it, and its failure printed the password.
 
+## Ops alerting configuration — `kw_common.alerting_env`
+
+`alerting` takes settings and assumes nothing about where they came from. **`alerting_env` is
+where the deployment knowledge lives**, and keeping the two apart is what lets a consumer outside
+this deployment use the first without inheriting the second.
+
+The convention it makes executable: **one shared file, three variables.**
+
+| variable | mode | what it is |
+| --- | --- | --- |
+| `SHARED_ROOT` | read-only | carries `configs/alerting.env` and nothing else |
+| `CONFIG_PATH` | read-write | the app's **own** directory; it writes its boot marker here |
+| `DEPLOY_ENV` | — | `prod` or `dev`, case-insensitive — lowercased inside the library |
+
+```python
+from dataclasses import replace
+
+from kw_common.alerting import configure, warn_if_unconfigured
+from kw_common.alerting_env import load_alert_settings_from_env, validate_boot_from_env
+
+settings = replace(
+    load_alert_settings_from_env("my-service"),   # reads SHARED_ROOT + DEPLOY_ENV
+    state_file="/data/my-service/alert-state.json",
+    error_log="/data/my-service/logs/errors.log",
+)
+alerter = configure(settings)
+warn_if_unconfigured("my-service")
+validate_boot_from_env(settings, alerter=alerter)   # raises AlertEnvError -> refuse to boot
+```
+
+What it decides, and why each is not left to the caller:
+
+* **The topic.** `NTFY_URL_<SERVICE>` if the shared file carries one, else this environment's
+  `NTFY_URL_DEV` / `NTFY_URL_PROD`.
+* **The title prefix, which is a property of the TOPIC and not of the service.** On a shared topic
+  nothing else says who is talking, so titles carry `[<env>][<service>]`. On a service's own topic
+  the topic is already the identifier, so there is no prefix. It reaches the email subject and the
+  ntfy title and **nothing else** — the de-duplication key and the error-log record keep the raw
+  title, so promoting a service from dev to prod does not re-page every condition it had already
+  reported.
+* **What "required" means, per environment**, once, next to the loader — otherwise every app
+  answers "what does prod require?" independently and they disagree the first time a key is added.
+  `SMTP_USER` is optional and defaults to `EMAIL_FROM` — but only when that is a bare ASCII
+  mailbox. They are the same value in this deployment today and are different things (the auth
+  identity and the header), and a From header carrying a display name is not a credential: copying
+  it into `SMTP_USER` would make a channel that fails every send report itself READY.
+
+There is **no default for any of the three variables, and no default path anywhere in the module.**
+A missing variable raises at boot. A default would point at the wrong deployment silently, and the
+symptom of that is an incident that produced no page.
+
+`validate_boot_from_env` checks the mount, the structure, the file, every key this environment
+requires — including that none is still the template's `CHANGE-ME` — and that every configured
+channel is one the library can actually SEND on. That last one matters more than it sounds:
+`NTFY_URL_PROD=my-topic` (a bare topic instead of the full URL) is non-blank, and a check that
+asked only "is there a value" would pass it, announce that the configuration checks out, and leave
+the channel dead. It asks `alerting`'s own readiness functions rather than re-deriving the answer.
+
+On success it sends **one** confirmation alert and writes an empty marker into `CONFIG_PATH`, and
+later boots skip while that marker is newer than the config file. The marker is **per
+environment**: with one marker for all of them, promoting a service from dev to prod — which does
+not touch the shared file — skipped validation entirely and the service came up with no topic at
+all. **On failure it logs and raises and does not attempt to alert** — it cannot report a broken
+alerting channel through that channel — and with no `Alerter` installed it validates but withholds
+the marker, so the confirmation is not lost to a boot that could not send it.
+
+⚠️ The marker is compared by TIMESTAMP, so a config file restored at an older mtime (`rsync -a`,
+`cp -p`, a volume restore) is not re-validated. Stated rather than implied; `touch` after a restore.
+
+📄 **Setup — the folder structure, the template and per-OS commands: [`docs/alerting-setup.md`](docs/alerting-setup.md).**
+A consumer README carries a short prerequisite block and a **link** to that page, never a copy; a
+prose copy per consumer is the same duplication problem relocated into documentation.
+
 ## The generic-code contract
 
 Every module here satisfies all of the following. A module that cannot is not ready to live in a
 shared library, and saying so is a better outcome than bending the rule.
 
 1. **It imports cleanly in isolation.** Copy the module alone into an empty directory and import
-   it: no consumer module appears in `sys.modules`, and neither does any other `kw_common` module.
+   it: no consumer module appears in `sys.modules`, and nothing outside the standard library does
+   either. **The "no other `kw_common` module" half binds every module EXCEPT `alerting_env`**,
+   which imports `alerting` because it exists to return an `AlertSettings` — a stated, single,
+   one-directional dependency, not an exception that grows. `alerting` must never import it back.
    *(Enforced for `alerting` by `tests/test_isolation.py`, which does exactly that in a
    subprocess, and for `leakguard` by a narrower check in `test_leak_guard_extraction.py`.
    Generalising that file over every module is issue #12 — it binds one `MODULE_PATH` today.)*
@@ -85,8 +164,13 @@ shared library, and saying so is a better outcome than bending the rule.
    path, topic or service name. The caller passes what it uses. Anything a consumer must customise
    is a parameter or a registered hook — **never a constant the consumer is expected to edit after
    install**, because an edited install is a fork, which is the thing this repository exists to
-   stop. *(Enforced against the AST: the module may not read `os.environ`, and no module-level
+   stop. *(Enforced against the AST: `alerting` may not read `os.environ`, and no module-level
    constant may hold an absolute path.)*
+   **`alerting_env` is the deliberate exception, and it is scoped rather than waived**: reading
+   the environment IS its job, so the AST check asked of it is a different one — it may read only
+   the three documented variables, through one helper, and it still may not hold an absolute path.
+   Injection is not "nobody reads the environment"; it is "exactly one module does, and the module
+   that does the work does not."
 3. **Stdlib-first.** Every third-party dependency is a supply-chain surface across the whole
    fleet at once. `dependencies` in `pyproject.toml` is empty, and a new entry needs a stated
    justification rather than a convenience argument.
@@ -104,6 +188,8 @@ shared library, and saying so is a better outcome than bending the rule.
 ```
 src/kw_common/          the library
 tests/                  the suite, run on 3.10 and 3.12
+docs/                   alerting-setup.md — the ONE setup page consumers point at
+alerting.env.template   the annotated shared alerting config, for an operator to fill in
 .leakguard.json         THIS repository's own leak-guard allowances (see below)
 .github/workflows/      ci.yml (PR + main) and release.yml (v* tags)
 ```

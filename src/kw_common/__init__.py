@@ -12,12 +12,15 @@ make every consumer of every future module pay for the alerting import (and its 
 and `urllib` cost) whether or not it alerts — and would quietly break the isolation property the
 whole library is built on.
 
-`__version__` is the only name here, and it is the SAME string as `project.version` in
-`pyproject.toml`. Consumers pin an exact git tag, never a branch:
+`__version__` is the only name here, and it is the SINGLE SOURCE of the version:
+`pyproject.toml` declares `dynamic = ["version"]` and reads it from this attribute, so there is
+no second literal to forget. The release workflow additionally asserts the git TAG agrees.
 
-    pip install git+https://github.com/texasdaddy/kw-common@v1.1.0
+Consumers pin an exact git tag, never a branch:
+
+    pip install git+https://github.com/texasdaddy/kw-common@v1.2.0
 """
 
 __all__ = ["__version__"]
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
