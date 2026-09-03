@@ -1,0 +1,18 @@
+{
+  "_readme": "This repository's OWN allowances for kw_common.leakguard. A key prefixed with `_` is a comment and is the only spelling this scanner ignores - anything else it does not read is refused, so a typo cannot silently drop the rules below. The guard reads this file FROM THE INDEX, so what governs a scan is exactly what a commit would record: `git add` an edit before expecting it to apply. Format: README.md.",
+  "_why_nothing_about_paths": "There is no path-exemption mechanism to configure. This repository's tracked engine source is full of synthetic deny cases, and an earlier version of this file excused all eight patterns on that one path - a whole-file skip written in data, through which a real leak passed. The guard recognises its own source by its BYTES instead. A second attempt to make path exemptions configurable-but-bounded also failed, and the feature was withdrawn; src/kw_common/leakguard.py's GuardConfig records both designs and why neither worked.",
+  "allow_literals": [
+    {
+      "literal": "github.com/texasdaddy",
+      "why": "functional: this repository's own clone URL. Inert against the shape denylist, live against the project-side real-literal guard that shares this engine."
+    },
+    {
+      "literal": "githubusercontent.com/texasdaddy",
+      "why": "functional: raw asset URLs. Same reasoning as the clone URL above."
+    },
+    {
+      "literal": "ghcr.io/texasdaddy",
+      "why": "functional: image pulls. Neutralizing it would break them; it is an account name, not infrastructure."
+    }
+  ]
+}

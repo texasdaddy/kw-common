@@ -12,15 +12,25 @@ WHY THIS EXISTS
     whatever already mirrored the repo. Cleaning it up afterwards costs a full history rewrite
     and a force-push across every clone. This guard is what stops it coming back.
 
-    ⛔ WHICH REPOSITORIES ARE PUBLIC — the previous answer here was WRONG, and wrong in the
-    direction that gets a guard switched off. It generalized "public" across the whole fleet,
-    including the images built from it. The truth: every CODE repo is PRIVATE — `tape`,
-    `keystone`, `cef-tracker`, `reauth-bot`, `gambit`, `the-desk`. Only `unraid-templates` is
-    PUBLIC (the GHCR *packages* are public too).
+    ⛔ WHICH REPOSITORIES ARE PUBLIC — the answer here has now been wrong TWICE, in opposite
+    directions, and both errors are the kind that get a guard switched off.
 
-    (The false sentence is deliberately NOT reproduced here. A correction that quotes the claim
-    it is refuting leaves the claim greppable in the file, so the next reader — and any test
-    asserting it is gone — finds it either way.)
+    The first generalized "public" across the whole fleet, including the images built from it.
+    The second over-corrected: it said `unraid-templates` was the ONLY public repository. That
+    was true when it was written and is not true now — `kw-common`, the repository this module
+    ships from, is public as well, and it is the one that PUBLISHES this file to anyone who
+    installs the library. Every other repository in the fleet is private (some of the GHCR
+    *packages* are public too).
+
+    (Neither false sentence is reproduced here. A correction that quotes the claim it is
+    refuting leaves the claim greppable in the file, so the next reader — and any test asserting
+    it is gone — finds it either way.)
+
+    ⚠️ THE SIBLING REPOSITORIES ARE NOT NAMED ANYWHERE IN THIS FILE, and that is a rule rather
+    than an omission. This module is inside the published wheel; an enumeration of the private
+    repositories in it would be readable by anyone who installs the library. So the provenance
+    comments below cite an issue as `consumer#NN` — the NUMBER is enough to find the discussion
+    from inside the fleet, and the repository it belongs to is not disclosed outside it.
 
     ⚠️ Why a docstring error is worth this much space: this file is the fleet's shared guard, and
     a blanket claim of publicness is precisely the premise someone reasons FROM when they want to
@@ -39,9 +49,10 @@ WHY THIS EXISTS
     The reason is that a denylist of REAL LITERALS cannot live in a public repo. Written out
     here, the codenames and the infra domain would be readable on GitHub code search forever —
     the guard would BE the leak, republishing in one greppable place exactly what it exists to
-    remove. Worse, this is the one file the scan skips (SELF_PATH, below), so it could never
-    catch itself doing it. Encoding the list (base64) was tried and is not a fix: it defeats a
-    grep, but the values are still shipped, still decodable in one line, and still there.
+    remove. Worse, this is the one file a scan skips — it recognises its own source, see
+    `_is_self` — so it could never catch itself doing it. Encoding the list (base64) was tried
+    and is not a fix: it defeats a grep, but the values are still shipped, still decodable in one
+    line, and still there.
 
     ⚠️ SO THIS GUARD IS NOT THE WHOLE CONTROL, AND MUST NOT BE TREATED AS ONE. It catches the
     shapes. The REAL-LITERAL check — the one that knows the actual host codenames, the actual
@@ -84,8 +95,9 @@ KNOWN LIMITS (state them; do not pretend to coverage)
         because it is no longer the only thing the commit-time layer runs. `git add cfg.txt` while
         it holds a leak, then overwrite cfg.txt with a clean version and do not re-stage: the tree
         scan is honestly clean and the index — and so the commit — still carries the leak (issue
-        #33). `--staged` is the scan that answers the index's question, and `.githooks/pre-commit`
-        runs both. The two shapes tried and REMOVED before it stay recorded so they are not
+        #33). `--staged` is the scan that answers the index's question, and a consuming
+        repository's `pre-commit` hook runs both. The two shapes tried and REMOVED before it stay
+        recorded so they are not
         re-attempted: reading each staged blob made the hook take 78 s on a 1000-file worktree,
         and one `cat-file --batch` DESYNCHRONISED on a gitlink — `:<path>` on a submodule returns
         a COMMIT object whose body the parser must skip — mis-attributing one file's content to
@@ -134,9 +146,9 @@ WHAT A SCAN LOOKS AT (five surfaces, not one)
     A push publishes a commit OBJECT, and every field of it is permanent. The scans read:
       * FILE CONTENT — the tracked worktree, the index, and the lines each commit adds;
       * FILE PATHS — a leak in a filename or a directory name is published on every file listing
-        and in every clone, and was read by nothing at all until keystone#20;
+        and in every clone, and was read by nothing at all until consumer#20;
       * COMMIT IDENTITY — author and committer name/email;
-      * COMMIT MESSAGES — subject and body, rendered on every commit page (keystone#21 / #39);
+      * COMMIT MESSAGES — subject and body, rendered on every commit page (consumer#21 / #39);
       * ANNOTATED TAGS the push NAMES — the whole tag OBJECT, which carries the tag's name, its
         tagger and its message together. Scoped by the REF being pushed, not by what its commit
         reaches: a tag cut at an already-pushed commit is the ordinary release gesture and covers
@@ -152,30 +164,73 @@ WHAT A SCAN LOOKS AT (five surfaces, not one)
     and catching it before it goes out is still cheaper than after.
 
 USAGE
-    python scripts/check_no_internal_info.py            # scan tracked files, exit 1 on a hit
-    python scripts/check_no_internal_info.py --selftest # prove the patterns still bite
-    python scripts/check_no_internal_info.py --staged   # scan the INDEX - what a commit records
-    python scripts/check_no_internal_info.py --range origin/main..HEAD  # scan the COMMITS
+    kw-leak-guard                      # scan tracked files, exit 1 on a hit
+    kw-leak-guard --selftest           # prove the SHIPPED patterns still bite
+    kw-leak-guard --staged             # scan the INDEX - what a commit would record
+    kw-leak-guard --range origin/main..HEAD    # scan the COMMITS a push would publish
+    kw-leak-guard --config <path>      # allowances from somewhere other than <repo>/.leakguard.json
 
-    As a pre-commit + pre-push hook (one-time, per clone):
-        git config core.hooksPath .githooks
+    `python -m kw_common.leakguard ...` is identical and equally supported.
+
+    As a pre-commit + pre-push hook, a repository points `core.hooksPath` at its own hooks and
+    calls the command above. The hooks are the CONSUMER's, not this package's: they are how a
+    repository wires the guard up, and they differ per repository.
 
 IF IT FIRES ON SOMETHING LEGITIMATE
-    Add the exact literal to ALLOW_LITERALS below, in the same commit, with a comment saying
-    why. That edit is visible in review -- which is the point. Do not loosen a pattern, and
-    never add a blanket per-file skip: this file's whole value is that it cannot be satisfied
-    by looking away.
+    Add the exact literal to `allow_literals` in the SCANNED REPOSITORY's `.leakguard.json`, with
+    the `why` the format requires. The file must be TRACKED — an untracked one is refused,
+    precisely so that an allowance cannot govern a scan while being invisible to review.
+
+    ⚠️ NOT by editing this file. It arrives from an installed package: an edit here is reverted by
+    the next `pip install --upgrade`, and a repository that edits its installed copy has forked the
+    guard, which is the failure the package exists to prevent. The allowances used to be a tail
+    hand-edited into the bottom of this file, and that is exactly why seven copies of it drifted.
+
+    Do not loosen a pattern, and do not look for a per-file skip: there is none to configure, and
+    this file's whole value is that it cannot be satisfied by looking away. A configuration that
+    stops any of this guard's own deny cases being caught — on any of the three surfaces — is
+    REFUSED rather than applied.
 """
 
 from __future__ import annotations
 
 import bisect
 import functools
+import json
 import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import NamedTuple
+
+# ⭐ THE PUBLIC SURFACE, and it is a semver contract now that this module ships in a package.
+# Grouped by concern rather than alphabetised, because the grouping is the map: a consumer needs
+# the CLI, or the configuration, or the scan.
+#
+# ⚠️ "NOT LISTED" MEANS "NOT PROMISED", NOT "PRIVATE". Plenty of public names are deliberately
+# absent — `parse_diff`, `scan_added`, `commit_identity`, `scan_tags`, `staged_diff`, `parse_args`,
+# `ParsedDiff` and the rest are the engine's internals, importable but free to change without a
+# major bump. An earlier version of this comment said everything outside the list was `_`-prefixed,
+# which was simply untrue.
+#
+# ⛔ `ALLOW_LITERALS` IS DELIBERATELY NOT EXPORTED. `apply_config` REBINDS it, so
+# `from kw_common.leakguard import ALLOW_LITERALS` captures a snapshot that stops tracking the
+# module the moment any scan configures itself — an exported name that cannot behave the way an
+# importer would expect. Read the live value off the module (`leakguard.ALLOW_LITERALS`), or
+# better, hold the `GuardConfig` you applied. `PATH_EXEMPT` is not exported either: it is an
+# engine constant that only an edit to this file changes.
+__all__ = [
+    # the command line
+    "main", "cli", "USAGE", "UsageError",
+    # the configuration a repository injects
+    "CONFIG_FILENAME", "GuardConfig", "DEFAULT_CONFIG", "ConfigError",
+    "find_config", "load_config", "resolve_config", "parse_config", "apply_config",
+    # the scan
+    "PATTERNS", "compile_patterns", "compile_for", "scan_text", "scan_path", "scan_range",
+    "selftest", "tracked_files", "repo_root",
+    # the data a scan is shaped by
+    "ALLOW_SPANS", "SKIP_SUFFIXES",
+]
 
 # --------------------------------------------------------------------------- the denylist
 # SHAPES ONLY. See the module docstring: a real literal in this list would make this file the
@@ -387,35 +442,50 @@ MESSAGE_PATTERN_OVERRIDES: dict[str, str | None] = {
 # string shape, and the corpora require the first to pass. It is caught in file CONTENT, which is
 # where such a host is actually configured. Do not read the surviving LABEL as coverage.
 
+# ⭐⭐ `ALLOW_LITERALS` BELOW IS THE ENTIRE CONFIGURATION SURFACE, AND IT DEFAULTS TO EMPTY.
+#
+# It used to be a hand-edited TAIL that each repository carried its own version of, which is
+# exactly what made the guard un-shareable: a whole-file copy from upstream clobbered the tail,
+# so every port either lost a repository's allowances or preserved them by hand and drifted. Now
+# the engine ships in a package and the allowances are INJECTED from the SCANNED repository —
+# see `resolve_config` and `CONFIG_FILENAME` further down.
+#
+# ⛔ THE DEFAULT ALLOWS NOTHING, AND THAT DIRECTION IS DELIBERATE. A repository with no config
+# file gets the strictest possible scan, so a missing, misnamed or unreadable config can only
+# ever make the guard louder. The opposite default — "ship the fleet's own allowances" — would
+# mean an installed library silently permitting values in a repository that never asked for
+# them, and a consumer would have to EDIT INSTALLED CODE to tighten it back up, which is the
+# fork this package exists to prevent.
+
 # Per-PATH exemptions for a single pattern, as (pattern label, path regex).
 #
-# EMPTY HERE, AND THAT IS THE EXPECTED STATE for a shape-based denylist: every pattern above
-# describes a value that has no business appearing anywhere in this repo, including in build
-# output. The mechanism exists because the engine is shared verbatim with the project-side
-# real-literal guard, which DOES need one (a scan for the operator's given name false-positives
-# on the home-directory path baked into `__pycache__` bytecode). Keeping the two engines
-# byte-identical except for their data is what stops them drifting into disagreeing about what
-# a repository contains.
+# ⛔⛔ AN ENGINE CONSTANT, NOT CONFIGURATION — a repository CANNOT set this. It was briefly
+# settable from `.leakguard.json` and two different attempts to bound the regex were both
+# fail-open, one round apart; `GuardConfig` records them. Changing it now takes an edit to this
+# file, which is a reviewed change rather than a line of data.
 #
-# ⚠️ This is a per-PATTERN, per-PATH carve-out and never a blanket file skip. Adding a whole
-# file here would recreate exactly the "satisfied by looking away" hole the docstring forbids.
+# EMPTY HERE, AND THAT IS THE EXPECTED STATE for a shape-based denylist: every pattern above
+# describes a value that has no business appearing anywhere in an ordinary repository, including
+# in build output. The mechanism exists because the engine is shared with the project-side
+# real-literal guard, which DOES need one — a scan for the operator's given name false-positives
+# on the home-directory path baked into `__pycache__` bytecode. Keeping one engine and moving
+# that difference into its own copy's data is what stops the two drifting into disagreeing about
+# what a repository contains.
+#
+# ⚠️ This is a per-PATTERN, per-PATH carve-out and never a blanket file skip. A whole-file skip
+# here would recreate the "satisfied by looking away" hole the docstring forbids, invisibly, for
+# every consumer at once.
 PATH_EXEMPT: tuple[tuple[str, str], ...] = ()
 
-# Literals that LOOK like a hit but are allowed. Keep each one justified.
-# ⚠️ As of today all three are INERT: none of them matches any current pattern, so removing the
-# neutralisation would change no verdict. They are kept as a deliberate carve-out for the
-# functional owner path in case a future pattern would catch it — stated here so nobody reads
-# this list as evidence that the carve-out is exercised. It is pinned DIRECTLY, by
-# `test_the_allow_literals_are_recognised_as_permitted_spans`, and not through a scan verdict that
-# would pass either way.
-ALLOW_LITERALS: tuple[str, ...] = (
-    # The GitHub/GHCR owner path is functional — neutralizing it breaks image pulls and the
-    # icon URLs the Unraid templates point at. It is the account name, not infrastructure, and
-    # it is in this repository's own clone URL.
-    "github.com/texasdaddy",
-    "githubusercontent.com/texasdaddy",
-    "ghcr.io/texasdaddy",
-)
+# Literals that LOOK like a hit but are allowed. Keep each one justified — the config format
+# REQUIRES the justification, so "keep each one justified" is enforced rather than requested.
+#
+# ⚠️ Against THIS pattern set an allow-literal is INERT: the denylist here is shapes only, and
+# no shape matches an owner path or a project name. It is live machinery for the project-side
+# real-literal guard, which shares this engine and whose patterns a functional URL genuinely
+# does trip. Stated so nobody reads an empty default as evidence the mechanism is unused, and
+# so nobody reads a populated config as evidence it is exercised.
+ALLOW_LITERALS: tuple[str, ...] = ()
 
 # The documented ways to write an address or a host. A span here SUPPRESSES A HIT IT CONTAINS
 # (see `scan_text`); it never deletes text and it never skips the line. Skipping the line meant
@@ -514,7 +584,7 @@ ALLOW_SPANS: tuple[str, ...] = (
 # Text-bearing formats are NEVER skipped — an SVG is XML and carries <title>/<desc>/href, and
 # the leak an earlier batch removed was literally an icon URL inside one.
 #
-# ⭐ THIS IS A HINT ABOUT WHERE NOT TO WASTE A READ, NOT AN EXEMPTION (keystone#22). It was the
+# ⭐ THIS IS A HINT ABOUT WHERE NOT TO WASTE A READ, NOT AN EXEMPTION (consumer#22). It was the
 # latter, and a file named `deploy-notes.pdf` holding an ordinary ASCII runbook — a LAN host, an
 # appdata path and an RFC1918 address, all in plain text — was therefore read by NEITHER scan and
 # exited 0. Renaming a text file must not defeat a guard. What each scan does now:
@@ -531,27 +601,398 @@ ALLOW_SPANS: tuple[str, ...] = (
 SKIP_SUFFIXES = (".png", ".jpg", ".jpeg", ".ico", ".gif", ".pdf", ".zip", ".gz",
                  ".woff", ".woff2", ".ttf", ".db", ".sqlite")
 
-# ⛔ THE EXACT PATH, not a substring of the file NAME. This file carries synthetic deny cases by
-# design and so cannot be scanned; nothing else earns that exemption. Matching `SELF in name` —
-# which this file and its siblings used to do — silently exempts any file whose name merely
-# CONTAINS it, `tests/test_check_no_internal_info.py` being the obvious one, and
-# `scripts/__pycache__/check_no_internal_info.cpython-312.pyc` being the one that actually bit:
-# a tracked, binary, literal-bearing copy the scan skipped in silence. A `.pyc` is deliberately
-# NOT in SKIP_SUFFIXES so it surfaces as unreadable-and-therefore-not-cleared instead.
+# ⛔⛔ THERE IS NO `SELF_PATH` CONSTANT ANY MORE, AND ITS REMOVAL IS A SECURITY FIX.
+#
+# This file carries synthetic deny cases by design and so cannot scan itself; nothing else earns
+# that exemption. It used to be spelled as a constant — `scripts/check_no_internal_info.py` —
+# which was already known to be wrong in one direction (relocate the guard and the exemption
+# lands on an unrelated file at the old path) and was patched by resolving `__file__` RELATIVE TO
+# THE SCANNED ROOT, keeping the constant as a fallback.
+#
+# ⚠️ THE FALLBACK IS THE WHOLE BUG ONCE THE GUARD IS INSTALLED RATHER THAN VENDORED. An installed
+# module lives in `site-packages`, which is not inside the repository being scanned, so
+# `relative_to(root)` raises and the fallback fires — silently exempting whatever the scanned
+# repository happens to keep at `scripts/check_no_internal_info.py`. That path is not a
+# hypothetical: it is where every repository in this fleet kept its vendored copy, so the first
+# consumer to install this package and delete its old script would have handed a permanent,
+# invisible amnesty to any file that later took that name.
+#
+# So: the exemption follows THE FILE, and when the file is not inside the scanned repository at
+# all, the PATH test grants nothing. `_self_rel_path` returns `None` for that case and every
+# caller treats `None` as "no file is self"; the only other way a file is recognised is by being
+# byte-identical to this module's own source — see `_is_self`.
 #
 # ⚠️ BOTH SCANS USE THIS, and they must agree. The range scan gets its paths from the
 # `diff --git a/X b/X` header, which is already repo-relative and posix-separated — the same
 # shape as the tree scan's `path.relative_to(root).as_posix()`. If the two disagreed about which
 # single file is exempt, one of them would be lying about its coverage.
 #
-# ⚠️ The project-side real-literal guard deliberately does NOT skip this path. Scanning THIS file
-# for real values is the check that keeps the shapes-only promise above honest, and a guard that
-# skipped it could not perform that check.
-SELF_PATH = "scripts/check_no_internal_info.py"
+# ⚠️ A `SELF in name` match — which this file and its siblings used to do — is a different bug in
+# the same family: it silently exempts any file whose name merely CONTAINS the guard's,
+# `tests/test_check_no_internal_info.py` being the obvious one and
+# `scripts/__pycache__/check_no_internal_info.cpython-312.pyc` being the one that actually bit —
+# a tracked, binary, literal-bearing copy the scan skipped in silence. A `.pyc` is deliberately
+# NOT in SKIP_SUFFIXES so it surfaces as unreadable-and-therefore-not-cleared instead.
+#
+# ⚠️ The project-side real-literal guard deliberately does NOT skip its own path. Scanning that
+# file for real values is the check that keeps the shapes-only promise above honest, and a guard
+# that skipped it could not perform that check.
 
 _ALLOW_SPAN_RX = re.compile("|".join(ALLOW_SPANS), re.IGNORECASE)
 _PATH_EXEMPT_RX: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
     (label, re.compile(rx)) for label, rx in PATH_EXEMPT)
+
+# ------------------------------------------------------ the configuration a consumer INJECTS
+
+# ⭐⭐ THE FILE IS READ FROM THE REPOSITORY BEING SCANNED, NEVER FROM THE INSTALLED PACKAGE.
+#
+# That sentence is the whole design. Every repository in this fleet used to carry its own COPY of
+# this engine with its allowances edited into the bottom of it, and the copies drifted: a fix made
+# once upstream had to be re-ported by hand into each, and a whole-file port clobbered the local
+# tail every time. An installed library cannot be edited — an edited install IS a fork, and a
+# `pip install --upgrade` silently reverts it — so the allowances have to arrive from outside.
+#
+# JSON, not TOML: `tomllib` arrived in 3.11 and this package supports 3.10, so TOML would mean a
+# third-party dependency for every consumer of every module here. That trade is not worth a
+# nicer comment syntax, and the format carries its justifications in a required `why` field
+# instead of in comments.
+CONFIG_FILENAME = ".leakguard.json"
+
+_CONFIG_EXAMPLE = """{
+  "_note": "a key prefixed with `_` is a comment - the only spelling this scanner ignores",
+  "allow_literals": [
+    {"literal": "github.com/<owner>", "why": "functional: the clone URL of this repository"}
+  ]
+}"""
+
+
+class ConfigError(Exception):
+    """A configuration file this scanner will not act on.
+
+    Its OWN exception type, separate from `UsageError`, because the two say different things to
+    the operator: one means "you typed the command wrong", the other means "the file in your
+    repository does not mean what you think it means". Both exit 2 — a scanner that cannot
+    establish its own rules must not report on a repository at all.
+    """
+
+
+class GuardConfig(NamedTuple):
+    """Everything a repository is allowed to say about how it is scanned: an allow-LIST.
+
+    ⛔ ONE FIELD, AND THAT IS THE RESULT OF DELETING THE OTHER ONE. `allow_literals` suppresses a
+    hit that falls inside an EXACT literal — it cannot remove a pattern, widen one, or skip a
+    file, and every entry is a value somebody wrote down and justified.
+
+    ⛔⛔ `path_exempt` WAS HERE AND WAS WITHDRAWN, and the reason is worth more than the feature.
+    It let a repository excuse one named pattern on one path REGEX, and the question "is this
+    regex narrow enough" turned out to have no honest answer:
+
+      1. The first design measured the deny corpus with no path at all, so the exemption was never
+         exercised by the check that was supposed to bound it. `{"path_regex": "."}` turned a
+         pattern off across a whole tree, on the content and path surfaces, in all three scan
+         modes, and the configuration was ACCEPTED.
+      2. The second measured the corpus at a list of ordinary probe paths. That is a nine-name
+         allowlist wearing the word "property": `\\.go$`, `^internal/`, `^terraform/` and twenty
+         more were accepted and were total against a real repository, and a negative lookahead
+         over the nine names turned a pattern off everywhere in one line. It ALSO refused the
+         narrowest legitimate exemption there is — a single file — whenever that file was named
+         `README.md` or `Dockerfile`, so it was inverted against its own stated purpose. And an
+         accepted regex was unbounded: `^internal/(a+)+b$` did not finish in two minutes, in a
+         module whose own rule is that nothing may hang.
+
+    Two designs, both fail-open, one round apart. No acceptance criterion asked for it — what was
+    asked for is an allow-LIST — so it is withdrawn rather than repaired a third time. `PATH_EXEMPT`
+    remains an ENGINE-level constant, per-pattern and per-path, for the project-side guard that
+    shares this engine; what a repository can no longer do is set it from data.
+    """
+
+    allow_literals: tuple[str, ...] = ()
+
+
+DEFAULT_CONFIG = GuardConfig()
+
+
+def _entries(raw: object, key: str) -> list[dict[str, object]]:
+    """The list of objects under `key`, or an error saying exactly what was wrong with it."""
+    if not isinstance(raw, list):
+        raise ConfigError(f"{key!r} must be a list of objects, got {type(raw).__name__}")
+    out: list[dict[str, object]] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ConfigError(
+                f"{key}[{i}] must be an object, got {type(entry).__name__}. Every entry carries "
+                f"its own justification:\n{_CONFIG_EXAMPLE}")
+        out.append(entry)
+    return out
+
+
+def _field(entry: dict[str, object], key: str, where: str, allowed: tuple[str, ...]) -> str:
+    """One required non-empty string field, with unknown keys refused rather than ignored.
+
+    ⛔ AN UNKNOWN KEY IS AN ERROR, not something to skip past. A misspelled `path_rgex` would
+    otherwise leave the entry meaning something the author did not write, and a leak guard whose
+    configuration can be silently misread is a leak guard whose verdict cannot be trusted. Same
+    reasoning as `compile_for` refusing an override that names no pattern.
+    """
+    unknown = sorted(set(entry) - set(allowed))
+    if unknown:
+        raise ConfigError(f"{where}: unknown key(s) {unknown}; expected {list(allowed)}")
+    value = entry.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ConfigError(f"{where}: {key!r} must be a non-empty string, got {value!r}")
+    return value
+
+
+def parse_config(text: str, where: str) -> GuardConfig:
+    """A `GuardConfig` from the TEXT of a config file, validated strictly.
+
+    ⚠️ EVERY REJECTION HERE FAILS THE SCAN. That is the safe direction: a config that cannot be
+    understood must never be quietly replaced by "no config", because the difference between
+    those two is invisible in the output and the operator would read a pass that was never
+    measured against the rules they wrote.
+    """
+    try:
+        raw = json.loads(text)
+    except ValueError as exc:
+        raise ConfigError(f"{where}: not valid JSON ({exc})") from None
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{where}: the top level must be an object, got {type(raw).__name__}")
+    # ⭐ A LEADING UNDERSCORE IS THE ONLY WAY TO WRITE A COMMENT, and it is deliberately the only
+    # ignored spelling. JSON has no comments and this file has to explain itself somewhere, but
+    # "ignore anything unrecognised" would swallow `allow_litrals` — a typo that silently drops a
+    # repository's entire allow-list while the scan reports a confident pass. No key this scanner
+    # reads begins with `_`, so the two cases cannot be confused.
+    unknown = sorted(k for k in set(raw) - {"allow_literals"} if not k.startswith("_"))
+    if unknown:
+        # ⭐ `path_exempt` GETS ITS OWN SENTENCE, because a repository that carried one is not
+        # making a typo — it is meeting a withdrawn feature, and "unknown key" would send it
+        # looking for a spelling mistake that is not there. See `GuardConfig` for why it went.
+        withdrawn = ("\nNote: `path_exempt` was WITHDRAWN. Two designs for bounding its regex were "
+                     "both fail-open (see GuardConfig); no acceptance criterion needed it, and it "
+                     "is not coming back as data. `PATH_EXEMPT` remains an engine constant."
+                     if "path_exempt" in unknown else "")
+        raise ConfigError(
+            f"{where}: unknown key(s) {unknown}. A key this scanner does not read is far more "
+            f"likely to be a typo in one it does than a note to a human, and a silently ignored "
+            f"rule is worse than no rule. For a note, prefix the key with `_`:"
+            f"{withdrawn}\n{_CONFIG_EXAMPLE}")
+
+    literals: list[str] = []
+    for i, entry in enumerate(_entries(raw.get("allow_literals", []), "allow_literals")):
+        where_i = f"{where}: allow_literals[{i}]"
+        literal = _field(entry, "literal", where_i, ("literal", "why"))
+        _field(entry, "why", where_i, ("literal", "why"))
+        literals.append(literal)
+
+    return GuardConfig(tuple(literals))
+
+
+def find_config(root: Path, explicit: str | None) -> Path | None:
+    """The config file NAMED on the command line, validated. `None` when none was named.
+
+    ⛔ AN EXPLICIT `--config` THAT DOES NOT EXIST IS AN ERROR. Falling back to discovery there
+    would mean a typo'd path scans under rules the operator did not choose and reports a verdict
+    they would read as authoritative.
+
+    ⚠️ DISCOVERY IS NOT HERE ANY MORE — it is `resolve_config`, and it reads the INDEX rather than
+    the filesystem. `root` is kept in the signature because a caller has it and a future explicit
+    form may want to resolve relative to it; it is unused today, and saying so beats a reader
+    wondering what it does.
+    """
+    if explicit is None:
+        return None
+    path = Path(explicit)
+    if not path.is_file():
+        raise ConfigError(f"--config {explicit!r}: no such file")
+    return path
+
+
+def load_config(path: Path | None) -> GuardConfig:
+    """Read and validate a config file from the FILESYSTEM; `None` means "no file"."""
+    if path is None:
+        return DEFAULT_CONFIG
+    try:
+        text = path.read_text(encoding=_CONFIG_ENCODING)
+    except OSError as exc:
+        raise ConfigError(f"{path}: cannot be read ({exc})") from None
+    except UnicodeDecodeError:
+        raise ConfigError(f"{path}: is not UTF-8 text") from None
+    return parse_config(text, str(path))
+
+
+# ⚠️ `utf-8-sig`, NOT `utf-8`. It reads plain UTF-8 identically and additionally strips a BOM —
+# which Windows PowerShell 5.1 writes by default from `Out-File`, and Notepad from "Save As
+# UTF-8". Without it a semantically perfect config exits 2 on the workstation this fleet is
+# operated from, which is a guard reddening correct work: the failure mode that gets a guard
+# switched off.
+_CONFIG_ENCODING = "utf-8-sig"
+
+
+def resolve_config(root: Path, explicit: str | None) -> GuardConfig:
+    """The configuration this scan runs under: the file NAMED, else the INDEX, else none.
+
+    ⛔⛔ THE DISCOVERED CONFIG IS READ FROM THE INDEX, NOT FROM THE WORKTREE, and that is a change
+    of KIND rather than one more patch. The previous version asked git whether the PATH was tracked
+    and then read the FILE — two different questions about two different objects. They diverge, and
+    a verification agent drove the divergence: `git update-index --skip-worktree .leakguard.json`
+    leaves `git status` empty while the worktree copy — allowing a real address — governs every
+    scan. A plain unstaged edit does the same with one ` M`.
+
+    Patching that (compare the bytes, then handle `--assume-unchanged`, then …) is the infinite
+    regress this module's own rules warn about: when the next round finds the same defect one step
+    over, change what is being ASSERTED. So the bytes that govern the scan ARE the bytes in the
+    index. There is no gap left to exploit, because there is no second copy: `--skip-worktree`
+    cannot help, an unstaged edit has no effect, and "staged but not yet committed" stops being a
+    hole and becomes the stated semantics — the index is exactly what a commit would record, which
+    is the question `--staged` asks anyway.
+
+    ⚠️ A FILE ON DISK THAT THE INDEX DOES NOT HAVE IS AN ERROR, not silence. Ignoring it would let
+    an author write a config, see a clean scan, and believe their allowances applied when nothing
+    of the kind happened.
+
+    ⚠️ AND A DIVERGENCE IS ANNOUNCED. If the worktree copy differs from the index copy, the scan
+    says which one it used. Reading the index is the safe choice, but a silent one would be its own
+    small surprise — the operator edited a file and the guard ignored it.
+    """
+    named = find_config(root, explicit)
+    if named is not None:
+        return load_config(named)
+
+    blob = staged_blob(root, CONFIG_FILENAME)
+    on_disk = root / CONFIG_FILENAME
+    if blob is None:
+        if on_disk.is_file():
+            # ⚠️ THE MESSAGE NAMES THE OTHER TWO WAYS TO GET HERE, because "the index has no such
+            # file" is the common one and not the only one. `git cat-file :<path>` also refuses a
+            # path with no STAGE-0 entry — an unmerged file mid-conflict — and the index lookup is
+            # case-SENSITIVE while NTFS is not, so a mis-cased name exists on disk, shows up in
+            # `git ls-files`, and misses here. All three fail closed; only the diagnosis differed,
+            # and sending somebody to `git add` a file they already added is how a fail-closed
+            # guard earns a reputation for lying.
+            raise ConfigError(
+                f"{on_disk} exists but the index has no stage-0 {CONFIG_FILENAME}, so it would "
+                f"change what this scan allows while being invisible to everyone reviewing this "
+                f"repository. Usually that means it is untracked: `git add {CONFIG_FILENAME}`. It "
+                f"can also mean the file is mid-merge (resolve the conflict and stage it), or that "
+                f"its name differs in CASE from the index entry, which git matches exactly. Or "
+                f"delete it and pass `--config <path>` explicitly.")
+        return DEFAULT_CONFIG
+    try:
+        text = blob.decode(_CONFIG_ENCODING)
+    except UnicodeDecodeError:
+        raise ConfigError(f"{CONFIG_FILENAME} (in the index): is not UTF-8 text") from None
+    # ⚠️ IN A `try`, because this read exists only to print a courtesy note and must never be the
+    # thing that ends a scan. It is the one read on this path with nothing to fall back on: a
+    # permission problem, or a deletion racing the `is_file()`, would otherwise raise OSError out
+    # of `main` as a traceback — against this module's own rule that a guard reports rather than
+    # crashes. The index copy governs either way, so failing to read the worktree costs a note.
+    try:
+        diverged = on_disk.is_file() and _lf(on_disk.read_bytes()) != _lf(blob)
+    except OSError:
+        diverged = False
+    if diverged:
+        print(f"note: {CONFIG_FILENAME} differs from the index; this scan used the INDEX copy, "
+              f"which is what a commit would record. `git add {CONFIG_FILENAME}` to use your edit.")
+    return parse_config(text, f"{CONFIG_FILENAME} (as the index holds it)")
+
+
+def apply_config(config: GuardConfig) -> None:
+    """Install a config as the module's live allowances, and REFUSE one that guts the guard.
+
+    ⛔⛔ THE REFUSAL IS THE POINT, and it is what makes injection safe. A repository could write
+    `{"literal": "/mnt/user", ...}` — a real pool root, and a plausible thing to want to allow —
+    and silence the pool-path pattern wherever it appears while CI stayed green and said "no
+    internal info found". That is precisely the "guard switched off" outcome this module's
+    docstring is written against, and moving the allowances into a file the consumer owns would
+    otherwise have made it a one-line edit.
+
+    ⚠️ THAT EXAMPLE IS MEASURED, and an earlier version of this docstring used one that is NOT.
+    `{"literal": "192.168."}` looks like it would turn RFC1918 off and does nothing at all:
+    suppression requires the permitted span to CONTAIN the whole match, and `192.168.` does not
+    contain `192.168.77.77`. The config is accepted and the finding still reported. An example
+    chosen by intuition rather than run is exactly the claim-inflation this file treats as a
+    defect — and it was written after the correct answer had already been measured.
+
+    So every configured allowance is measured against the deny corpus before it takes effect: if
+    applying it stops a `_MUST_FAIL` case being caught, the config is rejected and the scan does
+    not run. A repository may excuse things the corpus does not cover; it may not excuse the
+    corpus itself.
+
+    ⛔⛔ WHAT THIS CHECK IS AND IS NOT, stated flatly because two earlier versions of this
+    paragraph overstated it and "cannot be bypassed" is the claim that never survives a round.
+
+    THE CHECK IS CORPUS-SHAPED. It refuses a literal that stops one of the SAMPLES being caught,
+    and the corpus is finite: 32 content samples across 8 labels, 9 paths, 8 messages. So
+    `"/mnt/user"` is refused because a pool-path sample spells that pool — and `"/mnt/cache"`,
+    `"/mnt/disk9"` and `"tailnet-acme.ts.net"` are ACCEPTED, because no sample spells those.
+    Measured, all four.
+
+    ⚠️ AND AN ACCEPTED LITERAL IS NOT NARROW. A permitted span suppresses any hit it CONTAINS, and
+    the match for `unraid pool path` is exactly `/mnt/<pool>` — so allowing `"/mnt/cache"` silences
+    that pool everywhere in the repository, on all three surfaces and in all three scan modes, not
+    "one value at a time". The same holds for a tailnet name. An earlier version of this docstring
+    said the single wide literal that turns a pattern off across a tree is what this check closes.
+    It closes the ones the corpus happens to name. That is a real bound and a useful one — it is
+    what makes the obvious off-switches fail loudly — but it is not the property the sentence
+    claimed, and a repository author who believed it would draw exactly the wrong conclusion about
+    what the format can do.
+
+    So what actually stands between a repository and a self-inflicted blind spot is not this
+    check: it is that every entry is an exact literal, written out, carrying a required
+    justification, in a file read FROM THE INDEX — which is the visibility the old hand-edited
+    engine tail never had. This check is the backstop that catches the careless case, not a proof
+    of anything.
+    """
+    global ALLOW_LITERALS
+    previous = ALLOW_LITERALS
+    ALLOW_LITERALS = config.allow_literals
+    defeated = _deny_cases_defeated(compile_patterns())
+    if defeated:
+        ALLOW_LITERALS = previous
+        raise ConfigError(
+            "this configuration DEFEATS the guard's own deny cases, so it is refused:\n  "
+            + "\n  ".join(defeated)
+            + "\nAn allowance may excuse a value the corpus does not cover; it may not excuse "
+              "the corpus. Narrow the literal until the cases above are caught again.")
+
+
+def _deny_cases_defeated(compiled: list[tuple[str, re.Pattern[str]]]) -> list[str]:
+    """Which of the guard's own deny cases the live allowances stop catching.
+
+    ⛔ ALL THREE SURFACES, because the allowances reach all three. `ALLOW_LITERALS` is applied by
+    `_permitted_spans` inside `scan_text`, which the PATH and MESSAGE scans call too — so a check
+    that measured only file CONTENT accepted a literal that defeated three of the engine's own
+    path and message deny cases at once. Measured: `{"literal": "host-a.lan."}` was accepted, and
+    the shipped `--selftest` then failed with two PATH cases and one MESSAGE case uncaught.
+
+    ⚠️ THE CONTENT LOOP PASSES NO `rel_path`, and that is a consequence of withdrawing
+    `path_exempt` rather than a return to the bug it once was. `scan_text` consults `_exempt` only
+    when a path is given, and `PATH_EXEMPT` is an engine constant again — empty here, changeable
+    only by editing the engine, which is a reviewed change — so no CONFIGURED value's effect
+    depends on which path a sample is scanned at. An intermediate version ran the corpus at a list
+    of "ordinary" probe paths to bound a configured exemption; that list was a nine-name allowlist,
+    and `\\.go$` or `^internal/` sailed straight past it. `GuardConfig` records both failed designs.
+
+    ⚠️ THE PATH LOOP DOES PASS ONE, through `scan_path`, so were `PATH_EXEMPT` ever repopulated by
+    an engine edit the two loops would measure under different rules. Inert today, and written down
+    so the asymmetry is not discovered by whoever repopulates it.
+
+    Empty is the healthy answer.
+    """
+    defeated = []
+    # CONTENT.
+    for want_label, sample in list(_MUST_FAIL) + list(_MUST_FAIL_ADJACENT):
+        if want_label not in {label for _, label, _ in scan_text(sample, compiled)}:
+            defeated.append(f"{want_label}: {sample!r} is no longer caught")
+    # PATHS — `scan_path` runs the path override set.
+    for want_label, rel in _MUST_FAIL_PATHS:
+        if want_label not in {label for label, _ in scan_path(rel)}:
+            defeated.append(f"{want_label}: the PATH {rel!r} is no longer caught")
+    # MESSAGES — a commit message has no path, so only `ALLOW_LITERALS` can reach it here.
+    for want_label, msg in _MUST_FAIL_MESSAGES:
+        if want_label not in {label for _, label, _ in scan_text(msg, list(message_patterns()))}:
+            defeated.append(f"{want_label}: the MESSAGE {msg!r} is no longer caught")
+    return defeated
 
 # EVERY git call this makes is bounded — `tracked_files`, the per-commit diff and the fallback
 # re-diff alike. A guard that can hang on the push path is the failure the no-silent-hangs
@@ -563,32 +1004,41 @@ _GIT_TIMEOUT_S = 120
 
 
 @functools.cache
-def _self_rel_path(root: Path | None = None) -> str:
-    """This file's OWN repo-relative path — resolved, not assumed.
+def _self_rel_path(root: Path | None = None) -> str | None:
+    """This file's OWN repo-relative path, or `None` when it is not in the scanned repository.
 
-    ⚠️ `SELF_PATH` is a constant, so the exemption used to land on whatever sits at that path
-    rather than on this file. Copy the guard to `tools/check_no_internal_info.py` and run it, and
-    it scans ITSELF (every synthetic deny case above becomes a finding) while exempting the
-    unrelated file at `scripts/…` — the exemption on the one file that does not need it, and gone
-    from the one that does. Deriving it from `__file__` makes the SELF_PATH comment true wherever
-    the guard is run from; the constant stays as the fallback for an exotic loader with no
-    resolvable path, and for the project-side guard, which reads it to know what NOT to skip.
+    ⚠️ RESOLVED, NEVER ASSUMED — and `None` is a real answer, not a failure. A constant here made
+    the exemption land on whatever sits at that path rather than on this file: copy the guard to
+    `tools/check_no_internal_info.py` and run it, and it scanned ITSELF (every synthetic deny case
+    above became a finding) while exempting the unrelated file at `scripts/…` — the exemption on
+    the one file that does not need it, and gone from the one that does.
+
+    ⛔ AND THE CONSTANT AS A *FALLBACK* WAS WORSE, because it fires exactly when the guard is
+    INSTALLED. `site-packages` is not inside the repository being scanned, so `relative_to` raises
+    on every run of an installed guard and the fallback exempted whatever the scanned repository
+    kept at the old vendored path. Returning `None` means an installed guard exempts NOTHING,
+    which is the only safe answer: this file is not in that repository, so no file in it is this
+    file.
+
+    `root is None` — a caller with no repository context, which the range scan's helpers used to
+    have — is the same answer for the same reason: without a root there is nothing to be relative
+    to, and a guess is what created the hole.
 
     ⚡ CACHED: `_is_self` calls this once per tracked file, and each call makes two
-    `Path.resolve()` syscalls — ~1.7 ms per file against ~0.8 us for a constant compare, so a
-    large repository would pay seconds for an answer that cannot change during a run. (This used
-    to name `_skipped` as the per-file caller. `_skipped` is not called by the tree scan at all;
-    the caching is still right, the named caller was not.)
+    `Path.resolve()` syscalls — ~1.7 ms per file against ~0.8 us for a compare, so a large
+    repository would pay seconds for an answer that cannot change during a run. (This used to name
+    `_skipped` as the per-file caller. `_skipped` is not called by the tree scan at all; the
+    caching is still right, the named caller was not.)
     """
     if root is None:
-        return SELF_PATH
+        return None
     try:
         return Path(__file__).resolve().relative_to(root.resolve()).as_posix()
     except (ValueError, OSError):
-        return SELF_PATH
+        return None
 
 
-def _is_self(rel_path: str, root: Path | None = None) -> bool:
+def _is_self(rel_path: str, root: Path | None = None, data: bytes | None = None) -> bool:
     """Is this the scanner's own source? The ONE file whose CONTENT no scan reads.
 
     ⛔ THE ONLY UNCONDITIONAL CONTENT EXEMPTION IN THIS FILE, and it is deliberately separate from
@@ -596,13 +1046,69 @@ def _is_self(rel_path: str, root: Path | None = None) -> bool:
     different questions: "this file carries synthetic deny cases by design" versus "this file is
     probably an image, so reading it is pointless". The second is a GUESS FROM A FILENAME, and
     treating a guess as an exemption is what let an ASCII leak in a file named `.pdf` walk past
-    both scans (keystone#22). One is a fact about a known path; the other is a prediction, and a
+    both scans (consumer#22). One is a fact about a known path; the other is a prediction, and a
     prediction now has to be CHECKED against the bytes — see `_looks_binary`.
 
     This exempts the file's CONTENT only. Its PATH is scanned like every other path (`scan_path`):
     renaming this guard to something that names the estate is a leak whatever the file contains.
+
+    ⛔ `None` NEVER MATCHES. `_self_rel_path` returns `None` when this file is not inside the
+    scanned repository — the ordinary case for an installed package — and the comparison below
+    must therefore be against a real path or against nothing at all. Writing this as
+    `rel_path == _self_rel_path(root) or DEFAULT` in any form re-introduces the amnesty the
+    constant fallback used to hand out.
+
+    ⭐⭐ `data` IS THE SECOND IDENTITY TEST, AND IT IS AN IDENTITY TEST — not a second exemption.
+    An INSTALLED guard is not inside the repository it scans, so the path test cannot fire; but the
+    repository that OWNS the engine has the engine's source as an ordinary tracked file, full of
+    synthetic deny cases by design. Asking whether that file's BYTES are this module's own bytes
+    answers "is this me" without naming a path, so nothing else in any repository can claim it:
+    a file would have to be a byte-identical copy of this guard to be skipped, and this guard
+    contains no real value. Change one character of it — append a real leak, say — and the bytes
+    differ and it is scanned like anything else.
+
+    ⚠️ WHY NOT A CONFIGURED PATH EXEMPTION INSTEAD. That was the first answer, and it was wrong in
+    a way worth recording: excusing every pattern on the engine's own path is a whole-file skip
+    written in data, so a REAL leak appended to that file passed — the exact blind spot the
+    `SELF_PATH` constant used to leave, moved from code into config. An identity test cannot be
+    widened by a config, cannot be pointed at another file, and needs nobody to keep it narrow.
+
+    ⚠️ LINE ENDINGS ARE NORMALISED before the comparison. A checkout under `core.autocrlf=true`
+    holds the same file with CRLF while an installed copy has LF; without normalisation the guard
+    would fail to recognise its own source on exactly one platform, which is the "works on the
+    machine that wrote it" class this file has been bitten by before.
+
+    ⚠️ ONLY THE TREE SCAN PASSES `data`, because only the tree scan has the file's bytes. The range
+    and staged scans see a diff, so a repository that VENDORS the engine and scans a range with an
+    INSTALLED guard would still report its own corpus. That case does not arise here — this
+    repository's CI runs an editable install, where the PATH test fires — and it is stated rather
+    than left to be discovered.
     """
-    return rel_path == _self_rel_path(root)
+    self_path = _self_rel_path(root)
+    if self_path is not None and rel_path == self_path:
+        return True
+    if data is None:
+        return False
+    own = _own_source_bytes()
+    return own is not None and (data == own or _lf(data) == _lf(own))
+
+
+def _lf(data: bytes) -> bytes:
+    """CRLF-normalised, so "is this my own source" is not a question about the checkout's config."""
+    return data.replace(b"\r\n", b"\n")
+
+
+@functools.cache
+def _own_source_bytes() -> bytes | None:
+    """This module's own bytes, or `None` if they cannot be read.
+
+    ⛔ `None` MEANS "EXEMPT NOTHING", like every other unanswerable question in this file. A guard
+    that cannot read its own source must not therefore start skipping files.
+    """
+    try:
+        return Path(__file__).resolve().read_bytes()
+    except (OSError, NameError):
+        return None
 
 
 def _binary_suffix(rel_path: str) -> bool:
@@ -637,7 +1143,7 @@ def _skipped(rel_path: str, root: Path | None = None) -> bool:
 def _looks_binary(data: bytes) -> bool:
     """Is this blob genuinely not UTF-8 TEXT? Asked of the BYTES, never of the filename.
 
-    ⭐ THIS IS THE HALF THAT MAKES `SKIP_SUFFIXES` SAFE (keystone#22). The suffix list used to be
+    ⭐ THIS IS THE HALF THAT MAKES `SKIP_SUFFIXES` SAFE (consumer#22). The suffix list used to be
     trusted outright, so `deploy-notes.pdf` holding an ordinary ASCII runbook — a LAN host, an
     appdata path and an RFC1918 address, all in plain text — was read by neither scan and exited
     0. Renaming a text file must not be a way to defeat a guard.
@@ -918,7 +1424,7 @@ def scan_path(rel_path: str) -> list[tuple[str, str]]:
     is one correct pattern set for a path; it is derived from `PATTERNS` by `compile_for`, so a
     pattern added tomorrow reaches this surface unless someone writes an override and says why.
 
-    ⭐ A PATH IS PUBLISHED CONTENT (keystone#20). Neither scan looked at one: the tree scan read
+    ⭐ A PATH IS PUBLISHED CONTENT (consumer#20). Neither scan looked at one: the tree scan read
     `git ls-files` only to open the file, and the range scan read a path only to decide what to
     skip. So a tracked `192.168.77.77.conf`, or a `docs/<host>.lan-runbook/` directory, reached a
     public remote with BOTH scans exiting 0 on perfectly clean file contents. A filename is
@@ -1058,9 +1564,9 @@ def _plus_path(rest: str) -> str:
     ⛔ `.strip()` HERE WAS A FULL BYPASS (issue #241). git appends a TAB after a path that carries
     trailing whitespace — measured: `+++ b/notes.png \\t` — so stripping removed the tab AND the
     meaningful trailing space with it. `notes.png ` became `notes.png`, whose suffix is SKIPPED,
-    and every added line in the real file was dropped. The worse half: `<SELF_PATH> ` stripped to
-    exactly `SELF_PATH` and inherited this guard's single self-exemption, so an arbitrary file
-    could be handed the one exemption in the file.
+    and every added line in the real file was dropped. The worse half: `<the guard's own path> `
+    stripped to exactly the guard's own path and inherited its single self-exemption, so an
+    arbitrary file could be handed the one exemption in the file.
     """
     return rest[:-1] if rest.endswith("\t") else rest
 
@@ -1238,7 +1744,7 @@ def parse_diff(diff: str) -> ParsedDiff:
                 #
                 # ⛔ AND IT IS NOT REDUNDANT — do NOT delete it. It is the ONLY path source when
                 # git emits no `diff --git` header, and removing it is what turned #241 into #250
-                # in the sibling repo (tape#241, "what the next attempt should know", item 1).
+                # in the sibling repo (consumer#241, "what the next attempt should know", item 1).
                 path = raw.removeprefix("b/")
             continue
         if line.startswith("deleted file mode "):
@@ -1410,9 +1916,12 @@ def resolve_unscannable(root: Path, parsed: ParsedDiff, revs: tuple[str, ...]) -
     unattributable = [p for p in parsed.unscannable if _is_marker(p)]
     parsed = ParsedDiff(parsed.added, [p for p in parsed.unscannable if not _is_marker(p)])
     # ⚠️ `root` IS LOAD-BEARING HERE, and leaving it off was a live fail-open. `_skipped(p)` with
-    # no root falls back to the SELF_PATH CONSTANT instead of resolving this file from `__file__`
-    # — the exact defect `_self_rel_path` exists to remove, one line away from its own fix. The
-    # consequence is worse than a mismatched exemption: a path wrongly judged "skipped" drops out
+    # no root once fell back to a hardcoded self-path instead of resolving this file from
+    # `__file__` — the exact defect `_self_rel_path` exists to remove, one line away from its own
+    # fix. (It now answers `None`, which exempts nothing, so the modern failure is a missed
+    # exemption rather than a granted one; passing `root` is still what makes the two scans agree.)
+    # The consequence was worse than a mismatched exemption: a path wrongly judged "skipped" drops
+    # out
     # of `pending`, and an empty `pending` returns early DISCARDING the whole unscannable list, so
     # a blob the scan never read is reported as clean on the push path.
     pending = [p for p in parsed.unscannable if not _skipped(p, root)]
@@ -1469,7 +1978,7 @@ def scan_added(sha: str, parsed: ParsedDiff, compiled: list[tuple[str, re.Patter
     `_looks_binary` of bytes it has, and this asks nothing, because git already refused to serve a
     text diff for a blob it judged binary. Same answer, reached from what each scan can see.
 
-    ⭐ `_is_self`, NOT `_skipped`, ON THE ADDED LINES (keystone#22). git only serves a TEXT diff
+    ⭐ `_is_self`, NOT `_skipped`, ON THE ADDED LINES (consumer#22). git only serves a TEXT diff
     for a blob it judged to be text, so lines arriving here have already passed a content check
     stricter than any filename — and dropping them because the file is called `.pdf` is the
     filename-trust half of #22 on the range side. The tree scan's twin is `_looks_binary`. The
@@ -1548,7 +2057,11 @@ def commit_identity(root: Path, sha: str) -> list[tuple[str, str]]:
         raise ValueError(
             f"commit {sha[:10]}: expected {len(_IDENT_FIELDS)} identity fields from git, got "
             f"{len(parts)} - refusing to report on an identity that was not fully read")
-    return [(field, value) for field, value in zip(_IDENT_FIELDS, parts) if value]
+    # `strict=True` states what the guard above has already established, and cannot raise here:
+    # the lengths were compared three lines up and a mismatch already refused the commit. It is
+    # written out because a silent `zip` truncation is exactly the failure that check exists to
+    # prevent, and a reader should not have to look up to know which behaviour is intended.
+    return [(field, value) for field, value in zip(_IDENT_FIELDS, parts, strict=True) if value]
 
 
 def scan_identity(sha: str, ident: list[tuple[str, str]],
@@ -1562,7 +2075,7 @@ def scan_identity(sha: str, ident: list[tuple[str, str]],
 
 
 # ------------------------------------------------------- the COMMIT'S OWN message, and TAGS
-# ⭐ A COMMIT PUBLISHES ITS MESSAGE (keystone#21 / #39). The range scan read the commit's IDENTITY
+# ⭐ A COMMIT PUBLISHES ITS MESSAGE (consumer#21 / #39). The range scan read the commit's IDENTITY
 # and its DIFF and nothing else, so a leak written into a commit BODY — "deployed from <host>.lan,
 # policy <uuid>" — was published by `git push`, rendered on the commit page, and both scans exited
 # 0. It is exactly as permanent as a leaked line and costs the same history rewrite to remove,
@@ -1652,7 +2165,7 @@ def refs_being_published(root: Path, rev_range: str) -> list[tuple[str, str, str
         offending commits") was not even the right fix (`git tag -d` was).
 
     Both disappear if the question is "what refs is this push sending", which the caller already
-    knows: `.githooks/pre-push` is handed `<local_ref>` on stdin, and CI has `GITHUB_REF`. Both now
+    knows: a `pre-push` hook is handed `<local_ref>` on stdin, and CI has `GITHUB_REF`. Both now
     put the REF in the range they pass, so the range NAMES the tag and this reads it.
 
     ⭐ NESTED TAGS ARE WALKED. `git tag -a outer -m … inner` produces a chain, and reading only the
@@ -1708,8 +2221,8 @@ def scan_range(root: Path, rev_range: str,
 
     ⭐ FIVE SURFACES, not one. Pushing publishes a commit OBJECT, and every field of it is
     permanent and rendered on the commit page. Reading only the diff — which is all this did —
-    left three of the five unread: a leak in a filename (keystone#20), a leak in the commit
-    message (keystone#21 / #39), and a leak in a tag's name, tagger or message.
+    left three of the five unread: a leak in a filename (consumer#20), a leak in the commit
+    message (consumer#21 / #39), and a leak in a tag's name, tagger or message.
 
     ⚠️ "PERMANENT" IS TRUE OF FOUR OF THE FIVE, and the fifth is worth naming rather than rounding
     up. A commit's diff, its paths, its identity and its message can only be removed by rewriting
@@ -1773,8 +2286,8 @@ _MUST_PASS: list[str] = [
     "doc range 203.0.113.9 is fine",
     "APP_BASE_URL=https://svc.your-domain.example",
     "ntfy example: https://ntfy.example.com",
-    "see https://github.com/texasdaddy/tape/issues/31",
-    "icon: https://raw.githubusercontent.com/texasdaddy/unraid-templates/main/icons/tape.png",
+    "see https://github.com/texasdaddy/kw-common/issues/31",
+    "icon: https://raw.githubusercontent.com/texasdaddy/unraid-templates/main/icons/app.png",
     "version 10.16.2 of the driver",              # not an address
     "the 172.315 basis-point spread",             # not an address
     "bind 0.0.0.0:5000",
@@ -1938,7 +2451,7 @@ _MUST_PASS_MESSAGES: list[str] = [
     # both passed — the regression test for the `_ABS_POOL_PATH` left bound.
     "docs: add docs/mnt/user/notes.md",
     "test: fixtures now live under tests/fixtures/mnt/cache/appdata/svc",
-    "fix: close the issue at https://github.com/texasdaddy/tape/issues/31\n\n"
+    "fix: close the issue at https://github.com/texasdaddy/kw-common/issues/31\n\n"
     "Co-Authored-By: Someone <1234+someone@users.noreply.github.com>",
 ]
 
@@ -1994,9 +2507,21 @@ def selftest(compiled: list[tuple[str, re.Pattern[str]]]) -> int:
     # directions are checked for both surfaces, because the must-PASS half is what pins the
     # overrides and the must-FAIL half is what stops an override quietly gutting the surface.
     for rel in _MUST_PASS_PATHS:
-        hits = scan_path(rel)
-        if hits:
-            bad.append(f"false positive on the PATH {rel!r}: {hits}")
+        # A DIFFERENT NAME, not a reuse of `hits` above: `scan_text` yields `(line, label, match)`
+        # and `scan_path` yields `(label, match)`, so rebinding one name to both shapes is a type
+        # error waiting for the first person who reads the second use as the first.
+        path_hits = scan_path(rel)
+        if path_hits:
+            # ⚠️ A DIFFERENT NAME, for the type checker's sake and nothing more.
+            #
+            # ⛔ AN EARLIER VERSION OF THIS COMMENT CLAIMED A BUG HERE, AND THE BUG DID NOT EXIST.
+            # It said the report interpolated the leftover `hits` from the CONTENT loop above. It
+            # did not: the reference assigns `hits` on the line directly above this one, inside
+            # this loop, so the value was always correct. A verification agent checked the claim
+            # against the pre-move file and it was false. Recorded rather than deleted, because a
+            # ⚠️ comment in this file is supposed to mean "a real failure happened here", and one
+            # that describes an imaginary one devalues every other.
+            bad.append(f"false positive on the PATH {rel!r}: {path_hits}")
     for want_label, rel in _MUST_FAIL_PATHS:
         labels = {label for label, _ in scan_path(rel)}
         if want_label not in labels:
@@ -2023,19 +2548,22 @@ def selftest(compiled: list[tuple[str, re.Pattern[str]]]) -> int:
 
 
 # ------------------------------------------------------------------------ the command line
-USAGE = """usage: check_no_internal_info.py
+USAGE = """usage: kw-leak-guard
            [--selftest | --staged | --range <revision-range>] [--repo <path>]
+           [--config <path>]
 
   (no arguments)              scan the tracked working TREE
-  --selftest                  prove the denylist patterns still bite
+  --selftest                  prove the denylist patterns still bite (no repository needed)
   --staged                    scan what is in the INDEX - what `git commit` would record
   --range <A..B>              scan the lines ADDED by every commit in the range
   --range=<A..B>              the same, joined form
   --repo <path>               the repository to scan (default: the one containing $PWD)
+  --config <path>             this repository's allowances (default: <repo>/.leakguard.json
+                              if it exists; without one, NOTHING is excused)
   -h, --help                  this message
 
 exit codes: 0 clean | 1 a finding, something unreadable, or a range git could not resolve
-            2 a usage error (this message)"""
+            2 a usage error (this message) or a configuration this scanner will not act on"""
 
 
 class UsageError(Exception):
@@ -2052,6 +2580,10 @@ class Args(NamedTuple):
     repo: str | None
     help: bool
     staged: bool = False
+    # ⚠️ APPENDED, never inserted. A field's POSITION is its position in the constructor, so
+    # putting a new one in the middle silently rebinds every positional `Args(...)` call and
+    # every test that builds one — a change with no error message anywhere.
+    config: str | None = None
 
 
 def _value_for(flag: str, argv: list[str], i: int) -> str:
@@ -2084,6 +2616,7 @@ def parse_args(argv: list[str]) -> Args:
     repo: str | None = None
     want_help = False
     staged = False
+    config: str | None = None
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -2112,6 +2645,15 @@ def parse_args(argv: list[str]) -> Args:
             repo = arg[len("--repo="):]
             if not repo:
                 raise UsageError("--repo needs a path")
+        # ⛔ BOTH FORMS, because `--repo` has both and a flag that accepts one spelling and
+        # rejects the other reads as a typo in the caller rather than as a missing feature.
+        elif arg == "--config":
+            config = _value_for("--config", argv, i)
+            i += 1
+        elif arg.startswith("--config="):
+            config = arg[len("--config="):]
+            if not config:
+                raise UsageError("--config needs a path")
         else:
             # Includes a BARE revision range. `check_no_internal_info.py origin/main..HEAD` reads
             # like it would scan the range and would otherwise have run a tree scan and called it
@@ -2132,7 +2674,14 @@ def parse_args(argv: list[str]) -> Args:
         # ignored-argument defect, just harder to reach, so it is an error rather than a silent
         # preference.
         raise UsageError("--help does not combine with a scan; run one or the other")
-    return Args(selftest, rev_range, repo, want_help, staged)
+    if config is not None and selftest:
+        # `--selftest` proves the SHIPPED patterns still bite and reads no repository, so a
+        # config it silently ignored would leave the operator believing their allowances had been
+        # measured. They have not been: what measures them is `apply_config`, which refuses any
+        # config that stops a deny case being caught, and that runs on a real scan.
+        raise UsageError("--selftest measures the shipped patterns, not a repository's config; "
+                         "run a scan to have --config take effect")
+    return Args(selftest, rev_range, repo, want_help, staged, config)
 
 
 def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
@@ -2146,7 +2695,7 @@ def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
     for path in tracked:
         rel = path.relative_to(root).as_posix()
         # ⭐ THE PATH IS SCANNED FIRST, AND FOR EVERY TRACKED FILE — before any skip, any
-        # submodule check and any read (keystone#20). A filename is published content: it needs no
+        # submodule check and any read (consumer#20). A filename is published content: it needs no
         # decoding, it cannot be binary, and neither the self-exemption nor the binary-suffix hint
         # has anything to say about it. Doing it here rather than inside the read means an
         # `icons/<host>.lan.png` and a `docs/<addr>/` directory are caught even though the file
@@ -2233,7 +2782,15 @@ def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
             undecodable.append(f"{rel} (unreadable: {type(exc).__name__})")
             continue
         if raw is not None:
-            # ⭐⭐ THE SUFFIX IS A HINT, NOT A VERDICT (keystone#22). `SKIP_SUFFIXES` used to end
+            # ⭐⭐ THE SECOND HALF OF THE SELF-EXEMPTION, and it needs the BYTES, which is why it
+            # cannot live beside the path test above. An INSTALLED guard is not inside the
+            # repository it scans, so the path test never fires there — and the repository that
+            # OWNS this engine keeps its source as an ordinary tracked file, full of synthetic
+            # deny cases. This asks "are these my own bytes", which no other file can answer yes
+            # to and no configuration can widen. See `_is_self`.
+            if _is_self(rel, root, raw):
+                continue
+            # ⭐⭐ THE SUFFIX IS A HINT, NOT A VERDICT (consumer#22). `SKIP_SUFFIXES` used to end
             # the matter before the file was opened, so `deploy-notes.pdf` holding a plain ASCII
             # runbook — LAN host, appdata path, RFC1918 address — was never read by either scan and
             # exited 0. The bytes now decide: an asset that really is one is skipped exactly as
@@ -2266,7 +2823,7 @@ def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
         # ⭐ PLACED AFTER THE `try`, DELIBERATELY, so it covers BOTH sources of `text` — the
         # worktree read AND the staged blob from `staged_blob`. Those are two of the three decode
         # sites in this file, and the sibling repo's attempt at this reached only one of them
-        # because it was written at the reads rather than at what they produce (tape#242).
+        # because it was written at the reads rather than at what they produce (consumer#242).
         # (`text` is necessarily a str here: both sources set `raw`, and every path that leaves it
         # unset has already `continue`d. Asserted by construction rather than re-checked, because a
         # defensive `text is None` branch could only print a NUL message about something that is
@@ -2292,17 +2849,23 @@ def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
               "encoding; if it is staged-but-deleted, re-stage it so the scan sees what the "
               "commit will contain.\n")
     if findings:
-        print(f"INTERNAL INFO FOUND in {len(findings)} place(s) - this repo is public:\n")
+        # ⚠️ NOT "this repo is public". That was true of the one repository this guard used to be
+        # vendored into and is false for most of the repositories it now scans — and a message
+        # that states a falsehood about the reader's own repository is the sentence they use to
+        # decide the finding does not apply to them. What IS true everywhere is the reason the
+        # guard exists at all: a private repository is not a secret store, and a commit is
+        # permanent.
+        print(f"INTERNAL INFO FOUND in {len(findings)} place(s) - a commit is permanent:\n")
         for f in findings:
             print("  " + _ascii(f))
         print("\nReplace with a placeholder (<your-unraid-host>, your-domain.example, "
               "/mnt/POOL/..., RFC5737 addresses) or take the value from an env Variable.")
-        print("If a hit is genuinely legitimate, add the literal to ALLOW_LITERALS in "
-              f"{SELF_PATH} with a comment saying why.")
+        print("If a hit is genuinely legitimate, add the literal to `allow_literals` in this "
+              f"repository's {CONFIG_FILENAME}, with the `why` the format requires.")
     if findings or undecodable:
         return 1
     if tracked and scanned == 0:
-        # ⛔⛔ A RUN THAT SCANNED NOTHING IS NOT A CLEAN RUN (keystone#22, second half). This
+        # ⛔⛔ A RUN THAT SCANNED NOTHING IS NOT A CLEAN RUN (consumer#22, second half). This
         # printed `no internal info found (0 tracked text files scanned)` and exited 0 — a
         # cheerful pass, in the same words as a real one, for a scan that opened no file at all.
         # Every way of getting here is a failure worth stopping on: `--repo` aimed at the wrong
@@ -2374,7 +2937,7 @@ def staged_blob(root: Path, rel: str) -> bytes | None:
 def staged_diff(root: Path) -> tuple[ParsedDiff, list[str]]:
     """(what the INDEX would commit, the paths it introduces) — `git diff --cached`.
 
-    ⭐ THIS IS THE ANSWER TO #33 / keystone#23. The tree scan reads the WORKTREE, so a leak that
+    ⭐ THIS IS THE ANSWER TO #33 / consumer#23. The tree scan reads the WORKTREE, so a leak that
     is `git add`ed and then tidied in the worktree without re-staging is invisible to the
     pre-commit layer: the index — and therefore the commit — still carries it, and the hook exits
     0 while `git show HEAD:<file>` returns the leak. The range scan on the push path did catch it,
@@ -2421,8 +2984,12 @@ def _scan_staged(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int
         print("Add a binary suffix to SKIP_SUFFIXES if that is what it is, or stage the file as "
               "UTF-8 text.\n")
     if findings:
-        print(f"INTERNAL INFO FOUND in {len(findings)} place(s) STAGED FOR COMMIT - this repo is "
-              "public:\n")
+        # ⚠️ NOT "this repo is public" — the SAME correction the tree and range banners carry, and
+        # this surface was missed when they were fixed: the instance, not the class, in an edit
+        # whose whole subject was a false claim. The sentence is true of at most two repositories
+        # in this fleet and is read by every consumer of the guard.
+        print(f"INTERNAL INFO FOUND in {len(findings)} place(s) STAGED FOR COMMIT - a commit is "
+              "permanent:\n")
         for f in findings:
             print("  " + _ascii(f.strip()))
         print("\nThis is what the INDEX holds, which is what the commit will record - tidying the "
@@ -2496,7 +3063,7 @@ def _scan_commits(root: Path, rev_range: str,
         # ASCII-safe and these three `rev_range` sites were missed: the instance, not the class.
         print(_ascii(f"INTERNAL INFO FOUND in {len(result.findings)} place(s) published by "
                      f"{rev_range} ")
-              + "- this repo is public and pushing publishes HISTORY:\n")
+              + "- pushing publishes HISTORY:\n")
         for f in result.findings:
             print("  " + _ascii(f))
         # ⚠️ THE ADVICE MUST MATCH THE CAUSE — the same rule `_unparsed_header` exists for, applied
@@ -2545,11 +3112,24 @@ def main(argv: list[str]) -> int:
         print(USAGE)
         return 0
 
-    compiled = compile_patterns()
     if args.selftest:
-        return selftest(compiled)
+        # ⚠️ NO CONFIG, DELIBERATELY, and `parse_args` refuses `--selftest --config` rather than
+        # letting that read as "measured". The selftest answers "do the shipped patterns still
+        # bite", which is a property of this package and not of any repository.
+        return selftest(compile_patterns())
 
     root = repo_root(args.repo)
+    # ⛔ THE CONFIG IS LOADED AND APPLIED BEFORE ANY PATTERN IS COMPILED FOR A SCAN. Both steps
+    # can refuse — an unreadable or self-defeating config exits 2 rather than scanning under
+    # rules nobody chose. `compile_patterns()` is called AFTER `apply_config` because a scan must
+    # never run against a pattern set assembled before the allowances were checked.
+    try:
+        apply_config(resolve_config(root, args.config))
+    except ConfigError as exc:
+        print(f"{exc}", file=sys.stderr)
+        return 2
+
+    compiled = compile_patterns()
     if args.rev_range is not None:
         return _scan_commits(root, args.rev_range, compiled)
     if args.staged:
@@ -2557,5 +3137,15 @@ def main(argv: list[str]) -> int:
     return _scan_tree(root, compiled)
 
 
+def cli() -> int:
+    """The console-script entry point (`kw-leak-guard`).
+
+    `setuptools` calls this with no arguments and turns the return value into the exit status, so
+    it reads `sys.argv` itself. `main(argv)` stays the testable form — a test that had to build a
+    `sys.argv` to ask a question about argument parsing would be testing the wrong thing.
+    """
+    return main(sys.argv[1:])
+
+
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(cli())

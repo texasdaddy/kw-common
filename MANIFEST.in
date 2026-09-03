@@ -13,12 +13,28 @@ include MANIFEST.in
 include README.md
 include CHANGELOG.md
 include pyproject.toml
+include .leakguard.json
 recursive-include tests *.py
 
-# ⛔ `scripts/` is DELIBERATELY NOT INCLUDED. It briefly was, on the reasoning that a consumer
-# auditing the tarball should be able to run the same scan CI runs. That reasoning was thin — the
-# guard is a CI tool for THIS repository, not part of the library — and it had a real cost: the
-# canonical guard's docstring enumerates the fleet's other repositories by name, so including it
-# put that inventory inside every tarball attached to every public GitHub Release, widening the
-# distribution of something the tests were edited to stop publishing. Anyone who wants the guard
-# can clone the repository, which is where a CI tool belongs.
+# ⭐ THE WORKFLOWS, because two tests READ them. `test_the_CI_workflow_runs_BOTH_scans_FROM_THE_
+# INSTALLED_PACKAGE` and `test_the_required_status_check_names_are_recorded_in_the_workflow` open
+# `.github/workflows/ci.yml`, so an sdist without it ships a suite that ERRORS — which is the
+# third time this exact class has bitten (the conftest, then `.leakguard.json`, now this) and the
+# first time it was caught by unpacking the tarball and running the tests rather than by grepping
+# its file list. `README.md`'s "tests travel with the module" is false for an sdist consumer
+# otherwise, and the packaging job now runs the shipped suite instead of taking the claim on
+# trust.
+recursive-include .github/workflows *.yml
+
+# ⭐ `.leakguard.json` IS INCLUDED because it is an ARGUMENT for the tests, not decoration. This
+# repository's own config is the worked example the leak-guard suite reads, and an sdist whose
+# suite cannot find it ships tests that skip the one property the extraction exists to prove.
+# Same failure as the missing conftest, one release later.
+#
+# ⛔ `scripts/` NO LONGER EXISTS, and the reason it was excluded is worth keeping because it now
+# binds somewhere else. The guard used to be vendored there and was kept out of the sdist because
+# its docstring enumerated the fleet's other repositories by name, which would have put that
+# inventory inside every tarball attached to every public Release. The guard is now
+# `src/kw_common/leakguard.py` — INSIDE the wheel, published to everyone who installs the
+# library — so exclusion is no longer available as the fix. The names were removed from the file
+# instead, and `test_the_shipped_guard_names_no_private_repository` is what keeps them out.

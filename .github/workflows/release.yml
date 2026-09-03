@@ -37,10 +37,19 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
+      # ⭐ THE GUARD SHIPS INSIDE THE PACKAGE, so it is installed rather than invoked by path —
+      # the same as `ci.yml` and the same as every consumer will call it. This file used to run
+      # `python scripts/check_no_internal_info.py`, which is a path that no longer exists: had it
+      # been left, the first `v*` tag would have failed the publish with a FileNotFoundError, and
+      # the failure would have looked like a broken workflow rather than a stale invocation.
+      - name: Install the package (the guard ships inside it)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
       - name: Self-test the patterns, then scan the working tree
         run: |
-          python scripts/check_no_internal_info.py --selftest
-          python scripts/check_no_internal_info.py
+          kw-leak-guard --selftest
+          kw-leak-guard
       # ⛔ AN EMPTY RANGE IS NOT A PASS. The guard's job is to scan the commits this tag
       # publishes, and "there were none to scan" must never be reported as "there was nothing
       # wrong". `--range` legitimately exits 0 on zero commits — correct for a pre-push hook,
@@ -95,7 +104,7 @@ jobs:
             exit 1
           fi
           echo "scanning ${range} (${count} commit(s), plus the tag object itself)"
-          python scripts/check_no_internal_info.py --range "$range"
+          kw-leak-guard --range "$range"
 
   test:
     name: Lint, type-check and test the tagged tree (py${{ matrix.python }})
@@ -221,18 +230,39 @@ jobs:
           sdist="$(ls dist/*.tar.gz)"
           echo "inspecting ${sdist}"
           names="$(tar tzf "$sdist")"
-          echo "$names" | grep -q '/tests/conftest.py$' || {
-            echo "::error::the sdist has no tests/conftest.py — its suite ships without the"
-            echo "::error::autouse fixtures it depends on. Check MANIFEST.in."
-            exit 1
-          }
+          for required in '/tests/conftest.py' '/.leakguard.json' '/.github/workflows/ci.yml'; do
+            echo "$names" | grep -q "${required}\$" || {
+              echo "::error::the sdist has no ${required} — its suite ships without something it"
+              echo "::error::depends on. Check MANIFEST.in."
+              exit 1
+            }
+          done
           if echo "$names" | grep -q '/scripts/'; then
-            echo "::error::the sdist contains scripts/. The leak guard is a CI tool for this"
-            echo "::error::repository and its docstring names other repositories; it must not be"
-            echo "::error::published inside a release artifact. Check MANIFEST.in."
+            echo "::error::the sdist contains scripts/. The leak guard ships as"
+            echo "::error::kw_common.leakguard now; a second vendored copy is a fork waiting to"
+            echo "::error::happen. Check MANIFEST.in."
             exit 1
           fi
           echo "sdist contents are as intended"
+      # ⭐⭐ AND RUN IT, which is the check the list above cannot be. That list has been wrong three
+      # times — the conftest, `.leakguard.json`, then `.github/workflows/ci.yml` — and looked
+      # complete every time. Unpacking the tarball and running its tests asks the question
+      # `README.md` actually promises: do the tests travel? Duplicated from `ci.yml` deliberately,
+      # per this file's header: a tag can point at a commit that never went through a PR.
+      - name: The sdist's own test suite passes
+        run: |
+          set -eu
+          sdist="$(ls dist/*.tar.gz)"
+          rm -rf /tmp/sdist && mkdir -p /tmp/sdist
+          tar xzf "$sdist" -C /tmp/sdist
+          unpacked="$(ls -d /tmp/sdist/*/)"
+          python -m venv /tmp/sdisttest
+          /tmp/sdisttest/bin/python -m pip install --upgrade pip
+          /tmp/sdisttest/bin/python -m pip install "$unpacked"
+          /tmp/sdisttest/bin/python -m pip install "pytest==9.1.1" "pytest-timeout==2.4.0"
+          cd "$unpacked"
+          git config --global init.defaultBranch main
+          /tmp/sdisttest/bin/python -u -m pytest
       # The same check ci.yml runs, repeated here because THIS is the artifact being published.
       - name: Install the built wheel into a clean environment and import it
         run: |
@@ -242,13 +272,23 @@ jobs:
           /tmp/consumer/bin/python -m pip install --no-index dist/*.whl
           cd /tmp
           /tmp/consumer/bin/python -c "
-          import kw_common, kw_common.alerting as a
+          import kw_common, kw_common.alerting as a, kw_common.leakguard as g
           import os
           assert kw_common.__version__ == os.environ['GITHUB_REF_NAME'].lstrip('v'), (
               kw_common.__version__, os.environ['GITHUB_REF_NAME'])
           assert a.notify and a.AlertSettings and a.configure
-          print('installed', kw_common.__version__, 'with', len(a.__all__), 'exports')
+          assert g.main and g.cli and g.load_config and g.CONFIG_FILENAME == '.leakguard.json'
+          print('installed', kw_common.__version__, 'with', len(a.__all__), '+', len(g.__all__),
+                'exports')
           "
+      # ⭐ THE CONSOLE SCRIPT IS A SEPARATE CLAIM FROM THE IMPORT, and it is the one a consumer's
+      # CI depends on. An entry point aimed at the wrong callable installs fine, imports fine, and
+      # fails the first time anybody runs it — in their repository, after the tag.
+      - name: The installed console script runs against this tag's tree
+        run: |
+          set -eu
+          /tmp/consumer/bin/kw-leak-guard --selftest
+          /tmp/consumer/bin/kw-leak-guard --repo "$GITHUB_WORKSPACE"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: dist

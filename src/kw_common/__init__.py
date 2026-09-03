@@ -15,9 +15,9 @@ whole library is built on.
 `__version__` is the only name here, and it is the SAME string as `project.version` in
 `pyproject.toml`. Consumers pin an exact git tag, never a branch:
 
-    pip install git+https://github.com/texasdaddy/kw-common@v1.0.1
+    pip install git+https://github.com/texasdaddy/kw-common@v1.1.0
 """
 
 __all__ = ["__version__"]
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"

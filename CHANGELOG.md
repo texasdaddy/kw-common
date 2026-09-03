@@ -7,6 +7,172 @@ All notable changes to this project are documented here. The format follows
 A breaking change to a name in a module's `__all__` is a MAJOR bump, and its entry names every
 consumer repository that needs a code change.
 
+## [1.1.0] - 2026-09-02
+
+The leak guard becomes a module. It was a **file that seven repositories each kept a copy of**,
+with one of its test suites in **five** of them — so a fix made in one reached none of the others,
+and four separate engine improvements had to be re-ported by hand after being made once upstream.
+A copy cannot be pinned. This release ends that the same way the alerting module did: a consumer
+installs a version.
+
+Nothing here changes what a scan CATCHES. The detection patterns, the three scan shapes
+(tree / index / commit range) and the four engine-add surfaces are the canonical behaviour and are
+unchanged — verified by AST against the seven canonical fixes, by the shipped self-test, and by
+the 4,200 lines of engine tests that moved here with the code.
+
+### Added
+
+- **`kw_common.leakguard`** — the engine, importable, with a **`kw-leak-guard`** console entry
+  point (`python -m kw_common.leakguard` works identically). It imports nothing from the rest of
+  the package and depends on nothing outside the standard library.
+- **Injected configuration: `.leakguard.json` in the repository being scanned**, or a path given
+  with `--config`. This is the part that makes the extraction possible at all — see the adopter
+  notes below for the format and for the five fail-closed properties it was designed around.
+- **`--config <path>` / `--config=<path>`** on the command line, and `GuardConfig`,
+  `DEFAULT_CONFIG`, `ConfigError`, `find_config`, `load_config`, `parse_config`, `apply_config`,
+  `CONFIG_FILENAME` and `cli` in the module's `__all__`.
+- **A configuration that stops the guard's own DENY CASES being caught is refused**, on any of
+  the three surfaces, with exit 2 naming the case it defeats. ⚠️ Read that literally: the check
+  is CORPUS-SHAPED. It refuses a literal that silences one of a finite set of samples, so the
+  pool root the corpus spells is refused and another pool name is not — and an accepted literal
+  is not narrow, since allowing a pool root silences that pool everywhere. It is a backstop
+  against the careless case, not a proof that the format cannot be misused. What keeps an
+  allow-list honest is that every entry is an exact literal, spelled out, justified, and read
+  from the index.
+
+### Fixed
+
+- **An installed guard no longer exempts an arbitrary file in the repository it scans** — a
+  security fix, not tidying, and one whose FIRST answer was wrong in the same way. The self-exemption resolved `__file__` relative to the scanned root
+  and **fell back to the constant `scripts/check_no_internal_info.py`** when that failed. It fails
+  on **every run of an installed guard**, because `site-packages` is not inside the repository
+  being scanned — so the fallback would have exempted whatever the consumer kept at that path,
+  which is the exact path every repository in this fleet vendored its copy at. The first consumer
+  to install this package and delete its old script would have handed a permanent, invisible
+  amnesty to any file that later took that name. The resolver now answers "not mine" instead of
+  guessing, and a repository that genuinely vendors the guard still skips its own copy.
+
+  ⚠️ THAT LEFT THE SAME HOLE ONE LAYER OUT, and the verification gate found it. The repository
+  that OWNS the engine keeps its source as an ordinary tracked file, full of synthetic deny cases
+  — so with the path exemption gone, an installed guard reported all of them. The first answer was
+  a `path_exempt` entry per pattern in that repository's own config; since the engine has exactly
+  as many patterns as that list had entries, it was a whole-file skip written in data, and a REAL
+  leak appended to the engine's source PASSED. The guard now recognises its own source by its
+  BYTES: nothing else in any repository can claim that, and no configuration can widen it.
+- **The finding banner no longer claims "this repo is public."** True of the one repository the
+  guard was vendored into, false for most of the ones it now scans — and a sentence a reader uses
+  to decide a finding does not apply to them. It states what holds everywhere instead: a commit is
+  permanent.
+- **The docstring's account of which repositories are public was wrong for the second time**, now
+  in the opposite direction: it named one repository as the only public one, which was true when
+  written and false by the time this module shipped from a second public repository — the one that
+  publishes this file to everyone who installs the library. Both errors are recorded rather than
+  quietly overwritten.
+- **The private sibling repositories are no longer named anywhere in the engine.** `MANIFEST.in`
+  had kept the guard out of the sdist for exactly that reason; the module now ships inside the
+  **wheel**, so exclusion is no longer available as the fix. Provenance comments cite
+  `consumer#NN`, and a test enforces the absence.
+- **A `.leakguard.json` that is not tracked by git is refused.** An ignored config governed every
+  local scan while being invisible to review, which is the opposite of the property that justifies
+  injecting the allowances at all.
+- **A UTF-8 BOM on an otherwise valid config no longer reddens the build.** Windows PowerShell 5.1
+  and Notepad both write one; the config is read as `utf-8-sig`.
+- **The `--staged` banner no longer claims "this repo is public" either.** The tree and range
+  banners were corrected and this one was missed — the instance, not the class, inside an edit
+  whose entire subject was a false claim.
+- Two incidental repairs the move surfaced, neither of which changes a verdict: `zip(..., strict=)`
+  where the lengths were already asserted equal, and a rebound name in `selftest()` that made the
+  type checker right about a real type error.
+
+  ⚠️ An earlier draft of this entry claimed a third — "a false-positive PATH report that
+  interpolated the CONTENT loop's findings instead of its own". **That bug never existed**: the
+  pre-move file assigns the name inside the same loop, one line above its use, so the report was
+  always correct. A verification agent checked the claim against the original and it was false.
+  Recorded rather than deleted, because a changelog that invents a fix is the same defect class as
+  a comment that invents one.
+
+### Notes for adopters
+
+**This release does not change your CI's answer. It changes where the guard comes from.** A
+repository adopting it deletes its vendored `scripts/check_no_internal_info.py`, pins
+`kw-common@v1.1.0`, and calls `kw-leak-guard` instead of `python scripts/check_no_internal_info.py`.
+
+⛔ **Do not delete your vendored copy without first moving its `ALLOW_LITERALS` tail into
+`.leakguard.json`.** That tail is the per-repository configuration the whole extraction exists to
+rescue, and the engine now ships with it **empty** — the library assumes nothing about its
+consumer. Deleting the script without porting the tail turns your allowances off, which reddens CI
+on lines that were previously, and correctly, permitted.
+
+```json
+{
+  "_note": "a key prefixed with `_` is a comment - the only spelling this scanner ignores",
+  "allow_literals": [
+    {"literal": "github.com/<owner>", "why": "functional: this repository's own clone URL"}
+  ]
+}
+```
+
+`allow_literals` is the whole surface. It suppresses a hit that falls INSIDE an exact literal; it
+cannot remove a pattern, widen one, or skip a file. Five properties, each chosen in the fail-closed
+direction and each worth knowing before you write a config:
+
+1. **No config file means nothing is allowed.** A missing or misnamed file can only make a scan
+   *stricter*. The opposite default — shipping this fleet's own allowances — would mean an
+   installed library silently permitting values in a repository that never asked, and a consumer
+   would have to edit installed code to tighten it, which is the fork this package exists to
+   prevent.
+2. **The config is read from the INDEX, not from your working copy.** What governs a scan is
+   exactly what a commit would record, so `git add` an edit before expecting it to apply — the
+   guard prints a note when the two differ. A file on disk that the index does not have is an
+   error rather than silence. `--config <path>` is exempt: it is written out in the invocation,
+   which is the visibility that matters.
+3. **A config this scanner cannot understand STOPS the scan** (exit 2). It never degrades to "no
+   config": an unknown or misspelled key, a missing `why`, a `--config` path that does not exist.
+   The difference between "your rules were applied" and "your rules were unreadable, so none were"
+   is invisible in a clean verdict. A UTF-8 BOM is accepted — Windows editors write them, and
+   reddening a correct config is how a guard gets switched off.
+4. **`why` is required on every entry**, so "keep each one justified" is enforced rather than
+   requested. An entry whose justification is blank or whitespace is refused.
+5. **The only file whose CONTENT is skipped outright is the guard's own source, recognised as
+   its own.** (A `SKIP_SUFFIXES` asset whose bytes really are binary is skipped as well; a text
+   file merely NAMED `.png` is not.) Either it is
+   literally that file — you vendored the guard inside the repository it scans, or installed it in
+   editable mode from there — or the file's BYTES are the running guard's own bytes. Nothing else
+   in your repository can claim either.
+
+   ⚠️ Stated precisely, because the short version of it is wrong: where the running guard IS the
+   repository's own file, that file's content is skipped UNCONDITIONALLY. That is inherent in a
+   guard whose source carries its own deny corpus; the layer that covers that one file is a
+   separate real-literal check run from outside the repository, which deliberately does not skip
+   it.
+
+**There is no path-exemption setting.** A repository could briefly excuse one named pattern on one
+path regex, and both attempts to bound that regex were fail-open, one review round apart: the first
+never measured it (`{"path_regex": "."}` turned a pattern off tree-wide and was accepted); the
+second measured the deny corpus at a list of "ordinary" probe paths, which is a nine-name allowlist
+wearing the word "property" — `\.go$` and `^internal/` sailed past it, a negative lookahead over
+the nine names turned a pattern off everywhere in one line, and it REFUSED the narrowest exemption
+there is (a single file) whenever that file was called `README.md` or `Dockerfile`. No acceptance
+criterion asked for it, so it was withdrawn rather than repaired a third time. A config naming
+`path_exempt` is refused with a message saying so, and `PATH_EXEMPT` survives as an engine constant
+that only an edit to the module changes.
+
+**If your repository keeps a leak-guard corpus of its own** (synthetic deny cases, fixtures full
+of `.lan` hosts), there is no setting for it: assemble those values at RUNTIME from fragments,
+the way this repository's own test suites do, so the file carries no matchable literal at rest.
+This repository's `.leakguard.json` is the worked example of what a config now looks like, and
+the suite reads the real file so a broken config here fails a test here.
+
+**What is NOT in this release:** adoption anywhere. Each consuming repository takes it as its own
+change, and `unraid-templates` — where this engine came from — should re-adopt rather than keep its
+byte-identical copy.
+
+**A note for whoever ports the tests.** Five `.githooks`-shaped tests did not travel: they assert
+how a repository WIRES the guard up (the Windows `command -v python3` stub, `--not --remotes` on a
+brand-new branch, the executable bit git silently needs, and two that run a real `git commit` and
+check that HEAD did not move). Every one is a real lesson and none is a property of the engine.
+Keep them beside your hooks; each removal site here says what it asserted.
+
 ## [1.0.1] - 2026-09-01
 
 The three inherited security defects found during the v1.0.0 extraction and filed rather than
