@@ -9,7 +9,7 @@ description = "Shared, stdlib-only building blocks for the fleet's Python servic
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "texasdaddy" }]
-keywords = ["alerting", "ops"]
+keywords = ["alerting", "leak-guard", "ops"]
 # ⭐ ONLY THE VERSIONS CI ACTUALLY RUNS. This list claimed 3.11 and 3.13 as well, which CI never
 # measured — and this project's own README says a library that claims a version and is only ever
 # run on another is claiming something nobody checked. `requires-python = ">=3.10"` remains the
@@ -29,6 +29,17 @@ classifiers = [
 # not just a convenience argument. `dependencies` is written out empty rather than omitted so
 # that adding an entry is a visible diff on this line.
 dependencies = []
+
+# ⭐ THE LEAK GUARD IS A COMMAND, not only an importable module, because that is how a consumer
+# actually uses it: one line in a CI job. The alternative — every repository writing
+# `python -m kw_common.leakguard` — works too and stays supported, but a console script is what
+# makes the guard reachable without knowing where the package was installed.
+#
+# ⚠️ `cli`, NOT `main`. `main(argv)` takes its arguments, which is what makes it testable; a
+# console script is called with none. Pointing this entry at `main` would call it with no `argv`
+# and fail at import time for every consumer, in a way nothing in this repository would notice.
+[project.scripts]
+kw-leak-guard = "kw_common.leakguard:cli"
 
 [project.urls]
 Homepage = "https://github.com/texasdaddy/kw-common"
@@ -66,13 +77,20 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# The leak guard is a VERBATIM copy of the canonical file from `unraid-templates`. It is not
-# edited here — a local lint fix would make it a fork, which is the one thing a copied guard must
-# never become. See the header of the file itself.
-"scripts/check_no_internal_info.py" = ["ALL"]
+# ⭐ TWO RULES, NOT `ALL`. While the guard was a verbatim copy of an upstream file it was exempt
+# from linting entirely, because a local fix would have forked it. This repository now OWNS the
+# engine, so the blanket exemption became a 2,900-line hole in the lint — and closing it cost
+# exactly two suppressions and three real fixes.
+#
+# S603/S607 are `subprocess.run(["git", ...])`: the guard MUST use whatever `git` is on the
+# caller's PATH, since that is the git whose repository it is scanning. An absolute path would be
+# wrong rather than safer, and the argument lists are built here, never taken from a user.
+"src/kw_common/leakguard.py" = ["S603", "S607"]
 # S603: every subprocess call in the tests runs `sys.executable` on a file this suite just wrote.
 # There is no untrusted input to audit, and the isolation tests cannot be written without it.
-"tests/*" = ["S603"]
+# S607: the leak-guard suites drive REAL `git` in scratch repositories, for the same reason the
+# guard itself does — the git under test is whichever one the caller has.
+"tests/*" = ["S603", "S607"]
 
 [tool.mypy]
 python_version = "3.10"

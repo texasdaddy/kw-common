@@ -711,12 +711,18 @@ def parse_config(text: str, where: str) -> GuardConfig:
         raise ConfigError(f"{where}: not valid JSON ({exc})") from None
     if not isinstance(raw, dict):
         raise ConfigError(f"{where}: the top level must be an object, got {type(raw).__name__}")
-    unknown = sorted(set(raw) - {"allow_literals", "path_exempt"})
+    # ⭐ A LEADING UNDERSCORE IS THE ONLY WAY TO WRITE A COMMENT, and it is deliberately the only
+    # ignored spelling. JSON has no comments and this file has to explain itself somewhere, but
+    # "ignore anything unrecognised" would swallow `allow_litrals` — a typo that silently drops a
+    # repository's entire allow-list while the scan reports a confident pass. No key this scanner
+    # reads begins with `_`, so the two cases cannot be confused.
+    unknown = sorted(k for k in set(raw) - {"allow_literals", "path_exempt"}
+                     if not k.startswith("_"))
     if unknown:
         raise ConfigError(
             f"{where}: unknown key(s) {unknown}. A key this scanner does not read is far more "
             f"likely to be a typo in one it does than a note to a human, and a silently ignored "
-            f"rule is worse than no rule:\n{_CONFIG_EXAMPLE}")
+            f"rule is worse than no rule. For a note, prefix the key with `_`:\n{_CONFIG_EXAMPLE}")
 
     literals: list[str] = []
     for i, entry in enumerate(_entries(raw.get("allow_literals", []), "allow_literals")):

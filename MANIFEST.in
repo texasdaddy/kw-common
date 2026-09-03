@@ -13,12 +13,18 @@ include MANIFEST.in
 include README.md
 include CHANGELOG.md
 include pyproject.toml
+include .leakguard.json
 recursive-include tests *.py
 
-# ⛔ `scripts/` is DELIBERATELY NOT INCLUDED. It briefly was, on the reasoning that a consumer
-# auditing the tarball should be able to run the same scan CI runs. That reasoning was thin — the
-# guard is a CI tool for THIS repository, not part of the library — and it had a real cost: the
-# canonical guard's docstring enumerates the fleet's other repositories by name, so including it
-# put that inventory inside every tarball attached to every public GitHub Release, widening the
-# distribution of something the tests were edited to stop publishing. Anyone who wants the guard
-# can clone the repository, which is where a CI tool belongs.
+# ⭐ `.leakguard.json` IS INCLUDED because it is an ARGUMENT for the tests, not decoration. This
+# repository's own config is the worked example the leak-guard suite reads, and an sdist whose
+# suite cannot find it ships tests that skip the one property the extraction exists to prove.
+# Same failure as the missing conftest, one release later.
+#
+# ⛔ `scripts/` NO LONGER EXISTS, and the reason it was excluded is worth keeping because it now
+# binds somewhere else. The guard used to be vendored there and was kept out of the sdist because
+# its docstring enumerated the fleet's other repositories by name, which would have put that
+# inventory inside every tarball attached to every public Release. The guard is now
+# `src/kw_common/leakguard.py` — INSIDE the wheel, published to everyone who installs the
+# library — so exclusion is no longer available as the fix. The names were removed from the file
+# instead, and `test_the_shipped_guard_names_no_private_repository` is what keeps them out.

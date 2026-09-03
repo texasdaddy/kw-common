@@ -1,4 +1,4 @@
-"""Shared fixtures, and the two properties every test in this suite must have.
+"""Shared fixtures, and the three properties every test in this suite must have.
 
 1. **No test reaches the network.** A test that forgets to replace the channels would otherwise
    make a real DNS lookup and a real connection attempt — which passes or fails depending on where
@@ -7,6 +7,11 @@
    the first time this suite ran, and nine tests reported `"failed"` where they meant
    `"suppressed"`. The block below makes the mistake impossible rather than remembered.
 2. **No test leaks the process-wide default** installed by `configure()` into the next one.
+3. **No test leaves a leak-guard configuration installed.** `leakguard.apply_config` rebinds
+   module-level names, which is what lets the engine stay one file rather than threading a config
+   object through forty functions — and the cost of that choice is exactly this: a test that
+   applies a config and does not put it back changes what a LATER test measures, silently and in
+   the direction that makes a guard look weaker than it is.
 """
 
 from __future__ import annotations
@@ -14,11 +19,12 @@ from __future__ import annotations
 import ipaddress
 import smtplib
 import urllib.request
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
 
-from kw_common import alerting
+from kw_common import alerting, leakguard
 
 
 class NetworkAccessInTests(RuntimeError):
@@ -135,3 +141,49 @@ def _no_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
 def _reset_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """`configure()` installs a process-wide default; no test may leave one behind."""
     monkeypatch.setattr(alerting, "_default", None)
+
+
+# The repository (or unpacked sdist) this suite is running from. `parents[1]` because the tests
+# live one level down in both layouts, which is what `MANIFEST.in` guarantees for the sdist.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_CONFIG = REPO_ROOT / leakguard.CONFIG_FILENAME
+
+
+@pytest.fixture(autouse=True)
+def _leakguard_config_is_restored() -> object:
+    """Put the guard's live allowances back, and FAIL a test that walked off with them.
+
+    ⛔ RESTORING SILENTLY WOULD HIDE THE BUG. A test that applies a config and forgets to undo it
+    is not a tidiness problem: the next test measures a guard configured by an unrelated one, and
+    the failure surfaces as an unreproducible verdict in a file that never mentions config at all.
+    So this both restores the default AND says which test left it changed.
+    """
+    before = (leakguard.ALLOW_LITERALS, leakguard.PATH_EXEMPT)
+    yield
+    after = (leakguard.ALLOW_LITERALS, leakguard.PATH_EXEMPT)
+    if after != before:
+        leakguard.apply_config(leakguard.DEFAULT_CONFIG)
+        pytest.fail(
+            f"this test left a leak-guard configuration installed: {before!r} -> {after!r}. "
+            f"Use the `injected_literals` fixture, or call "
+            f"`leakguard.apply_config(leakguard.DEFAULT_CONFIG)` when you are done.")
+
+
+@pytest.fixture
+def injected_literals() -> object:
+    """This repository's OWN `.leakguard.json`, applied — the worked example, not a mock.
+
+    ⭐ THE POINT OF USING THE REAL FILE. The allowances a test measures are then the allowances
+    this repository actually scans under, so a config that stopped being honoured, or stopped
+    parsing, fails a test here rather than being discovered by a consumer. A fixture that built a
+    `GuardConfig` inline would pass just as happily with the file deleted.
+    """
+    assert REPO_CONFIG.is_file(), (
+        f"{REPO_CONFIG} is missing. It is this repository's injected leak-guard configuration and "
+        f"an argument for these tests; `MANIFEST.in` ships it in the sdist for that reason.")
+    config = leakguard.load_config(REPO_CONFIG)
+    assert config.allow_literals, (
+        f"{REPO_CONFIG} declares no allow_literals, so every test using this fixture is vacuous")
+    leakguard.apply_config(config)
+    yield config
+    leakguard.apply_config(leakguard.DEFAULT_CONFIG)

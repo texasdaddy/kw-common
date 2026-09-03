@@ -35,6 +35,19 @@ jobs:
   # these names, renaming one does not fail the check — the required context simply never reports
   # and every PR sits BLOCKED with green jobs and no explanation. Change the protection rule
   # first, then the name.
+  #
+  # ⭐ SO THE NAMES ARE WRITTEN DOWN HERE, because a required-context list is invisible from
+  # inside the repository — you cannot read it from a clone, and nothing fails when it drifts.
+  # The contexts this workflow publishes, exactly as GitHub sees them:
+  #
+  #   * "No internal info (leak guard)"
+  #   * "Lint, type-check and test (py3.10)" and "Lint, type-check and test (py3.12)"
+  #     (a matrix job's context carries its parameters, so BOTH are separate contexts)
+  #   * "The built wheel installs and imports"
+  #
+  # `main` carries no branch protection today. That is recorded rather than assumed: this list is
+  # what to protect WITH, and `test_the_required_status_check_names_are_recorded_in_the_workflow`
+  # is what stops a rename silently invalidating it later.
   no-internal-info:
     name: No internal info (leak guard)
     runs-on: ubuntu-latest
@@ -49,10 +62,21 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: "3.12"
-      - name: Self-test the patterns, then scan the working tree
+      # ⭐ THE GUARD IS INSTALLED, NOT INVOKED BY PATH — because that is how every consumer runs
+      # it, and the repository that OWNS the engine must not be the one place it is used
+      # differently. `pip install -e .` puts the `kw-leak-guard` console script on PATH, so this
+      # job exercises the exact entry point a consumer's CI calls.
+      - name: Install the package (the guard ships inside it)
         run: |
-          python scripts/check_no_internal_info.py --selftest
-          python scripts/check_no_internal_info.py
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+      - name: Self-test the patterns, then scan the working tree
+        # The self-test measures the SHIPPED patterns and reads no repository. The tree scan
+        # reads this repository's own `.leakguard.json` — the injected configuration, exercised
+        # on every run rather than only in a test.
+        run: |
+          kw-leak-guard --selftest
+          kw-leak-guard
       # TWO DIFFERENT QUESTIONS, so two scans. The tree scan above answers "is the leak here
       # NOW", and it reads `git ls-files` — TRACKED files only. It is blind to a value committed
       # and then deleted, which stays permanently readable at the commit that added it.
@@ -84,7 +108,7 @@ jobs:
             range="$PUSH_BEFORE..$PUSH_HEAD"
           fi
           echo "range: $range"
-          python scripts/check_no_internal_info.py --range "$range"
+          kw-leak-guard --range "$range"
 
   test:
     # ⭐ 3.10 AND 3.12, BOTH REQUIRED. `requires-python = ">=3.10"` is a promise to six consuming
@@ -142,31 +166,39 @@ jobs:
         run: |
           python -m pip install --upgrade pip build
           python -m build
-      # ⭐ THE SDIST IS AN ARTIFACT TOO, and until this step nothing looked inside it. Two
+      # ⭐ THE SDIST IS AN ARTIFACT TOO, and until this step nothing looked inside it. Three
       # properties, each of which has already been wrong once:
       #   * `tests/conftest.py` must be PRESENT — setuptools' default sdist takes `tests/test*.py`
       #     and not `conftest.py`, so the released tarball shipped tests without the autouse
       #     fixtures they depend on, including the one that makes "no test reaches the network"
       #     true. `MANIFEST.in` fixes that, and this is what keeps it fixed.
-      #   * `scripts/` must be ABSENT — the leak guard is a CI tool for this repository, and its
-      #     docstring names the fleet's other repositories, so shipping it put that list inside
-      #     every tarball attached to a public Release.
-      # Both are one line of `MANIFEST.in` away from regressing, with nothing else watching.
+      #   * `.leakguard.json` must be PRESENT — it is an ARGUMENT for the leak-guard suite, not
+      #     decoration, and a tarball without it ships tests that cannot exercise the injected
+      #     configuration this release exists to add. The same failure as the conftest, one
+      #     release later.
+      #   * `scripts/` must be ABSENT — it no longer exists, and this keeps a re-vendored copy
+      #     of the guard from quietly reappearing beside the packaged one. Note that exclusion is
+      #     no longer the mechanism that keeps repository names out of published artifacts: the
+      #     guard now ships INSIDE the wheel. `tests/test_leak_guard_extraction.py` holds that
+      #     line, and this check only keeps a second copy from arriving.
+      # All three are one line of `MANIFEST.in` away from regressing, with nothing else watching.
       - name: The sdist carries its fixtures and nothing it should not
         run: |
           set -eu
           sdist="$(ls dist/*.tar.gz)"
           echo "inspecting ${sdist}"
           names="$(tar tzf "$sdist")"
-          echo "$names" | grep -q '/tests/conftest.py$' || {
-            echo "::error::the sdist has no tests/conftest.py — its suite ships without the"
-            echo "::error::autouse fixtures it depends on. Check MANIFEST.in."
-            exit 1
-          }
+          for required in '/tests/conftest.py' '/.leakguard.json'; do
+            echo "$names" | grep -q "${required}\$" || {
+              echo "::error::the sdist has no ${required} — its suite ships without something it"
+              echo "::error::depends on. Check MANIFEST.in."
+              exit 1
+            }
+          done
           if echo "$names" | grep -q '/scripts/'; then
-            echo "::error::the sdist contains scripts/. The leak guard is a CI tool for this"
-            echo "::error::repository and its docstring names other repositories; it must not be"
-            echo "::error::published inside a release artifact. Check MANIFEST.in."
+            echo "::error::the sdist contains scripts/. The leak guard ships as"
+            echo "::error::kw_common.leakguard now; a second vendored copy is a fork waiting to"
+            echo "::error::happen. Check MANIFEST.in."
             exit 1
           fi
           echo "sdist contents are as intended"
@@ -180,8 +212,22 @@ jobs:
           /tmp/consumer/bin/python -m pip install --no-index dist/*.whl
           cd /tmp   # away from the source tree, so a passing import cannot come from `src/`
           /tmp/consumer/bin/python -c "
-          import kw_common, kw_common.alerting as a
+          import kw_common, kw_common.alerting as a, kw_common.leakguard as g
           print('version:', kw_common.__version__)
-          print('exports:', len(a.__all__))
+          print('exports:', len(a.__all__), len(g.__all__))
           assert a.notify and a.AlertSettings and a.configure
+          assert g.main and g.cli and g.load_config and g.CONFIG_FILENAME == '.leakguard.json'
           "
+      # ⭐ THE CONSOLE SCRIPT IS A SEPARATE CLAIM FROM THE IMPORT, and it is the one a consumer's
+      # CI actually depends on. An entry point aimed at the wrong callable installs fine, imports
+      # fine, and fails the first time anybody runs it — in their repository, after the tag.
+      #
+      # ⚠️ RUN AGAINST THIS CHECKOUT FROM AN INSTALLED GUARD. That is the acceptance case the
+      # extraction turns on: `site-packages` is not inside this repository, so the self-exemption
+      # cannot fire and the tree is cleared by `.leakguard.json` — the injected configuration —
+      # or not at all.
+      - name: The installed console script scans this repository
+        run: |
+          set -eu
+          /tmp/consumer/bin/kw-leak-guard --selftest
+          /tmp/consumer/bin/kw-leak-guard --repo "$GITHUB_WORKSPACE"
