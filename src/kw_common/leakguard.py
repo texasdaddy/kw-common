@@ -862,16 +862,35 @@ def resolve_config(root: Path, explicit: str | None) -> GuardConfig:
     on_disk = root / CONFIG_FILENAME
     if blob is None:
         if on_disk.is_file():
+            # ⚠️ THE MESSAGE NAMES THE OTHER TWO WAYS TO GET HERE, because "the index has no such
+            # file" is the common one and not the only one. `git cat-file :<path>` also refuses a
+            # path with no STAGE-0 entry — an unmerged file mid-conflict — and the index lookup is
+            # case-SENSITIVE while NTFS is not, so a mis-cased name exists on disk, shows up in
+            # `git ls-files`, and misses here. All three fail closed; only the diagnosis differed,
+            # and sending somebody to `git add` a file they already added is how a fail-closed
+            # guard earns a reputation for lying.
             raise ConfigError(
-                f"{on_disk} exists but the INDEX has no {CONFIG_FILENAME}, so it would change what "
-                f"this scan allows while being invisible to everyone reviewing this repository. "
-                f"`git add {CONFIG_FILENAME}`, or delete it and pass `--config <path>` explicitly.")
+                f"{on_disk} exists but the index has no stage-0 {CONFIG_FILENAME}, so it would "
+                f"change what this scan allows while being invisible to everyone reviewing this "
+                f"repository. Usually that means it is untracked: `git add {CONFIG_FILENAME}`. It "
+                f"can also mean the file is mid-merge (resolve the conflict and stage it), or that "
+                f"its name differs in CASE from the index entry, which git matches exactly. Or "
+                f"delete it and pass `--config <path>` explicitly.")
         return DEFAULT_CONFIG
     try:
         text = blob.decode(_CONFIG_ENCODING)
     except UnicodeDecodeError:
         raise ConfigError(f"{CONFIG_FILENAME} (in the index): is not UTF-8 text") from None
-    if on_disk.is_file() and _lf(on_disk.read_bytes()) != _lf(blob):
+    # ⚠️ IN A `try`, because this read exists only to print a courtesy note and must never be the
+    # thing that ends a scan. It is the one read on this path with nothing to fall back on: a
+    # permission problem, or a deletion racing the `is_file()`, would otherwise raise OSError out
+    # of `main` as a traceback — against this module's own rule that a guard reports rather than
+    # crashes. The index copy governs either way, so failing to read the worktree costs a note.
+    try:
+        diverged = on_disk.is_file() and _lf(on_disk.read_bytes()) != _lf(blob)
+    except OSError:
+        diverged = False
+    if diverged:
         print(f"note: {CONFIG_FILENAME} differs from the index; this scan used the INDEX copy, "
               f"which is what a commit would record. `git add {CONFIG_FILENAME}` to use your edit.")
     return parse_config(text, f"{CONFIG_FILENAME} (as the index holds it)")
@@ -899,17 +918,30 @@ def apply_config(config: GuardConfig) -> None:
     not run. A repository may excuse things the corpus does not cover; it may not excuse the
     corpus itself.
 
-    ⚠️ WHAT THIS DOES NOT CATCH, stated because "cannot be bypassed" is the claim that never
-    survives a round. The corpus is FINITE — 32 content samples across 8 labels, 9 paths and 8
-    messages, a handful each rather than the "one per pattern" an earlier version of this
-    paragraph asserted — and a permitted span only suppresses a hit it fully CONTAINS. So
-    `"/mnt/user"` is refused (it contains the pool-path corpus match) while `"192.168.1.1"` is
-    accepted, because no corpus case uses that address. A repository can therefore still allow
-    individual real values one at a time. That is not the hole this check exists to close: each
-    such entry is an explicit line with a written justification in a TRACKED file in that
-    repository, which is the visibility the old hand-edited tail never had. What is closed is the
-    single wide literal — or the single wide path exemption — that silently turns a whole pattern
-    off across a tree.
+    ⛔⛔ WHAT THIS CHECK IS AND IS NOT, stated flatly because two earlier versions of this
+    paragraph overstated it and "cannot be bypassed" is the claim that never survives a round.
+
+    THE CHECK IS CORPUS-SHAPED. It refuses a literal that stops one of the SAMPLES being caught,
+    and the corpus is finite: 32 content samples across 8 labels, 9 paths, 8 messages. So
+    `"/mnt/user"` is refused because a pool-path sample spells that pool — and `"/mnt/cache"`,
+    `"/mnt/disk9"` and `"tailnet-acme.ts.net"` are ACCEPTED, because no sample spells those.
+    Measured, all four.
+
+    ⚠️ AND AN ACCEPTED LITERAL IS NOT NARROW. A permitted span suppresses any hit it CONTAINS, and
+    the match for `unraid pool path` is exactly `/mnt/<pool>` — so allowing `"/mnt/cache"` silences
+    that pool everywhere in the repository, on all three surfaces and in all three scan modes, not
+    "one value at a time". The same holds for a tailnet name. An earlier version of this docstring
+    said the single wide literal that turns a pattern off across a tree is what this check closes.
+    It closes the ones the corpus happens to name. That is a real bound and a useful one — it is
+    what makes the obvious off-switches fail loudly — but it is not the property the sentence
+    claimed, and a repository author who believed it would draw exactly the wrong conclusion about
+    what the format can do.
+
+    So what actually stands between a repository and a self-inflicted blind spot is not this
+    check: it is that every entry is an exact literal, written out, carrying a required
+    justification, in a file read FROM THE INDEX — which is the visibility the old hand-edited
+    engine tail never had. This check is the backstop that catches the careless case, not a proof
+    of anything.
     """
     global ALLOW_LITERALS
     previous = ALLOW_LITERALS
@@ -933,13 +965,17 @@ def _deny_cases_defeated(compiled: list[tuple[str, re.Pattern[str]]]) -> list[st
     path and message deny cases at once. Measured: `{"literal": "host-a.lan."}` was accepted, and
     the shipped `--selftest` then failed with two PATH cases and one MESSAGE case uncaught.
 
-    ⚠️ NO `rel_path` IS PASSED, and that is a consequence of withdrawing `path_exempt` rather than
-    a return to the bug it once was. `scan_text` consults `_exempt` only when a path is given, and
-    `PATH_EXEMPT` is an engine constant again — empty here, changeable only by editing the engine,
-    which is a reviewed change. No configured value's effect depends on which path a sample is
-    scanned at any more. An intermediate version ran the corpus at a list of "ordinary" probe
-    paths to bound a configured exemption; that list was a nine-name allowlist, and `\\.go$` or
-    `^internal/` sailed straight past it. `GuardConfig` records both failed designs.
+    ⚠️ THE CONTENT LOOP PASSES NO `rel_path`, and that is a consequence of withdrawing
+    `path_exempt` rather than a return to the bug it once was. `scan_text` consults `_exempt` only
+    when a path is given, and `PATH_EXEMPT` is an engine constant again — empty here, changeable
+    only by editing the engine, which is a reviewed change — so no CONFIGURED value's effect
+    depends on which path a sample is scanned at. An intermediate version ran the corpus at a list
+    of "ordinary" probe paths to bound a configured exemption; that list was a nine-name allowlist,
+    and `\\.go$` or `^internal/` sailed straight past it. `GuardConfig` records both failed designs.
+
+    ⚠️ THE PATH LOOP DOES PASS ONE, through `scan_path`, so were `PATH_EXEMPT` ever repopulated by
+    an engine edit the two loops would measure under different rules. Inert today, and written down
+    so the asymmetry is not discovered by whoever repopulates it.
 
     Empty is the healthy answer.
     """

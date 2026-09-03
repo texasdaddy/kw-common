@@ -648,7 +648,12 @@ def test_an_UNTRACKED_config_is_refused(tmp_path: Path) -> None:
     assert res.returncode == 2, (
         f"an untracked config governed the scan; the allowances are invisible to review:"
         f"\n{_out(res)}")
-    assert "the INDEX has no" in _out(res), _out(res)
+    assert "the index has no stage-0" in _out(res), _out(res)
+    # ⭐ AND IT MUST NAME THE REMEDY. "The index has no such file" is the common cause and not the
+    # only one — an unmerged path has no stage-0 entry either, and git's index lookup is
+    # case-sensitive where NTFS is not — so a message that asserts one cause sends the other two
+    # to `git add` a file they already added.
+    assert f"git add {guard.CONFIG_FILENAME}" in _out(res), _out(res)
 
     # The other direction: the very same file, tracked, is honoured.
     _git(repo, "add", "-f", guard.CONFIG_FILENAME)
@@ -812,22 +817,26 @@ def test_line_endings_do_not_stop_the_guard_recognising_its_own_source(tmp_path:
     installed copy has LF. Without normalisation the guard would fail to recognise itself on
     exactly one platform — the "works on the machine that wrote it" class this file has been
     bitten by before.
+
+    ⛔⛔ THE PLANT IS THE OPPOSITE ENDING FROM THE CHECKOUT'S, and getting that wrong cost this
+    test all of its value once already. It planted a CRLF copy unconditionally and SKIPPED when
+    the two forms matched — which is precisely when the checkout is CRLF, i.e. the one
+    configuration the normalisation exists for. Measured: with a CRLF source and `_lf` deleted, the
+    whole suite passed and this test skipped. Planting the opposite ending keeps it measuring on
+    both.
     """
     own = _SCRIPT.read_bytes()
     repo = _repo(tmp_path, "crlf")
-    crlf = own.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
-    # ⚠️ SKIP, DO NOT FAIL, WHEN THE CHECKOUT IS ALREADY CRLF. The two forms are then identical and
-    # there is nothing left to measure — and failing would red the suite on precisely the
-    # configuration this normalisation exists for, which is the wrong way round. `.gitattributes`
-    # (`* text=auto eol=lf`) keeps it from arising here; an installed copy on a machine configured
-    # otherwise is where it would. Found when a harness rewrote the module with CRLF and this
-    # assertion fired.
-    if crlf == own:
-        pytest.skip("this checkout already holds the guard with CRLF endings; nothing differs")
-    (repo / "vendored.py").write_bytes(crlf)
+    lf = own.replace(b"\r\n", b"\n")
+    other = lf if b"\r\n" in own else lf.replace(b"\n", b"\r\n")
+    assert other != own, (
+        "vacuity guard: the plant has the same line endings as the guard's own source, so nothing "
+        "about normalisation is being measured")
+    (repo / "vendored.py").write_bytes(other)
     _git(repo, "add", "vendored.py")
     assert _run(repo).returncode == 0, (
-        "a CRLF copy of the guard's own source was not recognised as the guard")
+        "a copy of the guard's own source with the other line ending was not recognised as the "
+        "guard")
 
 
 # -------------------------------------------------------------------------------------------

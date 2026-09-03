@@ -187,13 +187,16 @@ Five properties are deliberate and worth knowing before you write one:
    config". An unknown key, a missing `why`, a `--config` path that does not exist: all errors. A
    silently ignored rule is worse than no rule, because a clean verdict looks identical either way.
    (A UTF-8 BOM is fine — Windows editors write them.)
-4. **A config that would gut the guard is refused.** Applying your allowances must not stop any of
-   the engine's own deny cases being caught, on any of the three surfaces: file content, file
-   paths, commit messages. So an `allow_literals` entry as wide as a pool root — the `/mnt/<pool>`
-   prefix itself, spelled out — is refused. (This paragraph cannot show you the refused literal,
-   for the reason the placeholder section below explains: the guard scans this file.) What the
-   check does *not* catch is written down beside it in the code: the corpus is finite, so single
-   real values can still be allowed one explicit, justified line at a time.
+4. **A config that stops the guard's own DENY CASES being caught is refused** — on any of the
+   three surfaces: file content, file paths, commit messages. Read that literally, because it is
+   narrower than it sounds and an earlier version of this bullet overstated it. The check is
+   corpus-shaped: it refuses a literal that silences one of the engine's finite set of samples,
+   so the pool root the corpus happens to spell is refused and *another pool name is not*.
+   And an accepted literal is not narrow — allowing a pool root silences that pool everywhere,
+   because the match for that pattern is the pool root itself.
+   So treat this as a backstop against the careless case, not as a proof. What actually keeps an
+   allow-list honest is that every entry is an exact literal, spelled out, with a required
+   justification, in a file read from the index.
 5. **The only file whose CONTENT the guard skips outright is its own source, recognised as its
    own.** (A `SKIP_SUFFIXES` asset whose bytes really are binary is skipped too, but that is a
    read the guard would learn nothing from — rename a text file to `.png` and it is still

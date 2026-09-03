@@ -31,10 +31,14 @@ the 4,200 lines of engine tests that moved here with the code.
 - **`--config <path>` / `--config=<path>`** on the command line, and `GuardConfig`,
   `DEFAULT_CONFIG`, `ConfigError`, `find_config`, `load_config`, `parse_config`, `apply_config`,
   `CONFIG_FILENAME` and `cli` in the module's `__all__`.
-- **A configuration that would defeat the guard is refused.** Applying a repository's allowances
-  must not stop any of the engine's own deny cases being caught, or the scan stops with exit 2
-  naming the case it defeats. Without this, moving the allowances into a file the consumer owns
-  would have made "turn a whole pattern off across the tree, with CI still green" a one-line edit.
+- **A configuration that stops the guard's own DENY CASES being caught is refused**, on any of
+  the three surfaces, with exit 2 naming the case it defeats. ⚠️ Read that literally: the check
+  is CORPUS-SHAPED. It refuses a literal that silences one of a finite set of samples, so the
+  pool root the corpus spells is refused and another pool name is not — and an accepted literal
+  is not narrow, since allowing a pool root silences that pool everywhere. It is a backstop
+  against the careless case, not a proof that the format cannot be misused. What keeps an
+  allow-list honest is that every entry is an exact literal, spelled out, justified, and read
+  from the index.
 
 ### Fixed
 
