@@ -1,6 +1,6 @@
 {
-  "_readme": "This repository's OWN allowances for kw_common.leakguard. A key prefixed with `_` is a comment and is the only spelling this scanner ignores - anything else it does not read is refused, so a typo cannot silently drop the rules below. Format: README.md.",
-  "_why_path_exempt": "This repository OWNS the guard, so its engine source is a tracked file full of synthetic deny cases. Running from this checkout, the guard recognises that file as itself and skips it. Running from an INSTALLED package it cannot - site-packages is not inside this repository - so the exemption is declared here instead, per pattern and per path, where it is visible. Every pattern is named explicitly rather than skipping the file: adding a pattern to the engine will red this repository until someone decides that pattern belongs on this list too.",
+  "_readme": "This repository's OWN allowances for kw_common.leakguard. A key prefixed with `_` is a comment and is the only spelling this scanner ignores - anything else it does not read is refused, so a typo cannot silently drop the rules below. This file must stay TRACKED: an untracked one is refused, precisely so an allowance cannot govern a scan while being invisible to review. Format: README.md.",
+  "_why_no_path_exempt": "This repository OWNS the engine, so its source is a tracked file full of synthetic deny cases - and the first version of this file excused all eight patterns on that one path. That was a whole-file skip written in data: a REAL leak appended to the engine's source passed, which is the exact blind spot the hardcoded self-path used to leave, moved from code into config. The guard now recognises its own source by its BYTES, which nothing else in any repository can claim and no config can widen. No path_exempt entry is needed here, and there should be none.",
   "allow_literals": [
     {
       "literal": "github.com/texasdaddy",
@@ -13,48 +13,6 @@
     {
       "literal": "ghcr.io/texasdaddy",
       "why": "functional: image pulls. Neutralizing it would break them; it is an account name, not infrastructure."
-    }
-  ],
-  "path_exempt": [
-    {
-      "pattern": "private IPv4 (RFC1918)",
-      "path_regex": "^src/kw_common/leakguard\\.py$",
-      "why": "the guard's OWN source carries synthetic deny cases by design; a guard with no deny cases has silently stopped guarding"
-    },
-    {
-      "pattern": "cgnat address",
-      "path_regex": "^src/kw_common/leakguard\\.py$",
-      "why": "as above - the deny corpus that proves this pattern still bites"
-    },
-    {
-      "pattern": "tailnet name",
-      "path_regex": "^src/kw_common/leakguard\\.py$",
-      "why": "as above - the deny corpus that proves this pattern still bites"
-    },
-    {
-      "pattern": "private lan domain",
-      "path_regex": "^src/kw_common/leakguard\\.py$",
-      "why": "as above - the deny corpus that proves this pattern still bites"
-    },
-    {
-      "pattern": "unraid pool path",
-      "path_regex": "^src/kw_common/leakguard\\.py$",
-      "why": "as above - the deny corpus that proves this pattern still bites"
-    },
-    {
-      "pattern": "windows profile path",
-      "path_regex": "^src/kw_common/leakguard\\.py$",
-      "why": "as above - the deny corpus that proves this pattern still bites"
-    },
-    {
-      "pattern": "personal mail address",
-      "path_regex": "^src/kw_common/leakguard\\.py$",
-      "why": "as above - the deny corpus that proves this pattern still bites"
-    },
-    {
-      "pattern": "uuid (access policy / tenant id)",
-      "path_regex": "^src/kw_common/leakguard\\.py$",
-      "why": "as above - the deny corpus that proves this pattern still bites"
     }
   ]
 }

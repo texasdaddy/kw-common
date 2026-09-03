@@ -39,7 +39,7 @@ the 4,200 lines of engine tests that moved here with the code.
 ### Fixed
 
 - **An installed guard no longer exempts an arbitrary file in the repository it scans** — a
-  security fix, not tidying. The self-exemption resolved `__file__` relative to the scanned root
+  security fix, not tidying, and one whose FIRST answer was wrong in the same way. The self-exemption resolved `__file__` relative to the scanned root
   and **fell back to the constant `scripts/check_no_internal_info.py`** when that failed. It fails
   on **every run of an installed guard**, because `site-packages` is not inside the repository
   being scanned — so the fallback would have exempted whatever the consumer kept at that path,
@@ -47,6 +47,14 @@ the 4,200 lines of engine tests that moved here with the code.
   to install this package and delete its old script would have handed a permanent, invisible
   amnesty to any file that later took that name. The resolver now answers "not mine" instead of
   guessing, and a repository that genuinely vendors the guard still skips its own copy.
+
+  ⚠️ THAT LEFT THE SAME HOLE ONE LAYER OUT, and the verification gate found it. The repository
+  that OWNS the engine keeps its source as an ordinary tracked file, full of synthetic deny cases
+  — so with the path exemption gone, an installed guard reported all of them. The first answer was
+  a `path_exempt` entry per pattern in that repository's own config; since the engine has exactly
+  as many patterns as that list had entries, it was a whole-file skip written in data, and a REAL
+  leak appended to the engine's source PASSED. The guard now recognises its own source by its
+  BYTES: nothing else in any repository can claim that, and no configuration can widen it.
 - **The finding banner no longer claims "this repo is public."** True of the one repository the
   guard was vendored into, false for most of the ones it now scans — and a sentence a reader uses
   to decide a finding does not apply to them. It states what holds everywhere instead: a commit is
@@ -60,10 +68,24 @@ the 4,200 lines of engine tests that moved here with the code.
   had kept the guard out of the sdist for exactly that reason; the module now ships inside the
   **wheel**, so exclusion is no longer available as the fix. Provenance comments cite
   `consumer#NN`, and a test enforces the absence.
-- Three incidental repairs the move surfaced, none of which changes a verdict: `zip(..., strict=)`
-  where the lengths were already asserted equal, a rebound name in `selftest()` that made the type
-  checker right about a real type error, and — found by fixing that — a false-positive PATH report
-  that interpolated the CONTENT loop's findings instead of its own.
+- **A `.leakguard.json` that is not tracked by git is refused.** An ignored config governed every
+  local scan while being invisible to review, which is the opposite of the property that justifies
+  injecting the allowances at all.
+- **A UTF-8 BOM on an otherwise valid config no longer reddens the build.** Windows PowerShell 5.1
+  and Notepad both write one; the config is read as `utf-8-sig`.
+- **The `--staged` banner no longer claims "this repo is public" either.** The tree and range
+  banners were corrected and this one was missed — the instance, not the class, inside an edit
+  whose entire subject was a false claim.
+- Two incidental repairs the move surfaced, neither of which changes a verdict: `zip(..., strict=)`
+  where the lengths were already asserted equal, and a rebound name in `selftest()` that made the
+  type checker right about a real type error.
+
+  ⚠️ An earlier draft of this entry claimed a third — "a false-positive PATH report that
+  interpolated the CONTENT loop's findings instead of its own". **That bug never existed**: the
+  pre-move file assigns the name inside the same loop, one line above its use, so the report was
+  always correct. A verification agent checked the claim against the original and it was false.
+  Recorded rather than deleted, because a changelog that invents a fix is the same defect class as
+  a comment that invents one.
 
 ### Notes for adopters
 
@@ -90,29 +112,37 @@ on lines that were previously, and correctly, permitted.
 }
 ```
 
-Four properties, each chosen in the fail-closed direction and each worth knowing before you write
+Five properties, each chosen in the fail-closed direction and each worth knowing before you write
 a config:
 
-1. **No config file means nothing is allowed.** A missing, misnamed or uncommitted file can only
-   make a scan *stricter*. The opposite default — shipping this fleet's own allowances — would
-   mean an installed library silently permitting values in a repository that never asked, and a
-   consumer would have to edit installed code to tighten it, which is the fork this package exists
-   to prevent.
-2. **A config this scanner cannot understand STOPS the scan** (exit 2). It never degrades to "no
+1. **No config file means nothing is allowed.** A missing or misnamed file can only make a scan
+   *stricter*. The opposite default — shipping this fleet's own allowances — would mean an
+   installed library silently permitting values in a repository that never asked, and a consumer
+   would have to edit installed code to tighten it, which is the fork this package exists to
+   prevent.
+2. **The config must be TRACKED.** A gitignored or never-added `.leakguard.json` is refused. The
+   whole justification for injecting the allowances is that they become reviewable, and a file
+   nobody can see governs every local scan — the pre-commit and pre-push paths especially — while
+   `git status` stays empty. `--config <path>` is exempt: it is written out in the invocation.
+3. **A config this scanner cannot understand STOPS the scan** (exit 2). It never degrades to "no
    config": an unknown or misspelled key, a missing `why`, a regex that will not compile, a
    `--config` path that does not exist. The difference between "your rules were applied" and "your
-   rules were unreadable, so none were" is invisible in a clean verdict.
-3. **`why` is required on every entry**, so "keep each one justified" is enforced rather than
-   requested. `path_exempt` excuses ONE named pattern on ONE path regex and is never a whole-file
-   skip; a `pattern` naming no real pattern is an error rather than an entry that does nothing.
-4. **The guard skips at most one file — its own source — and only when it is genuinely inside the
-   repository being scanned.** If you vendor a copy, that copy skips itself. If you install the
-   package, nothing in your repository is skipped, including a file at the old vendored path.
+   rules were unreadable, so none were" is invisible in a clean verdict. A UTF-8 BOM is accepted —
+   Windows editors write them, and reddening a correct config is how a guard gets switched off.
+4. **`why` is required on every entry**, so "keep each one justified" is enforced rather than
+   requested. `path_exempt` excuses ONE named pattern on ONE path regex; a `pattern` naming no real
+   pattern is an error rather than an entry that quietly does nothing, and a regex wide enough to
+   match an ordinary file (`.`, `.+`, `.*`, `(tests/fixtures/)?`) is refused as an off-switch. A
+   scoped one — `^tests/fixtures/` — is accepted and honoured.
+5. **The guard skips at most one file: its own source, recognised as its own.** Either it is
+   literally that file (you vendored the guard inside the repository it scans), or the file's
+   BYTES are the running guard's own bytes. Nothing else can claim that and no config can widen
+   it: change one character of the guard's source and it is scanned like any other file.
 
 **If your repository keeps a leak-guard corpus of its own** (synthetic deny cases, fixtures full of
-`.lan` hosts), declare it with `path_exempt` per pattern rather than expecting a file skip. This
-repository's own `.leakguard.json` is the worked example, and the suite reads the real file so a
-broken config here fails a test here.
+`.lan` hosts), declare it with `path_exempt` per pattern, scoped to the directory that holds it.
+This repository's own `.leakguard.json` is the worked example, and the suite reads the real file so
+a broken config here fails a test here.
 
 **What is NOT in this release:** adoption anywhere. Each consuming repository takes it as its own
 change, and `unraid-templates` — where this engine came from — should re-adopt rather than keep its

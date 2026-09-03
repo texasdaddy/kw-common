@@ -338,10 +338,6 @@ def test_this_repositorys_OWN_config_parses_and_is_honoured(injected_literals) -
     a red test here rather than a discovery in somebody else's CI.
     """
     assert injected_literals.allow_literals, "this repository declares no allow_literals"
-    assert injected_literals.path_exempt, "this repository declares no path_exempt entries"
-    known = {label for label, _ in guard.PATTERNS}
-    for label, _rx in injected_literals.path_exempt:
-        assert label in known, f"{label!r} names no pattern; `load_config` should have refused it"
     for literal in injected_literals.allow_literals:
         line = f"see https://{literal}/kw-common for the source"
         spans = guard._permitted_spans(line)
@@ -517,6 +513,254 @@ def test_the_four_engine_add_surfaces_still_catch_from_an_INSTALLED_guard(
         f"the finding is not attributed to the MESSAGE surface, so it may be the diff or the "
         f"identity being reported instead:\n{_out(message)}")
 
+
+
+# -------------------------------------------------------------------------------------------
+# The gate found every one of the following, in code this package invented. Each is pinned in
+# BOTH directions, because a refusal that only ever says no is not a check.
+# -------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path_regex",
+    [".", ".+", ".*", "(tests/fixtures/)?", "^", "[a-z./]*", "docs|src|tests|README"],
+    ids=["any-char", "one-or-more", "zero-or-more", "optional-group", "empty-anchor",
+         "char-class-star", "alternation-over-everything"],
+)
+def test_a_WIDE_path_exempt_is_refused(tmp_path: Path, path_regex: str) -> None:
+    """⛔⛔ A COMPLETE OFF-SWITCH, found by three independent verification agents at once.
+
+    `_deny_cases_defeated` used to measure the deny corpus with NO `rel_path`, and `scan_text`
+    consults `_exempt` only `if rel_path` — so the "this configuration DEFEATS the guard's own
+    deny cases" refusal was structurally blind to `path_exempt`. A repository could write one
+    entry with a regex matching every path, silence a pattern across its whole tree on both the
+    content and the path surfaces, and have the config ACCEPTED. Measured before the fix: a tree
+    with an RFC1918 address in a tracked file scanned `no internal info found`, exit 0, in all
+    three scan modes.
+
+    ⚠️ THE CHECK IS NOT A REGEX-SHAPE RULE. "It must be anchored", "it must not match the empty
+    string" — `.+` is neither anchored nor empty-matching and is still total, and this file's own
+    history is a list of matchers that lost that arms race. What is measured is the PROPERTY: a
+    path exemption may not stop a deny case being caught on a path an ordinary repository has.
+    """
+    repo = _repo(tmp_path, f"wide_{abs(hash(path_regex))}")
+    (repo / "leak.txt").write_text(f"DATABASE_URL=postgres://u:p@{_ADDR}:5432/db\n",
+                                   encoding="utf-8")
+    _git(repo, "add", "leak.txt")
+    assert _run(repo).returncode == 1, "vacuity guard: the leak must be caught without the config"
+
+    _write_config(repo, {"path_exempt": [
+        {"pattern": "private IPv4 (RFC1918)", "path_regex": path_regex,
+         "why": "test fixture: wide enough to be an off-switch"}]})
+    res = _run(repo)
+    assert res.returncode == 2, (
+        f"a path_exempt regex that matches every path was accepted — the guard can be switched "
+        f"off from a config file:\n{_out(res)}")
+    assert "DEFEATS" in _out(res), _out(res)
+
+
+def test_a_NARROW_path_exempt_is_still_accepted_and_honoured(tmp_path: Path) -> None:
+    """The direction that must NOT break: a scoped exemption is the mechanism's whole purpose.
+
+    A repository that keeps its own synthetic deny cases — a fixtures directory, a vendored
+    corpus — has to be able to say so. `^tests/fixtures/` matches none of the probe paths, so it
+    is accepted, and the file under it really is excused.
+    """
+    repo = _repo(tmp_path, "narrowpath")
+    fixtures = repo / "tests" / "fixtures"
+    fixtures.mkdir(parents=True)
+    (fixtures / "hosts.txt").write_text(f"{_HOST}\n", encoding="utf-8")
+    _git(repo, "add", "tests")
+    assert _run(repo).returncode == 1, "vacuity guard: the fixture must red without the exemption"
+
+    _write_config(repo, {"path_exempt": [
+        {"pattern": "private lan domain", "path_regex": "^tests/fixtures/",
+         "why": "synthetic hosts, needed to prove the pattern still bites"}]})
+    res = _run(repo)
+    assert res.returncode == 0, (
+        f"a properly scoped path exemption was refused; the mechanism is now unusable:"
+        f"\n{_out(res)}")
+
+    # ...and it is scoped. The same host OUTSIDE the exempted path must still red.
+    (repo / "prod.conf").write_text(f"AGENT=http://{_HOST}/\n", encoding="utf-8")
+    _git(repo, "add", "prod.conf")
+    assert _run(repo).returncode == 1, (
+        "the exemption reached beyond its path regex — a scoped carve-out that is not scoped")
+
+
+def test_an_allow_literal_may_not_defeat_the_PATH_or_MESSAGE_deny_cases(tmp_path: Path) -> None:
+    """The refusal measures three surfaces, because `ALLOW_LITERALS` reaches three.
+
+    ⛔ IT USED TO MEASURE ONLY FILE CONTENT. `_permitted_spans` is applied inside `scan_text`,
+    which the PATH and MESSAGE scans call too — so a literal could be accepted while defeating
+    three of the engine's own path and message deny cases at once. Measured before the fix: with
+    that config applied, the shipped `--selftest` failed with two PATH cases and one MESSAGE case
+    uncaught, and a real range scan cleared a leaking commit message and a leaking filename.
+    """
+    repo = _repo(tmp_path, "pathmsg")
+    _write_config(repo, {"allow_literals": [
+        {"literal": "host-a.lan.", "why": "test fixture: swallows the path and message cases"},
+        {"literal": "host-a.lan.example", "why": "test fixture"}]})
+    res = _run(repo)
+    assert res.returncode == 2, (
+        f"a literal that defeats the PATH and MESSAGE deny cases was accepted:\n{_out(res)}")
+    assert "PATH" in _out(res) or "MESSAGE" in _out(res), (
+        f"the refusal does not name the surface it protects, so nobody can act on it:"
+        f"\n{_out(res)}")
+
+
+def test_an_UNTRACKED_config_is_refused(tmp_path: Path) -> None:
+    """⛔ THE JUSTIFICATION FOR INJECTION IS THAT THE ALLOWANCES BECOME REVIEWABLE.
+
+    A `.leakguard.json` that is gitignored, or simply never added, is not reviewable: it governs
+    every local scan — including the pre-commit and pre-push paths a developer meets most — while
+    `git status` is empty and nothing in the repository shows why the scan is green. Measured
+    before the fix: an ignored config allowing a `.lan` host turned the local scan green with
+    nothing tracked to explain it.
+
+    ⚠️ `--config` IS DELIBERATELY EXEMPT — it is written out in the invocation, which is the
+    visibility that matters, and a config held outside the scanned repository is legitimate. That
+    half is pinned by `test_an_explicit_config_path_is_honoured_and_a_missing_one_is_an_ERROR`.
+    """
+    repo = _repo(tmp_path, "untracked")
+    (repo / "leak.txt").write_text(f"AGENT=http://{_HOST}/\n", encoding="utf-8")
+    _git(repo, "add", "leak.txt")
+    _git(repo, "commit", "-q", "-m", "seed")
+    (repo / guard.CONFIG_FILENAME).write_text(
+        json.dumps({"allow_literals": [{"literal": _HOST, "why": "test fixture"}]}),
+        encoding="utf-8")
+    (repo / ".gitignore").write_text(f"{guard.CONFIG_FILENAME}\n", encoding="utf-8")
+    _git(repo, "add", ".gitignore")
+
+    res = _run(repo)
+    assert res.returncode == 2, (
+        f"an untracked config governed the scan; the allowances are invisible to review:"
+        f"\n{_out(res)}")
+    assert "NOT TRACKED" in _out(res), _out(res)
+
+    # The other direction: the very same file, tracked, is honoured.
+    _git(repo, "add", "-f", guard.CONFIG_FILENAME)
+    assert _run(repo).returncode == 0, "a tracked config was not honoured"
+
+
+def test_a_BOM_on_a_valid_config_does_not_red_the_build(tmp_path: Path) -> None:
+    """⚠️ A GUARD THAT REDDENS CORRECT WORK GETS SWITCHED OFF, so this is a real defect class.
+
+    Windows PowerShell 5.1 `Out-File` and Notepad's "Save As UTF-8" both write a BOM. Reading the
+    config as `utf-8` rather than `utf-8-sig` turned a semantically perfect file into exit 2 on
+    the workstation this fleet is operated from.
+    """
+    repo = _repo(tmp_path, "bom")
+    (repo / "leak.txt").write_text(f"AGENT=http://{_HOST}/\n", encoding="utf-8")
+    _git(repo, "add", "leak.txt")
+    (repo / guard.CONFIG_FILENAME).write_text(
+        json.dumps({"allow_literals": [{"literal": _HOST, "why": "test fixture"}]}),
+        encoding="utf-8-sig")
+    _git(repo, "add", guard.CONFIG_FILENAME)
+    assert (repo / guard.CONFIG_FILENAME).read_bytes().startswith(b"\xef\xbb\xbf"), (
+        "vacuity guard: the fixture is not actually BOM-prefixed")
+
+    res = _run(repo)
+    assert res.returncode == 0, (
+        f"a BOM-prefixed but otherwise valid config reddened the scan:\n{_out(res)}")
+
+
+def test_NO_scan_banner_claims_the_repository_is_public(tmp_path: Path) -> None:
+    """⭐ THE CLASS, not the instance — which is how this one was missed the first time.
+
+    The sentence was removed from the tree and range banners and left on `--staged`. It is true
+    of at most two repositories in this fleet and is printed to every consumer of the guard, and
+    it is precisely the sentence a reader uses to decide a finding does not apply to them.
+    """
+    repo = _repo(tmp_path, "banners")
+    _git(repo, "commit", "-q", "-m", "seed")
+    (repo / "s.py").write_text(f"ADDR = '{_ADDR}'\n", encoding="utf-8")
+    _git(repo, "add", "s.py")
+
+    staged = _run(repo, "--staged")
+    _git(repo, "commit", "-q", "-m", "commit the leak")
+    tree = _run(repo)
+    rng = _run(repo, "--range", "HEAD~1..HEAD")
+
+    for name, res in (("--staged", staged), ("tree", tree), ("--range", rng)):
+        assert res.returncode == 1, f"vacuity guard: the {name} scan did not find the leak"
+        assert "this repo is public" not in _out(res), (
+            f"the {name} banner still claims the scanned repository is public:\n{_out(res)}")
+
+
+@pytest.mark.timeout(300)
+def test_a_REAL_leak_in_the_engines_OWN_source_reds_even_in_the_repo_that_owns_it(
+    tmp_path: Path,
+) -> None:
+    """⛔⛔ THE ACCEPTANCE CRITERION, asked of the one repository it is hardest for.
+
+    This repository's tracked engine source is full of synthetic deny cases by design, and an
+    INSTALLED guard is not inside it, so the path-based self-exemption cannot fire. The first
+    answer was a `path_exempt` entry per pattern in this repository's own config — and since the
+    engine has exactly as many patterns as that list had entries, it was a whole-file skip written
+    in data: a REAL leak appended to the engine's source PASSED. That is the `SELF_PATH` blind
+    spot again, moved from code into configuration.
+
+    The guard recognises its own source by its BYTES instead. Nothing else can claim that, and no
+    configuration can widen it — change one character and the file is scanned like any other.
+
+    ⚠️ THE CLEAN DIRECTION IS ASSERTED FIRST. Without it, a guard that had stopped recognising
+    itself entirely would pass the interesting half of this test for the wrong reason.
+    """
+    own = _SCRIPT.read_bytes()
+    repo = _repo(tmp_path, "ownsource")
+    vendored = repo / "src" / "kw_common" / "leakguard.py"
+    vendored.parent.mkdir(parents=True)
+    vendored.write_bytes(own)
+    _git(repo, "add", "src")
+
+    assert _run(repo).returncode == 0, (
+        "the guard did not recognise a byte-identical copy of its own source, so every synthetic "
+        "deny case in it became a finding")
+
+    vendored.write_bytes(own + f"\n# PLANTED: {_HOST} {_ADDR} {_LEAK_PATH}\n".encode())
+    _git(repo, "add", "src")
+    res = _run(repo)
+    assert res.returncode == 1, (
+        f"a REAL leak appended to the engine's own source was exempted — the identity test has "
+        f"become a whole-file skip:\n{_out(res)}")
+    assert "src/kw_common/leakguard.py" in _out(res), _out(res)
+
+
+def test_the_identity_test_cannot_be_claimed_by_any_OTHER_file(tmp_path: Path) -> None:
+    """The other half: only a byte-identical copy is recognised, and that copy leaks nothing.
+
+    A file that merely LOOKS like the guard — same name, same path, a plausible prefix of its
+    bytes — is scanned. The only file that is skipped is one whose content is the guard's own,
+    which by construction contains no real value.
+    """
+    own = _SCRIPT.read_bytes()
+    repo = _repo(tmp_path, "impostor")
+    (repo / "scripts").mkdir()
+    # The guard's real first 4 KB, then a leak. Same name, same path, a genuine prefix.
+    (repo / _VENDORED_REL).write_bytes(own[:4096] + f"\nAGENT={_HOST}\n".encode())
+    _git(repo, "add", "scripts")
+    res = _run(repo)
+    assert res.returncode == 1, (
+        f"a file carrying the guard's first 4 KB was treated as the guard:\n{_out(res)}")
+
+
+def test_line_endings_do_not_stop_the_guard_recognising_its_own_source(tmp_path: Path) -> None:
+    """⚠️ A CRLF CHECKOUT IS NOT A DIFFERENT FILE.
+
+    `core.autocrlf=true` gives a Windows worktree the same source with CRLF line endings while an
+    installed copy has LF. Without normalisation the guard would fail to recognise itself on
+    exactly one platform — the "works on the machine that wrote it" class this file has been
+    bitten by before.
+    """
+    own = _SCRIPT.read_bytes()
+    repo = _repo(tmp_path, "crlf")
+    crlf = own.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    assert crlf != own, "vacuity guard: the fixture is not actually CRLF"
+    (repo / "vendored.py").write_bytes(crlf)
+    _git(repo, "add", "vendored.py")
+    assert _run(repo).returncode == 0, (
+        "a CRLF copy of the guard's own source was not recognised as the guard")
 
 # =================================================================================================
 # 5. The package surface itself

@@ -184,6 +184,14 @@ def injected_literals() -> object:
     config = leakguard.load_config(REPO_CONFIG)
     assert config.allow_literals, (
         f"{REPO_CONFIG} declares no allow_literals, so every test using this fixture is vacuous")
+    # ⛔ AND IT MUST DECLARE NO PATH EXEMPTIONS. The first version of this file excused all eight
+    # patterns on the engine's own path — a whole-file skip written in data, through which a REAL
+    # leak appended to that file passed. The guard recognises its own source by its BYTES now, so
+    # there is nothing left for a path exemption here to do, and an entry reappearing would mean
+    # the identity test has stopped working and somebody papered over it.
+    assert not config.path_exempt, (
+        f"{REPO_CONFIG} declares path_exempt entries. This repository needs none: the guard "
+        f"recognises its own source by content. An entry here is a whole-file skip in disguise.")
     leakguard.apply_config(config)
     yield config
     leakguard.apply_config(leakguard.DEFAULT_CONFIG)

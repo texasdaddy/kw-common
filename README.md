@@ -175,27 +175,41 @@ revert your rules and your rules cannot hold back an upgrade.
 * **`why` is required on every entry.** "Keep each one justified" is enforced rather than
   requested.
 
-Four properties are deliberate and worth knowing before you write one:
+Five properties are deliberate and worth knowing before you write one:
 
-1. **No config means nothing is allowed.** A missing, misnamed or uncommitted file can only ever
-   make the scan *stricter*.
-2. **A config this scanner cannot understand STOPS the scan** (exit 2) — it never degrades to "no
+1. **No config means nothing is allowed.** A missing or misnamed file can only ever make the scan
+   *stricter*.
+2. **The config must be TRACKED.** A `.leakguard.json` that is gitignored, or simply never added,
+   is refused — because the whole justification for injecting the allowances is that they become
+   reviewable, and a file nobody can see in the repository governs every local scan while
+   `git status` stays empty. `--config <path>` is exempt from that rule: it is written out in the
+   invocation, which is the visibility that matters.
+3. **A config this scanner cannot understand STOPS the scan** (exit 2) — it never degrades to "no
    config". An unknown key, a missing `why`, a regex that will not compile, a `--config` path that
    does not exist: all errors. A silently ignored rule is worse than no rule, because a clean
-   verdict looks identical either way.
-3. **A config that would gut the guard is refused.** Applying your allowances must not stop any of
-   the engine's own deny cases being caught. Without that check, `{"literal": "192.168."}` would
-   turn a whole pattern off across your tree while CI stayed green. What it does *not* catch is
-   written down beside it in the code: the corpus holds one sample per pattern, so single real
-   values can still be allowed one explicit, justified line at a time.
-4. **The guard skips at most one file — its own source — and only when it is genuinely inside the
-   repository being scanned.** An installed guard lives in `site-packages`, which is not inside
-   your repository, so it exempts *nothing* there. (Earlier versions fell back to a hardcoded
-   `scripts/check_no_internal_info.py`, which silently exempted whatever a repository happened to
-   keep at that path — the path every repository in this fleet vendored its copy at.)
+   verdict looks identical either way. (A UTF-8 BOM is fine — Windows editors write them.)
+4. **A config that would gut the guard is refused.** Applying your allowances must not stop any of
+   the engine's own deny cases being caught, on any of the three surfaces (content, paths,
+   messages) or on any ordinary path. So an `allow_literals` entry as wide as a pool root — the
+   `/mnt/<pool>` prefix itself, spelled out — is refused, and so is any `path_exempt` regex wide
+   enough to match an ordinary file: `.`, `.+`, `.*`, `(tests/fixtures/)?`. A scoped one such as
+   `^tests/fixtures/` is accepted and honoured. (This paragraph cannot show you the refused
+   literal, for the reason the placeholder section below explains: the guard scans this file.) What
+   the check does *not* catch is written down beside it in the code: the corpus holds one sample
+   per pattern, so single real values can still be allowed one explicit, justified line at a time.
+5. **The guard skips at most one file: its own source, recognised as its own.** Either it is
+   literally this file (the guard is vendored inside the repository being scanned), or the file's
+   *bytes* are the running guard's own bytes. Nothing else can claim that, and no config can widen
+   it — change one character of the guard's source and it is scanned like any other file.
+   (Earlier versions fell back to a hardcoded `scripts/check_no_internal_info.py`, which silently
+   exempted whatever a repository happened to keep at that path — the path every repository in
+   this fleet vendored its copy at.)
 
 This repository's own `.leakguard.json` is the worked example, and the test suite reads the real
-file rather than a fixture so that a broken config here fails a test here.
+file rather than a fixture so that a broken config here fails a test here. Note what it does
+**not** contain: any `path_exempt` entry for the engine's own source. The first version of it
+excused all eight patterns on that one path, which is a whole-file skip written in data — a real
+leak appended to the engine's source passed. Property 5 is what replaced it.
 
 ### This repository is PUBLIC
 
