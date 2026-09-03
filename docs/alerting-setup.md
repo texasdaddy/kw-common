@@ -109,8 +109,10 @@ version:
   URL**, never a bare topic name.
 * **a dedicated topic** — optional, one service, `NTFY_URL_<SERVICE>`. It wins over the shared
   topic and turns the title prefix off, because the topic is already the identifier. The key is
-  the service name upper-cased with each RUN of non-alphanumeric characters replaced by a single
-  `_` and the ends trimmed, so `backup-agent` is `NTFY_URL_BACKUP_AGENT`. There is exactly one
+  the service name upper-cased with each RUN of characters that are not an **ASCII** letter or
+  digit replaced by a single `_` and the ends trimmed, so `backup-agent` is
+  `NTFY_URL_BACKUP_AGENT`, `feed--poller` is `NTFY_URL_FEED_POLLER` (a run becomes ONE `_`), and
+  `café-poller` is `NTFY_URL_CAF_POLLER` (an accented letter is not an ASCII letter). There is exactly one
   spelling: a key spelled any other way is ignored and the service quietly lands back on the
   shared topic. A service may not be named `dev` or `prod` — that would derive a shared
   environment key — and `kw_common.alerting_env.ntfy_key("<service>")` returns the answer if you

@@ -2,9 +2,10 @@
 needed.
 
 These travel with the module for the same reason every other suite here does: a behaviour that is
-not tested here becomes six untested copies the moment it ships. That is not rhetorical for this
-package — the whole reason it exists is that five container templates declared five different
-shapes of alerting variable, each of which was somebody's reasonable reading of the same prose.
+not tested here becomes an untested copy in every consumer the moment it ships. That is not
+rhetorical for this package — the whole reason it exists is that a set of container templates each
+declared a different shape of alerting variable, every one of them somebody's reasonable reading
+of the same prose.
 
 ⭐ WHAT THIS FILE IS ADVERSARIAL ABOUT. Three properties are easy to write a test that CANNOT
 fail, and each of them is the one that matters:
@@ -37,6 +38,7 @@ from kw_common.alerting_env import (
     CONFIG_PATH_VAR,
     CONFIG_RELPATH,
     DEPLOY_ENV_VAR,
+    ENVIRONMENTS,
     MARKER_NAME,
     SHARED_ROOT_VAR,
     AlertEnvError,
@@ -345,7 +347,7 @@ def test_the_manifest_is_case_insensitive_the_same_way() -> None:
 
 
 def test_the_manifest_requires_the_email_block_and_leaves_smtp_user_optional() -> None:
-    """⭐ THE MANIFEST IS OWNED HERE, so this is the test that stops six apps disagreeing about
+    """⭐ THE MANIFEST IS OWNED HERE, so this is the test that stops apps disagreeing about
     what prod requires. `SMTP_USER` is deliberately NOT in it — it defaults to `EMAIL_FROM`."""
     for env in ("dev", "prod"):
         keys = required_keys(env)
@@ -1409,40 +1411,79 @@ def test_a_port_only_fault_does_not_claim_the_alerts_would_go_nowhere(tmp_path: 
         validate_boot(settings, "prod", tmp_path / "app3", alerter=Alerter(settings))
 
 
-def test_the_templates_OWN_transform_examples_are_checked_against_the_code() -> None:
-    """⭐⭐ THE DOCUMENTATION DEFECT THAT NOTHING COULD CATCH, TURNED INTO SOMETHING THAT CAN.
+def _stated_mappings(text: str) -> list[tuple[str, str]]:
+    """Every `service -> NTFY_URL_KEY` mapping a document states, in either form it uses.
 
-    The `NTFY_URL_<SERVICE>` rule is stated in three places and two of them described a
-    PER-CHARACTER substitution, while the code collapses a RUN and trims the ends. Every published
-    example happened to fall in the set where the two agree, so it read plausibly — and an
-    operator with a doubled or trailing separator would have written a key the loader never looks
-    up and landed on the shared topic, with a prefix, silently.
-
-    Prose cannot be tested. EXAMPLES can, so the template now carries examples that exercise a run
-    and a trailing separator, and this reads them out of the shipped file and asks the code.
+    The template writes them as an arrow table; the prose files write them as "`x` is `NTFY_URL_X`".
+    Both are read, because a mapping is a mapping wherever an operator finds it.
     """
     import re as _re
 
-    examples = _re.findall(r'service "([^"]+)"\s*->\s*(NTFY_URL_\S+)',
-                           TEMPLATE.read_text(encoding="utf-8"))
-    assert len(examples) >= 4, (
-        f"the template shows {len(examples)} transform example(s); it needs enough to cover a "
-        f"plain name, a hyphen, a RUN of separators and a trailing one")
-    for service, key in examples:
-        assert ntfy_key(service) == key, (
-            f"the template tells an operator that {service!r} is {key}, but the loader looks up "
-            f"{ntfy_key(service)}")
-    # ⭐ AND THE EXAMPLES MUST DISTINGUISH THE RIGHT RULE FROM THE WRONG ONE. Every previously
-    # published example fell in the set where per-character and per-run substitution AGREE, which
-    # is exactly why the wrong wording read plausible for two rounds. Compute what the wrong rule
-    # would produce and require at least one example where the two differ.
+    arrow = _re.findall(r'service "([^"]+)"\s*->\s*(NTFY_URL_[A-Z0-9_]+)', text)
+    prose = _re.findall(r"`([^`\s]+)`\s+(?:is|derives)\s+`?(NTFY_URL_[A-Z0-9_]+)`?", text)
+    return [*arrow, *prose]
+
+
+def test_EVERY_transform_mapping_this_package_publishes_is_checked_against_the_code() -> None:
+    """⭐⭐ THE DOCUMENTATION DEFECT THAT NOTHING COULD CATCH, TURNED INTO SOMETHING THAT CAN.
+
+    The `NTFY_URL_<SERVICE>` rule is stated in four places, and a correction reached ONE of them:
+    the others went on describing a PER-CHARACTER substitution while the code collapses a RUN and
+    trims the ends. Every example published at the time fell in the set where the two agree, so it
+    read plausibly — and an operator with a doubled or trailing separator would have written a key
+    the loader never looks up and landed on the shared topic, with a prefix, silently. That is the
+    exact failure the sentence itself warns about, produced by the sentence.
+
+    ⚠️ SCOPE, STATED HONESTLY: prose cannot be tested and this does not try. It checks every
+    MAPPING — the concrete `x -> KEY` claims an operator actually copies — in every file this
+    package ships, which is the part that is machine-checkable. A first version read the template
+    ALONE, and the whole finding was that fixing one file is not fixing the class.
+    """
+    import re as _re
+
+    sources = {
+        "alerting.env.template": TEMPLATE.read_text(encoding="utf-8"),
+        "docs/alerting-setup.md": SETUP_DOC.read_text(encoding="utf-8"),
+        "CHANGELOG.md": (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8"),
+        "README.md": (REPO_ROOT / "README.md").read_text(encoding="utf-8"),
+        "src/kw_common/alerting_env.py": MODULE_PATH.read_text(encoding="utf-8"),
+    }
+    checked = 0
+    for name, text in sources.items():
+        for service, key in _stated_mappings(text):
+            checked += 1
+            # ⚠️ A MAPPING FOR A RESERVED NAME IS A DIFFERENT CLAIM. The documents say `prod`
+            # "derives NTFY_URL_PROD" while EXPLAINING WHY such a name is refused — it is the
+            # reason for the rule, not a key anyone should write. Asserting equality there would
+            # have failed on correct prose; asserting the REFUSAL turns the false positive into
+            # coverage of the other half of the same rule.
+            if service.strip().lower() in ENVIRONMENTS:
+                with pytest.raises(AlertEnvError, match="environment"):
+                    ntfy_key(service)
+                continue
+            assert ntfy_key(service) == key, (
+                f"{name} tells a reader that {service!r} is {key}, but the loader looks up "
+                f"{ntfy_key(service)} — so a service named that would land on the SHARED topic "
+                f"and never be found")
+    assert checked >= 6, (
+        f"only {checked} stated mapping(s) were found across {len(sources)} files — the "
+        f"extraction has stopped matching how these documents write them, which would make this "
+        f"test pass over anything")
+
+    # ⭐ AND THE TEMPLATE'S EXAMPLES MUST DISTINGUISH THE RIGHT RULE FROM THE WRONG ONE. Every
+    # example published before this fell in the set where per-character and per-run substitution
+    # AGREE, which is exactly why the wrong wording read plausible for two rounds. Compute what the
+    # wrong rule would produce and require the template to carry a case where the two differ.
     def per_character(service: str) -> str:
         return "NTFY_URL_" + _re.sub(r"[^A-Za-z0-9]", "_", service).upper()
 
-    distinguishing = [s for s, _ in examples if ntfy_key(s) != per_character(s)]
-    assert distinguishing, (
-        "no example separates the per-RUN rule from the per-CHARACTER one, so this test would "
-        "have passed on the wording that was wrong. Add a name with a doubled or trailing "
+    template_examples = _stated_mappings(sources["alerting.env.template"])
+    assert len(template_examples) >= 4, (
+        f"the template shows {len(template_examples)} transform example(s); it needs enough to "
+        f"cover a plain name, a hyphen, a RUN of separators and a trailing one")
+    assert [s for s, _ in template_examples if ntfy_key(s) != per_character(s)], (
+        "no template example separates the per-RUN rule from the per-CHARACTER one, so this test "
+        "would have passed on the wording that was wrong. Add a name with a doubled or trailing "
         "separator.")
 
 

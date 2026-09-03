@@ -185,7 +185,7 @@ def normalise_env(value: object) -> str:
     """`DEPLOY_ENV` as this library uses it: stripped and lowercased, or a refusal.
 
     ⭐ NORMALISED HERE, INSIDE THE LIBRARY, so `Prod`, `PROD` and `prod` cannot behave differently
-    across apps. Six repositories each lowercasing at their own call site is six chances to forget
+    across apps. Every consumer lowercasing at its own call site is one more chance to forget
     one, and the symptom of forgetting is not an error — it is a service that looks up
     `NTFY_URL_PROD` in a file whose key is `NTFY_URL_PROD` and finds it, right up until one app
     spells it `Prod` and silently lands on no topic at all.
@@ -222,10 +222,15 @@ def ntfy_key(service: str) -> str:
     operator happened to type, and a service reading the wrong one lands on the SHARED topic with
     a prefix it should not have: a change nobody sees until an alert arrives looking different.
 
-    Precisely: a RUN of non-alphanumeric characters becomes ONE underscore and the ends are
-    trimmed, so `a.b-c` is `NTFY_URL_A_B_C` rather than `A_B__C`. Non-ASCII letters are among the
-    characters that are replaced, so an accented or non-Latin name reduces to its ASCII parts —
-    stated because it is surprising, and refused outright when nothing is left.
+    Precisely: a RUN of characters that are not ASCII letters or digits becomes ONE underscore and
+    the ends are trimmed, so `feed--poller` is `NTFY_URL_FEED_POLLER` rather than `FEED__POLLER`,
+    and `poller-` is `NTFY_URL_POLLER`.
+
+    ⚠️ ASCII, and the word is load-bearing. A letter with an accent is NOT a letter here:
+    `café-poller` derives `NTFY_URL_CAF_POLLER`, not `CAFE_` or `CAFÉ_`. Stated because it is
+    surprising, and because guessing it wrong lands the service back on the shared topic
+    SILENTLY — the whole failure this rule exists to prevent. A name with no ASCII letters or
+    digits at all is refused outright rather than reduced to nothing.
 
     ⛔ AND A SERVICE MAY NOT DERIVE A RESERVED ENVIRONMENT KEY. A service literally named `dev` or
     `prod` would otherwise read `NTFY_URL_DEV`/`NTFY_URL_PROD` — keys the fleet-shared file always
@@ -248,9 +253,10 @@ def ntfy_key(service: str) -> str:
     # configuration that was fine is the worse error of the two, and the suite caught it.
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in service.strip()):
         raise _refuse(
-            f"service={service!r} contains a control character. It would reach the ntfy Title "
-            f"header and the mail Subject, both of which refuse one, so every alert on every "
-            f"channel would fail.")
+            f"service={service!r} contains a control character. It would be carried into the "
+            f"alert title prefix, and from there into an HTTP header and a mail Subject — a "
+            f"newline or a carriage return is refused outright by both, and the rest travel as "
+            f"junk in every alert you receive. A service name is not the place for one.")
     stem = _NON_KEY_CHARS.sub("_", service.strip()).strip("_").upper()
     if not stem:
         raise _refuse(
@@ -662,9 +668,6 @@ def _check_usable(settings: AlertSettings, config: Path) -> None:
         dead.append(
             "the email settings are present but unusable — the process log line above names "
             "which one, and SMTP_USER defaults to EMAIL_FROM only when that is a bare mailbox")
-    # ⭐ `smtp_port_fault` EXISTS FOR EXACTLY THIS CALL — pure, logs nothing, sends nothing,
-    # and documented as the way to ask "is this port acceptable" at BOOT rather than by provoking
-    # a send-time ERROR that logs on every notification and pages on none.
     if settings.ntfy_url and settings.title_prefix:
         # ⭐ ASKED ONLY WHEN ntfy IS CONFIGURED, and that scoping is the point. `http.client`
         # encodes a header value as LATIN-1, so a prefix carrying (say) a currency sign fails every
@@ -679,6 +682,9 @@ def _check_usable(settings: AlertSettings, config: Path) -> None:
                 "the alert title prefix contains a character ntfy's Title header cannot carry "
                 "(it is encoded latin-1), so every ntfy send would fail — the prefix is built "
                 "from the service name, so rename the service or give it its own topic")
+    # ⭐ `smtp_port_fault` EXISTS FOR EXACTLY THIS CALL — pure, logs nothing, sends nothing,
+    # and documented as the way to ask "is this port acceptable" at BOOT rather than by provoking
+    # a send-time ERROR that logs on every notification and pages on none.
     fault = smtp_port_fault((cfg.email or {}).get("SMTP_PORT", ""))
     if fault:
         dead.append(f"SMTP_PORT is unusable: {fault}")

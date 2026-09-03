@@ -83,8 +83,9 @@ knowledge lives in a **sibling module** instead.
   the retrievable error record and the process log line all keep the RAW title, so promoting a
   service from dev to prod does not re-page every escalating condition it had already reported.
 - **`NTFY_URL_<SERVICE>` has exactly one spelling**: the service name upper-cased, with each RUN
-  of non-alphanumeric characters replaced by a SINGLE `_` and the ends dropped — so `backup-agent`
-  is `NTFY_URL_BACKUP_AGENT` and `feed--poller` is `NTFY_URL_FEED_POLLER`, not `FEED__POLLER`. A
+  of characters that are not an ASCII letter or digit replaced by a SINGLE `_` and the ends
+  dropped — so `backup-agent` is `NTFY_URL_BACKUP_AGENT`, `feed--poller` is `NTFY_URL_FEED_POLLER`
+  rather than `FEED__POLLER`, and `café-poller` is `NTFY_URL_CAF_POLLER`. A
   key spelled any other way is never looked up and the service quietly lands back on the shared
   topic with a prefix it should not have. `alerting_env.ntfy_key(service)` returns the answer, and
   the template's worked examples are checked against it by a test rather than by proofreading.
