@@ -220,10 +220,10 @@ warning you about it. Ask the guard instead of guessing — if a placeholder is 
 `_MUST_PASS`, check it before committing:
 
 ```
-python scripts/check_no_internal_info.py --selftest
+kw-leak-guard --selftest
 ```
 
 ```
-python -c "import sys; sys.path.insert(0,'scripts'); import check_no_internal_info as g; \
+python -c "from kw_common import leakguard as g; \
 print(g.scan_text('YOUR PLACEHOLDER HERE', g.compile_patterns()) or 'allowed')"
 ```
