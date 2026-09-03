@@ -12,8 +12,8 @@ So the deployment knowledge lives HERE, in a sibling, and the split is the desig
     alerting        given settings, deliver a notification. Knows nothing about deployments.
     alerting_env    turn ONE shared file plus THREE variables into those settings.
 
-An app imports both. An app that is not in this deployment — a consumer elsewhere, or Keystone
-later reading its configuration out of a database — imports only the first, calls
+An app imports both. An app that is not in this deployment — a consumer elsewhere, or a service
+that later reads its configuration out of a database — imports only the first, calls
 `load_alert_settings(...)` with explicit arguments, or builds an `AlertSettings` by hand.
 
 ⭐ THE POINT OF THE PACKAGE: THE CONVENTION IS A FUNCTION SIGNATURE, NOT PROSE.
@@ -81,10 +81,12 @@ from pathlib import Path
 
 from .alerting import (
     OK,
+    AlertConfig,
     Alerter,
     AlertSettings,
     _parse_env_text,
     current_alerter,
+    smtp_port_fault,
 )
 
 __all__ = [
@@ -96,6 +98,7 @@ __all__ = [
     "DEPLOY_ENV_VAR",
     "CONFIG_RELPATH",
     "MARKER_NAME",
+    "marker_name",
     "ENVIRONMENTS",
     # the manifest
     "EMAIL_REQUIRED_KEYS",
@@ -188,43 +191,64 @@ def normalise_env(value: object) -> str:
     spells it `Prod` and silently lands on no topic at all.
     """
     if not isinstance(value, str):
-        raise AlertEnvError(
+        raise _refuse(
             f"{DEPLOY_ENV_VAR} must be a string naming one of {', '.join(ENVIRONMENTS)} — "
             f"got {type(value).__name__}")
     env = value.strip().lower()
     if env not in ENVIRONMENTS:
-        raise AlertEnvError(
+        raise _refuse(
             f"{DEPLOY_ENV_VAR}={value!r} is not one of {', '.join(ENVIRONMENTS)}. It is "
             f"case-insensitive, so 'Prod' and 'PROD' are fine; anything else is refused rather "
             f"than guessed, because guessing selects the WRONG ntfy topic and nothing says so.")
     return env
 
 
-# Everything that is not a letter or a digit collapses to a single `_`. Service names in this
-# fleet are hyphenated (`reauth-bot`, `cef-tracker`) and a hyphen cannot appear in an environment
-# key, so SOME transform is unavoidable — and an unavoidable transform that is not written down is
-# where two repositories silently disagree.
+# A RUN of characters that are not a letter or a digit collapses to a SINGLE `_`, and leading and
+# trailing ones are dropped. Service names are commonly hyphenated and a hyphen cannot appear in an
+# environment key, so SOME transform is unavoidable — and an unavoidable transform that is not
+# written down is where two repositories silently disagree.
 _NON_KEY_CHARS = re.compile(r"[^A-Za-z0-9]+")
+
+# The keys the shared file reserves for the ENVIRONMENT topics. A service whose name derives one of
+# these would read a shared topic as though it were its own private one.
+_RESERVED_KEYS = frozenset(f"NTFY_URL_{env.upper()}" for env in ENVIRONMENTS)
 
 
 def ntfy_key(service: str) -> str:
     """The per-service override key for `service`: `NTFY_URL_` + its name, upper-cased.
 
-    ⚠️ ONE RULE, NO CANDIDATES. `reauth-bot` is `NTFY_URL_REAUTH_BOT` — not `NTFY_URL_REAUTH`, not
+    ⚠️ ONE RULE, NO CANDIDATES. `feed-poller` is `NTFY_URL_FEED_POLLER` — not `NTFY_URL_FEED`, not
     both. Accepting several spellings would make the file's meaning depend on which one an
     operator happened to type, and a service reading the wrong one lands on the SHARED topic with
     a prefix it should not have: a change nobody sees until an alert arrives looking different.
 
-    The setup document and `alerting.env.template` print this rule; `config_file_for` and the
-    loader are the only things that apply it.
+    Precisely: a RUN of non-alphanumeric characters becomes ONE underscore and the ends are
+    trimmed, so `a.b-c` is `NTFY_URL_A_B_C` rather than `A_B__C`. Non-ASCII letters are among the
+    characters that are replaced, so an accented or non-Latin name reduces to its ASCII parts —
+    stated because it is surprising, and refused outright when nothing is left.
+
+    ⛔ AND A SERVICE MAY NOT DERIVE A RESERVED ENVIRONMENT KEY. A service literally named `dev` or
+    `prod` would otherwise read `NTFY_URL_DEV`/`NTFY_URL_PROD` — keys the fleet-shared file always
+    carries — as its own dedicated override: the wrong topic, no title prefix, and a validation
+    alert announcing it is "on its own ntfy topic". Refused at the only moment anyone can act on it.
+
+    The setup document and `alerting.env.template` print this rule; the loader is the only thing
+    that applies it.
     """
     if not isinstance(service, str) or not service.strip():
-        raise AlertEnvError("service must be a non-blank name")
+        raise _refuse("service must be a non-blank name")
     stem = _NON_KEY_CHARS.sub("_", service.strip()).strip("_").upper()
     if not stem:
-        raise AlertEnvError(
-            f"service={service!r} has no letters or digits, so it cannot name a config key")
-    return f"NTFY_URL_{stem}"
+        raise _refuse(
+            f"service={service!r} has no ASCII letters or digits, so it cannot name a config key")
+    key = f"NTFY_URL_{stem}"
+    if key in _RESERVED_KEYS:
+        raise _refuse(
+            f"service={service!r} derives {key}, which is the shared {stem.lower()} environment "
+            f"topic rather than a per-service override. A service cannot be named after an "
+            f"environment: it would read the shared topic as its own and lose its title prefix. "
+            f"Rename the service.")
+    return key
 
 
 def config_file_for(shared_root: str | os.PathLike[str]) -> Path:
@@ -260,20 +284,30 @@ def read_config(config_path: str | os.PathLike[str]) -> dict[str, str]:
         with open(path, encoding="utf-8", newline="") as fh:
             raw = fh.read()
     except FileNotFoundError as exc:
-        raise AlertEnvError(
+        raise _refuse(
             f"the shared alerting config {path} does not exist. It is the file every service in "
             f"the fleet reads; see the setup document for how to create it.") from exc
     except OSError as exc:
-        raise AlertEnvError(
+        raise _refuse(
             f"the shared alerting config {path} could not be read ({type(exc).__name__}: {exc}). "
             f"If the mount is read-only that is expected and fine — this is a READ.") from exc
-    except ValueError as exc:
-        # UnicodeDecodeError lands here. Named in the message because "not UTF-8" is a thing an
-        # operator can act on immediately and "ValueError" is not.
-        raise AlertEnvError(
+    except UnicodeDecodeError as exc:
+        # Named in the message because "not UTF-8" is a thing an operator can act on immediately
+        # and "ValueError" is not.
+        raise _refuse(
             f"the shared alerting config {path} is not UTF-8 text ({type(exc).__name__}). A file "
             f"saved as cp1252 or UTF-16 by a desktop editor reads like this; save it as UTF-8.",
         ) from exc
+    except ValueError as exc:
+        # ⚠️ CAUGHT SEPARATELY FROM THE DECODE ERROR, AND THE DIAGNOSIS IS THE WHOLE POINT.
+        # `UnicodeDecodeError` IS a `ValueError`, so one combined branch reported an embedded NUL
+        # in the PATH — which `open()` rejects with a plain `ValueError` — as "the file is not
+        # UTF-8 text". The right refusal, pointing the wrong way: an operator would go looking at
+        # the file's encoding for a fault in the variable that named it.
+        raise _refuse(
+            f"the shared alerting config path {path!r} is not a usable path "
+            f"({type(exc).__name__}: {exc}). Check the {SHARED_ROOT_VAR} value — this is a fault "
+            f"in the path itself, not in the file's contents.") from exc
     return _parse_env_text(raw)
 
 
@@ -315,6 +349,13 @@ def load_alert_settings(config_path: str | os.PathLike[str], deploy_env: str,
     """
     env = normalise_env(deploy_env)
     key = ntfy_key(service)          # validates `service` before anything else is read
+    # ⭐ NORMALISED ONCE, HERE, AND USED EVERYWHERE BELOW. `AlertSettings` strips the service name
+    # in its own constructor, so building the prefix from the RAW argument produced two different
+    # spellings of the same service — and the prefix is the one that reaches an HTTP header and a
+    # mail Subject, so a name carrying a newline killed every channel while the settings object
+    # looked clean. Two normalisations of one value, disagreeing, is the shape this library keeps
+    # having to fix; one is the fix.
+    service = service.strip()
     values = read_config(config_path)
 
     override = values.get(key, "").strip()
@@ -358,7 +399,7 @@ def _require_env(name: str) -> str:
     """
     value = os.environ.get(name)
     if value is None:
-        raise AlertEnvError(
+        raise _refuse(
             f"{name} is not set. Every app in this fleet declares {SHARED_ROOT_VAR}, "
             f"{CONFIG_PATH_VAR} and {DEPLOY_ENV_VAR}; there is no default for any of them, "
             f"because a default would point at the wrong deployment silently.")
@@ -366,7 +407,7 @@ def _require_env(name: str) -> str:
         # A container platform passes an unset Variable as an EMPTY STRING, so blank is the
         # common way this arrives — and treating blank as "set" is how a template with the
         # variable declared but never filled in reads as configured.
-        raise AlertEnvError(
+        raise _refuse(
             f"{name} is set to an empty value, which is what an unfilled container Variable "
             f"looks like. Give it a value or remove it; blank is not a default.")
     return value.strip()
@@ -388,6 +429,23 @@ def load_alert_settings_from_env(service: str) -> AlertSettings:
 
 
 # --- boot validation -----------------------------------------------------------------------------
+def marker_name(deploy_env: str) -> str:
+    """The marker filename for `deploy_env` — `.alerting-validated-<env>`.
+
+    ⭐⭐ PER ENVIRONMENT, AND THAT IS A FIX RATHER THAN A FLOURISH. With ONE marker for every
+    environment, promoting a service dev -> prod — a routine operation that does not touch the
+    fleet-shared file — left the marker still newer than the config, so validation NEVER RAN in the
+    new environment. `NTFY_URL_PROD` was never checked; the service came up with an empty topic
+    URL and did not refuse. Measured exactly that way.
+
+    The environment is what the check is ABOUT — `required_keys` differs per environment and so
+    does the topic — so "this configuration has been validated" is not a fact about the file alone.
+    An empty marker in `CONFIG_PATH` compared by timestamp is still exactly what the standard
+    specifies; it constrains neither the filename nor the count.
+    """
+    return f"{MARKER_NAME}-{normalise_env(deploy_env)}"
+
+
 def _marker_is_fresh(marker: Path, config: Path) -> bool:
     """Whether the marker post-dates the config file, i.e. this boot may skip validation.
 
@@ -414,42 +472,59 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
     it skipped because the marker is newer than the config file. Raises `AlertEnvError` on any
     failure — the caller's `main()` is expected to let that stop the process.
 
-    `marker_dir` is the app's OWN read-write directory: the `CONFIG_PATH` variable. The marker is
-    never written into the shared root, which is mounted read-only and is not this app's to write.
+    `marker_dir` is the directory the marker is written to, and it must be the app's OWN
+    read-write directory — the `CONFIG_PATH` variable. ⚠️ That is a REQUIREMENT ON THE CALLER, not
+    something this function can enforce: point it at the shared root and it will try to write
+    there, and the shared root is mounted read-only precisely so that fails.
 
     `shared_root`, when given, is checked to be a directory — that is the "is the mount actually
     there" question, and it is worth asking separately because a missing MOUNT and a missing FILE
     send an operator to different places.
 
     `alerter` is the `Alerter` the success notification goes through; `None` uses the process
-    default installed by `alerting.configure()`.
+    default installed by `alerting.configure()`. With NO alerter available the marker is NOT
+    written, so the confirmation is not lost — see `_announce`.
 
     ⛔ A FAILURE NEVER NOTIFIES. Not once, not "best effort". Every path below that raises has
     logged first and sent nothing: the channel being validated is the one that would carry the
     report, so an attempt to alert about it either goes nowhere or, worse, appears to succeed.
+
+    ⚠️ WHAT THE MARKER CANNOT SEE, stated because a check that implies coverage it lacks is worse
+    than none: a config file RESTORED at an older timestamp — `rsync -a`, `cp -p`, `tar -x`, a
+    volume restore, all of which preserve mtime — leaves the marker still newer, so a file that
+    changed is not re-validated. The standard specifies an empty marker and a timestamp
+    comparison, and that is the limit of what a timestamp can answer; recording the config's own
+    digest would close it and is a different design. Filed rather than papered over.
     """
     env = normalise_env(deploy_env)
     config = Path(settings.config_file) if settings.config_file else None
     if config is None:
-        raise AlertEnvError(
+        raise _refuse(
             "these settings carry no config_file, so there is nothing to validate. Build them "
             "with load_alert_settings() or load_alert_settings_from_env().")
 
-    marker = Path(marker_dir) / MARKER_NAME
+    marker = Path(marker_dir) / marker_name(env)
     if _marker_is_fresh(marker, config):
-        log.info("alerting: configuration validated on an earlier boot (%s is newer than %s); "
-                 "skipping. Touch or edit the config file to force a re-check.", marker, config)
+        log.info("alerting: %s configuration validated on an earlier boot (%s is newer than %s); "
+                 "skipping. Touch or edit the config file to force a re-check.",
+                 env, marker, config)
         return False
 
     _check_layout(config, shared_root)
     values = read_config(config)          # raises AlertEnvError, having named the reason
     _check_required(values, env, config)
+    _check_usable(settings, config)
 
     # ⭐ ALERT FIRST, MARKER SECOND, in that order. A crash between the two re-validates and
     # re-alerts on the next boot; the reverse order would mark a boot validated whose alert never
     # left, which is silence — the one failure this whole standard exists to prevent.
-    _announce(settings, env, values, config, alerter)
-    _write_marker(marker)
+    if not _announce(settings, env, values, config, alerter):
+        # ⛔ AND NO ALERTER IS THAT SAME FAILURE, so the marker is withheld. Writing it anyway
+        # recorded the boot as validated with the confirmation never sent — and then no LATER boot
+        # would send one either, because the marker suppresses them, so the proof was lost until
+        # somebody edited the file. The next boot after `configure()` validates and announces.
+        return True
+    _write_marker(marker, config)
     return True
 
 
@@ -469,46 +544,129 @@ def validate_boot_from_env(settings: AlertSettings, *,
                          shared_root=shared_root, alerter=alerter)
 
 
+def _refuse(message: str) -> AlertEnvError:
+    """Log the refusal, then hand back the exception for the caller to `raise`.
+
+    ⭐ THE LOG IS PART OF THE CONTRACT, NOT DECORATION. The standard says a failure "logs loudly
+    and refuses to boot", and the README, the CHANGELOG and this module's own docstrings all say
+    "logs and raises". Before this existed the raising half was true and the logging half was not:
+    `read_config`, `_check_layout` and `_check_required` all raised having emitted NOTHING. An
+    adopter that catches `AlertEnvError` to print its own one-liner then had no record of which
+    check failed anywhere.
+
+    Returned rather than raised so every call site still reads `raise _refuse(...)` — the control
+    flow stays visible at the point it happens, and a function that raises from inside a helper is
+    exactly the shape that makes a traceback point at the wrong line.
+    """
+    log.error("alerting: refusing to boot — %s", message)
+    return AlertEnvError(message)
+
+
 def _check_layout(config: Path, shared_root: str | os.PathLike[str] | None) -> None:
     """The mount and the structure, asked as separate questions from "is the file readable"."""
     if shared_root is not None:
         root = Path(shared_root)
         if not root.is_dir():
-            raise AlertEnvError(
+            raise _refuse(
                 f"the shared root {root} is not a directory. In a container this is a MOUNT: it "
                 f"reads like this when the volume was never added to the template, or was added "
                 f"with a host path that does not exist.")
     parent = config.parent
     if not parent.is_dir():
-        raise AlertEnvError(
+        raise _refuse(
             f"{parent} does not exist, so the shared root is mounted but its structure is not "
             f"there. The shared root must contain {CONFIG_RELPATH!r} — see the setup document.")
 
 
+# ⭐ THE ONE PLACEHOLDER MARKER, AND IT IS DELIBERATELY NOT `example.com`.
+# `alerting.env.template` asserts that a file left as-is will refuse to boot, and before this the
+# claim was FALSE: every placeholder is non-blank, so the untouched template validated, announced
+# that the configuration "checks out", and wrote the marker — so no later boot re-validated
+# either. The key it mattered most for is `SMTP_PASSWORD`, the one most likely to survive an edit
+# pass.
+#
+# ⛔ REFUSING `example.com` INSTEAD WOULD BE THE OBVIOUS FIX AND IT IS THE WRONG ONE. The reserved
+# documentation domains are this repository's APPROVED synthetic vocabulary — its leak guard's own
+# must-pass corpus is built from them and every fixture in the suite uses them — so a check that
+# refused them would refuse the very values the internal-info rules require. One unmistakable
+# marker, spelled in the template, is the version that cannot collide.
+_PLACEHOLDER = "CHANGE-ME"
+
+
 def _check_required(values: dict[str, str], env: str, config: Path) -> None:
-    """Every key this environment requires carries a non-blank value."""
-    missing = [k for k in required_keys(env) if not values.get(k, "").strip()]
+    """Every key this environment requires carries a real value — not blank, not a placeholder."""
+    required = required_keys(env)
+    missing = [k for k in required if not values.get(k, "").strip()]
     if missing:
         # ⭐ NAMES ONLY, NEVER VALUES. One of these keys is the SMTP password, and this message is
         # the line an operator pastes into a bug report.
-        raise AlertEnvError(
+        raise _refuse(
             f"{config} is missing or blank for: {', '.join(missing)}. Those are the keys "
             f"{env!r} requires; {', '.join(OPTIONAL_KEYS)} are optional. Refusing to boot rather "
             f"than starting a service whose alerts go nowhere.")
+    unfilled = [k for k in required
+                if values.get(k, "").strip().upper().startswith(_PLACEHOLDER)]
+    if unfilled:
+        raise _refuse(
+            f"{config} still carries the {_PLACEHOLDER} placeholder for: {', '.join(unfilled)}. "
+            f"That is the template as it ships, not a configuration — fill those in.")
+
+
+def _check_usable(settings: AlertSettings, config: Path) -> None:
+    """Every configured channel is one `alerting` can actually send on.
+
+    ⭐⭐ ASKED OF `alerting`'s OWN READINESS FUNCTIONS, never re-implemented here. A second answer
+    to "is this channel usable" is a second thing to keep in step, and the whole point of this
+    module is to stop two places disagreeing about one convention.
+
+    Why it is worth asking at all: `_check_required` establishes that a key carries a VALUE, and a
+    value is not a working channel. `NTFY_URL_PROD=my-topic` — a bare topic instead of the full
+    URL, and the single likeliest operator typo — is non-blank, so validation used to pass, the
+    confirmation alert went out saying the configuration "checks out", and the ntfy channel was
+    dead the whole time. `validate_boot`'s own refusal text promises "rather than starting a
+    service whose alerts go nowhere"; this is what makes that sentence true.
+    """
+    cfg = AlertConfig.load(settings)
+    dead = []
+    if settings.ntfy_url and not cfg.ntfy_ready():
+        dead.append(
+            "the ntfy URL is set but unusable — it must be the FULL topic URL "
+            "(https://<host>/<topic>), not a bare topic, and it may not carry userinfo")
+    if not cfg.email_ready():
+        dead.append(
+            "the email settings are present but unusable — the process log line above names "
+            "which one, and SMTP_USER defaults to EMAIL_FROM only when that is a bare mailbox")
+    # ⭐ `smtp_port_fault` EXISTS FOR EXACTLY THIS CALL — pure, logs nothing, sends nothing,
+    # and documented as the way to ask "is this port acceptable" at BOOT rather than by provoking
+    # a send-time ERROR that logs on every notification and pages on none.
+    fault = smtp_port_fault((cfg.email or {}).get("SMTP_PORT", ""))
+    if fault:
+        dead.append(f"SMTP_PORT is unusable: {fault}")
+    if dead:
+        raise _refuse(
+            f"{config} parses and carries every required key, but: " + "; ".join(dead) + ". "
+            "Refusing to boot rather than starting a service whose alerts go nowhere.")
 
 
 def _announce(settings: AlertSettings, env: str, values: dict[str, str], config: Path,
-              alerter: Alerter | None) -> None:
-    """The one-time validation alert. Best effort by construction — `notify` never raises."""
+              alerter: Alerter | None) -> bool:
+    """Send the one-time validation alert. Returns whether there was anything to send it through.
+
+    Best effort by construction once an `Alerter` exists — `notify` never raises.
+    """
     target = alerter or current_alerter()
     if target is None:
-        # Not a failure: an app may validate before it configures, or in a test. Say so loudly
-        # enough that "no alert arrived" is explicable, and carry on — the CONFIG is valid, which
-        # is what was asked.
+        # ⛔ NOT A CONFIG FAILURE, BUT NOT A SUCCESS EITHER, AND THE CALLER MUST KNOW. The
+        # configuration IS valid. What is missing is the channel to say so through, and if the
+        # marker were written anyway this boot would be recorded as validated with the
+        # confirmation never sent — after which no later boot would send one either, because the
+        # marker suppresses them. That is the "marked validated, alert never left" state the
+        # ordering comment in `validate_boot` exists to prevent, arrived at from the other side.
         log.warning("alerting: configuration validated, but no Alerter is installed, so the "
-                    "one-time validation alert was NOT sent. Call alerting.configure(settings) "
-                    "before validate_boot(), or pass alerter=.")
-        return
+                    "one-time validation alert was NOT sent and the marker was NOT written — the "
+                    "next boot will validate again. Call alerting.configure(settings) before "
+                    "validate_boot(), or pass alerter=.")
+        return False
     dedicated = bool(values.get(ntfy_key(settings.service), "").strip())
     # ⛔ NO VALUES IN THE BODY. This message goes to email and to a push topic; the file it is
     # describing holds an SMTP password. It says which KEYS were used, never what they hold.
@@ -521,10 +679,53 @@ def _announce(settings: AlertSettings, env: str, values: dict[str, str], config:
         f"This message is the proof that the channel works; it is sent once per configuration "
         f"change, not on every boot.",
     )
+    return True
 
 
-def _write_marker(marker: Path) -> None:
-    """Write the empty marker into the app's own read-write directory.
+def _outrank(marker: Path, config: Path) -> None:
+    """Make the marker's timestamp STRICTLY newer than the config's, if it is not already.
+
+    ⭐⭐ THIS IS NOT TIDINESS — WITHOUT IT THE MARKER NEVER WORKS ON A COARSE FILESYSTEM, AND THE
+    SYMPTOM IS AN ALERT ON EVERY BOOT, FOREVER.
+
+    `_marker_is_fresh` asks whether the marker is STRICTLY newer, and that reading is the correct
+    one: equal timestamps genuinely cannot establish an order, and skipping on a tie would skip a
+    config edit that landed in the same tick. But "write the config, then write the marker" only
+    produces a strictly greater timestamp on a filesystem whose granularity is finer than the gap
+    between the two writes. On one with **one-second** timestamps — an ext4 built with 128-byte
+    inodes, which is what several CI runners' scratch disks are — the two writes land on the SAME
+    second and the marker can never outrank the config. Every boot then re-validates and re-sends
+    the confirmation alert, permanently, until somebody edits the file.
+
+    Measured exactly that way: green on Windows (NTFS, 100 ns) and RED on both Linux jobs, on the
+    same commit, with the second boot returning `True` where it must return `False`.
+
+    So the ordering is ESTABLISHED rather than hoped for. The bump is one second past the config,
+    not "now", because the point is to outrank that file and nothing else — and one second is the
+    smallest step a one-second filesystem would not round away.
+
+    ⚠️ WHAT THIS DOES NOT CATCH, stated rather than implied: a config edit made in the second
+    AFTER a boot is dated no later than the marker, so the next boot skips it and the change is
+    picked up on the boot after that. Any mtime scheme has that window; this makes it one second
+    wide instead of zero. The alternative — recording the config's own digest in the marker — is
+    not what the standard specifies, which is an empty marker and a timestamp comparison.
+    """
+    try:
+        config_mtime = config.stat().st_mtime
+        if marker.stat().st_mtime > config_mtime:
+            return
+        stamp = config_mtime + 1
+        os.utime(marker, (stamp, stamp))
+    except OSError as exc:
+        # Same posture as a failed write: the configuration is valid and has been announced. The
+        # cost of not being able to stamp the marker is a duplicate alert per boot, not an outage.
+        log.warning("alerting: could not date the validation marker %s past %s (%s) — the "
+                    "configuration is valid and was announced, but this boot's marker may not "
+                    "suppress the next one.", marker, config, type(exc).__name__)
+
+
+def _write_marker(marker: Path, config: Path) -> None:
+    """Write the empty marker into the app's own read-write directory, dated past the config.
 
     ⚠️ A FAILURE HERE IS NOT A BOOT FAILURE. The configuration IS valid — that has already been
     established and announced. An unwritable `CONFIG_PATH` costs one redundant validation and one
@@ -539,3 +740,5 @@ def _write_marker(marker: Path) -> None:
                     "is valid and was announced, but every boot will re-validate and re-announce "
                     "until this directory is writable. It is the CONFIG_PATH variable.",
                     marker, type(exc).__name__)
+        return
+    _outrank(marker, config)

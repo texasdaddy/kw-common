@@ -2,8 +2,8 @@
 
 One page, owned once, pointed at from everywhere. Every service that uses `kw_common.alerting_env`
 reads the same shared file and declares the same three variables, so this document is written once
-here rather than copied into each consumer's README — eight prose copies is the same duplication
-problem relocated into documentation.
+here rather than copied into each consumer's README — a prose copy per consumer is the same
+duplication problem relocated into documentation.
 
 **A consumer README carries a short prerequisite block and a link to this page. Never a copy.**
 
@@ -71,16 +71,34 @@ mkdir -p ./configs
 curl -fLo ./configs/alerting.env https://raw.githubusercontent.com/texasdaddy/kw-common/v1.2.0/alerting.env.template
 ```
 
-`-f` makes `curl` fail on an HTTP error rather than writing the error page into your config file;
-`-L` follows the redirect GitHub serves for raw content.
+`-f` makes `curl` fail on an HTTP error rather than writing the error page into your config file —
+measured: on a 404 it exits 22 and creates nothing. `-L` follows a redirect if one is ever served;
+today `raw.githubusercontent.com` answers 200 directly, so the flag costs nothing and covers a
+change you would otherwise discover as a truncated file.
 
 The URL names a **tag**, not a branch, for the same reason a consumer pins a tag: what you download
 today and what you download next month should be the same file unless you chose otherwise.
 
-## 4. Fill it in
+## 4. Restrict it, THEN fill it in
 
-Open `configs/alerting.env` and replace every placeholder. The template documents each key; the
-short version:
+Lock the file down **before** you type a password into it. It holds an SMTP credential, and the
+file arrives from the download world-readable:
+
+```sh
+chmod 600 ./configs/alerting.env
+```
+
+`600` grants the file's **owner** — whoever ran the download — and nobody else. If the account your
+services run as is a different user, `chown` the file to that account (or to a group both are in,
+and use `640`). Getting that wrong is not silent: the service refuses to boot and says the file
+could not be read.
+
+On Windows, open the file's Properties → Security, disable inheritance, and grant only the account
+the services run as.
+
+Now open `configs/alerting.env` and replace every placeholder — including `SMTP_PASSWORD`, which
+ships as `CHANGE-ME` and which boot validation refuses. The template documents each key; the short
+version:
 
 * **email** — `EMAIL_TO`, `EMAIL_FROM`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_PASSWORD` are required.
   `SMTP_USER` is optional and defaults to `EMAIL_FROM`; set it only when the auth identity and the
@@ -89,20 +107,26 @@ short version:
   URL**, never a bare topic name.
 * **a dedicated topic** — optional, one service, `NTFY_URL_<SERVICE>`. It wins over the shared
   topic and turns the title prefix off, because the topic is already the identifier. The key is
-  the service name upper-cased with every non-alphanumeric character replaced by `_`, so
-  `reauth-bot` is `NTFY_URL_REAUTH_BOT`. There is exactly one spelling: a key spelled any other
-  way is ignored and the service quietly lands back on the shared topic.
+  the service name upper-cased with each RUN of non-alphanumeric characters replaced by a single
+  `_` and the ends trimmed, so `backup-agent` is `NTFY_URL_BACKUP_AGENT`. There is exactly one
+  spelling: a key spelled any other way is ignored and the service quietly lands back on the
+  shared topic. A service may not be named `dev` or `prod` — that would derive a shared
+  environment key — and `kw_common.alerting_env.ntfy_key("<service>")` prints the answer if you
+  would rather not derive it by hand.
 
-Then restrict the file. It holds an SMTP password:
+## 5. Set the three variables
 
-```sh
-chmod 600 ./configs/alerting.env
-```
+On the container (or in whatever starts the service), declare exactly:
 
-On Windows, remove inherited access and grant only the account the services run as, from the
-file's Properties → Security dialog.
+| variable | value |
+| --- | --- |
+| `SHARED_ROOT` | the path the shared root is mounted at, **read-only** |
+| `CONFIG_PATH` | a directory the app can WRITE, its own, for the boot marker |
+| `DEPLOY_ENV` | `prod` or `dev` |
 
-## 5. Use it from an app
+None of them has a default. If one is missing or blank the service refuses to boot and names it.
+
+## 6. Use it from an app
 
 ```python
 from dataclasses import replace
@@ -121,23 +145,43 @@ validate_boot_from_env(settings, alerter=alerter)
 ```
 
 `load_alert_settings_from_env` reads `SHARED_ROOT` and `DEPLOY_ENV` and raises `AlertEnvError` if
-either is unset. `validate_boot_from_env` additionally reads `CONFIG_PATH`; it checks the mount,
-the structure, the file and every key this environment requires, then sends **one** confirmation
-alert and writes an empty marker. Later boots skip the check while that marker is newer than the
-config file, so editing the file is what makes the next boot re-validate.
+either is unset. `validate_boot_from_env` additionally reads `CONFIG_PATH` and checks:
+
+* the shared root is mounted and carries `configs/`;
+* the file reads and is UTF-8;
+* every key this environment requires carries a value, and none of them is still `CHANGE-ME`;
+* every configured channel is one the library can actually send on — a bare topic instead of a
+  full ntfy URL, an unusable `SMTP_PORT`, or an `EMAIL_FROM` that is not a plain mailbox all refuse
+  here rather than failing silently on the first real alert.
+
+Then it sends **one** confirmation alert and writes an empty marker into `CONFIG_PATH`. Later boots
+skip the check while that marker is newer than the config file, so editing the file is what makes
+the next boot re-validate. The marker is **per environment**, so promoting a service from `dev` to
+`prod` re-validates even though the shared file did not change.
 
 `state_file` and `error_log` are the app's own paths under its own volume, not fleet settings, so
 they are not in the shared file and the loader has nothing to say about them — hence the
 `replace`.
 
 **Let `AlertEnvError` stop the process.** An app that cannot alert must not come up pretending it
-can, and it must not try to report the problem through the channel that is broken.
+can, and it must not try to report the problem through the channel that is broken. Every refusal is
+logged before it is raised, so the reason is in the process log even if you catch it.
 
-## 6. What good looks like
+## 7. What good looks like
 
-The first boot after any change to `configs/alerting.env` delivers one `[OK] Alerting
-configuration validated` message to email and to the ntfy topic. That message **is** the proof the
-channel works — a channel that never fires is indistinguishable from a broken one.
+The first boot after any change to `configs/alerting.env` delivers one confirmation to email and to
+the ntfy topic, titled:
+
+```
+[OK] [<env>][<service>] Alerting configuration validated
+```
+
+— or without the `[<env>][<service>]` part if that service has its own topic. That message **is**
+the proof the channel works: a channel that never fires is indistinguishable from a broken one.
 
 If it does not arrive, the process log says which of the two channels was skipped and why; nothing
 is silent.
+
+⚠️ One limit worth knowing: the marker is compared by **timestamp**. A config file restored at an
+older timestamp — `rsync -a`, `cp -p`, `tar -x`, a volume restore, all of which preserve mtime —
+leaves the marker still newer, so that change is not re-validated. `touch` the file after a restore.

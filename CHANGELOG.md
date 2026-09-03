@@ -30,11 +30,15 @@ knowledge lives in a **sibling module** instead.
     `DEPLOY_ENV` and **refuses, loudly, when either is unset or blank.** Blank is refused as well
     as absent, because a container platform passes an unfilled Variable as an empty string.
 - **`validate_boot(...)` / `validate_boot_from_env(...)`** — the startup check. It verifies the
-  mount, the structure, that the file is readable, and that every key this environment requires
-  carries a value; on success it sends **one** confirmation alert and writes an empty marker into
-  `CONFIG_PATH`, and later boots skip the check while that marker is newer than the config file.
+  mount, the structure, that the file is readable, that every key this environment requires carries
+  a value that is not still the template's `CHANGE-ME`, and that every configured channel is one
+  the library can actually SEND on. On success it sends **one** confirmation alert and writes an
+  empty marker into `CONFIG_PATH`; later boots skip while that marker is newer than the config
+  file. The marker is **per environment**, so a dev → prod promotion re-validates even though the
+  shared file did not change.
   ⛔ **A failure logs and raises and does not attempt to alert** — it cannot report a broken
-  alerting channel through that channel.
+  alerting channel through that channel. With no `Alerter` installed it validates but does NOT
+  write the marker, so a confirmation that could not be sent is not silently marked as sent.
 - **The required-key manifest, owned here** — `required_keys(deploy_env)`. Otherwise every app
   answers "what does prod require?" independently and they disagree the first time a key is added.
 - **`alerting.env.template`** and **`docs/alerting-setup.md`** — the setup contract, owned once.
@@ -43,16 +47,23 @@ knowledge lives in a **sibling module** instead.
   to review any file you download and that you proceed at your own risk. A consumer README carries
   a prerequisite block and a **link** to that page — never a copy.
 - **`AlertSettings.title_prefix`** — applied to the email subject and the ntfy title, and to
-  nothing else.
+  nothing else. A control character in it is refused: it becomes an HTTP header value and a mail
+  `Subject`, both of which reject one, so such a prefix would fail every alert on every channel
+  while the boot report still said both were ready.
 
 ### Changed
 
-- **`SMTP_USER` is now OPTIONAL and defaults to `EMAIL_FROM`.** They are the same value in this
-  deployment today and they are different things — the auth identity and the header — so the key
-  stays and simply is not required. A file that sets it to something different is honoured, which
-  is what a verified alias or a relay whose user is literally `apikey` needs. Applied where the
-  file is READ, so it survives the per-notification re-read that lets a password rotation take
-  effect without a restart.
+- **`SMTP_USER` is now OPTIONAL and defaults to `EMAIL_FROM` — when, and only when, that is a
+  bare ASCII mailbox.** They are the same value in this deployment today and they are different
+  things: `SMTP_USER` is the auth identity, `EMAIL_FROM` is the header. A From header may
+  legitimately read `Alerts <box@host>` or carry a non-ASCII display name, and neither is a
+  credential — deriving one from the other made `email_ready()` report READY for a channel that
+  then failed 100% of sends, which is the "dead while looking configured" failure this module's
+  docstrings call its worst. Where the two cannot be the same, the key is simply required, and the
+  existing diagnostic already says so. A file that sets it explicitly is always honoured, which is
+  what a verified alias or a relay whose user is literally `apikey` needs. Applied where the file
+  is READ, so it survives the per-notification re-read that lets a password rotation take effect
+  without a restart.
 - **`_parse_env_file` split into a read and a parse.** One parser, two error policies: `alerting`
   reads fail-soft (a missing or mis-encoded file means the email channel is unconfigured, which is
   right for a notification already in flight) and `alerting_env.read_config` reads fail-loud (at
@@ -67,12 +78,13 @@ knowledge lives in a **sibling module** instead.
 - **The title prefix is a property of the TOPIC, not of the service.** A service on the shared
   environment topic gets `[<env>][<service>]` in front of its alert titles, because on a shared
   topic nothing else says who is talking. A service with its own `NTFY_URL_<SERVICE>` topic gets
-  **no** prefix. reauth-bot is the live example and keeps exactly what it does today.
+  **no** prefix. The one service in this deployment that already has its own topic keeps exactly
+  what it does today.
 - **The prefix reaches the two outbound channels and nothing else.** The de-duplication state key,
   the retrievable error record and the process log line all keep the RAW title, so promoting a
   service from dev to prod does not re-page every escalating condition it had already reported.
 - **`NTFY_URL_<SERVICE>` has exactly one spelling**: the service name upper-cased with every
-  non-alphanumeric character replaced by `_`, so `reauth-bot` is `NTFY_URL_REAUTH_BOT`. A key
+  non-alphanumeric character replaced by `_`, so `backup-agent` is `NTFY_URL_BACKUP_AGENT`. A key
   spelled any other way is ignored and the service quietly lands back on the shared topic with a
   prefix it should not have. `alerting_env.ntfy_key(service)` is exported so nothing has to guess.
 - **`state_file` and `error_log` are NOT in the shared file and are not loader arguments.** They
@@ -80,6 +92,13 @@ knowledge lives in a **sibling module** instead.
 - **`NTFY_URL_<ENV>` is required even for a service that has its own topic.** The file is shared:
   a file missing `NTFY_URL_PROD` is broken for every service without an override, and the next
   service to adopt is exactly that one.
+- **A service may not be named after an environment.** `dev` or `prod` derives
+  `NTFY_URL_DEV`/`NTFY_URL_PROD` — keys the shared file always carries — so it would read a shared
+  topic as its own dedicated one: wrong topic, no prefix, and a confirmation alert saying it is on
+  its own. Refused by `ntfy_key`.
+- **The marker is a TIMESTAMP comparison, and that is its limit.** A config file restored at an
+  older mtime (`rsync -a`, `cp -p`, `tar -x`, a volume restore) leaves the marker still newer, so
+  that change is not re-validated. `touch` the file after a restore.
 - ⚠️ **`CONFIG_PATH` is not the config file.** `load_alert_settings`'s first parameter is called
   `config_path` and is the alerting.env FILE; the `CONFIG_PATH` variable is the app's own
   read-write DIRECTORY, where the marker goes. The validation function spells that one
@@ -436,3 +455,5 @@ every service runs the same code instead of a copy that drifts.
 
 [1.0.1]: https://github.com/texasdaddy/kw-common/releases/tag/v1.0.1
 [1.0.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.0.0
+[1.2.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.2.0
+[1.1.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.1.0

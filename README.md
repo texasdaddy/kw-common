@@ -40,7 +40,9 @@ the release notes name every consumer that needs a code change.
 | `kw_common.alerting_env` | The deployment layer `alerting` refuses to be: one shared config file plus three variables in, `AlertSettings` out — and the boot check that refuses to start when they are wrong. |
 | `kw_common.leakguard` | The internal-information leak guard: shape-based scans of the tracked tree, the index, and the commits a push publishes — plus the `kw-leak-guard` command. |
 
-Modules are **independently importable**. `import kw_common` pulls in nothing; take what you need:
+`import kw_common` pulls in nothing, and no module drags in one you did not ask for — `alerting`
+and `leakguard` share not a line. (`alerting_env` is the one deliberate dependency: it RETURNS an
+`AlertSettings`, so it imports `alerting` and nothing else.) Take what you need:
 
 ```python
 from kw_common.alerting import (
@@ -114,23 +116,36 @@ What it decides, and why each is not left to the caller:
   reported.
 * **What "required" means, per environment**, once, next to the loader — otherwise every app
   answers "what does prod require?" independently and they disagree the first time a key is added.
-  `SMTP_USER` is optional and defaults to `EMAIL_FROM`; they are the same value in this deployment
-  today and are different things (the auth identity and the header), so the key exists and is not
-  required.
+  `SMTP_USER` is optional and defaults to `EMAIL_FROM` — but only when that is a bare ASCII
+  mailbox. They are the same value in this deployment today and are different things (the auth
+  identity and the header), and a From header carrying a display name is not a credential: copying
+  it into `SMTP_USER` would make a channel that fails every send report itself READY.
 
 There is **no default for any of the three variables, and no default path anywhere in the module.**
 A missing variable raises at boot. A default would point at the wrong deployment silently, and the
 symptom of that is an incident that produced no page.
 
-`validate_boot_from_env` checks the mount, the structure, the file and every required key; on
-success it sends **one** confirmation alert and writes an empty marker into `CONFIG_PATH`, and
-later boots skip the check while that marker is newer than the config file. **On failure it logs
-and raises and does not attempt to alert** — it cannot report a broken alerting channel through
-that channel.
+`validate_boot_from_env` checks the mount, the structure, the file, every key this environment
+requires — including that none is still the template's `CHANGE-ME` — and that every configured
+channel is one the library can actually SEND on. That last one matters more than it sounds:
+`NTFY_URL_PROD=my-topic` (a bare topic instead of the full URL) is non-blank, and a check that
+asked only "is there a value" would pass it, announce that the configuration checks out, and leave
+the channel dead. It asks `alerting`'s own readiness functions rather than re-deriving the answer.
+
+On success it sends **one** confirmation alert and writes an empty marker into `CONFIG_PATH`, and
+later boots skip while that marker is newer than the config file. The marker is **per
+environment**: with one marker for all of them, promoting a service from dev to prod — which does
+not touch the shared file — skipped validation entirely and the service came up with no topic at
+all. **On failure it logs and raises and does not attempt to alert** — it cannot report a broken
+alerting channel through that channel — and with no `Alerter` installed it validates but withholds
+the marker, so the confirmation is not lost to a boot that could not send it.
+
+⚠️ The marker is compared by TIMESTAMP, so a config file restored at an older mtime (`rsync -a`,
+`cp -p`, a volume restore) is not re-validated. Stated rather than implied; `touch` after a restore.
 
 📄 **Setup — the folder structure, the template and per-OS commands: [`docs/alerting-setup.md`](docs/alerting-setup.md).**
-A consumer README carries a short prerequisite block and a **link** to that page, never a copy;
-eight prose copies is the same duplication problem relocated into documentation.
+A consumer README carries a short prerequisite block and a **link** to that page, never a copy; a
+prose copy per consumer is the same duplication problem relocated into documentation.
 
 ## The generic-code contract
 
@@ -138,7 +153,10 @@ Every module here satisfies all of the following. A module that cannot is not re
 shared library, and saying so is a better outcome than bending the rule.
 
 1. **It imports cleanly in isolation.** Copy the module alone into an empty directory and import
-   it: no consumer module appears in `sys.modules`, and neither does any other `kw_common` module.
+   it: no consumer module appears in `sys.modules`, and nothing outside the standard library does
+   either. **The "no other `kw_common` module" half binds every module EXCEPT `alerting_env`**,
+   which imports `alerting` because it exists to return an `AlertSettings` — a stated, single,
+   one-directional dependency, not an exception that grows. `alerting` must never import it back.
    *(Enforced for `alerting` by `tests/test_isolation.py`, which does exactly that in a
    subprocess, and for `leakguard` by a narrower check in `test_leak_guard_extraction.py`.
    Generalising that file over every module is issue #12 — it binds one `MODULE_PATH` today.)*

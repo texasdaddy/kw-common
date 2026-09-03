@@ -23,6 +23,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -42,6 +43,7 @@ from kw_common.alerting_env import (
     config_file_for,
     load_alert_settings,
     load_alert_settings_from_env,
+    marker_name,
     normalise_env,
     ntfy_key,
     read_config,
@@ -147,8 +149,8 @@ def test_the_loader_runs_with_no_environment_set_at_all(tmp_path: Path) -> None:
     any of them — or fell back to a default path — this raises rather than returning settings.
     """
     write_shared(tmp_path)
-    settings = load_alert_settings(config_file_for(tmp_path), "prod", "tape")
-    assert settings.service == "tape"
+    settings = load_alert_settings(config_file_for(tmp_path), "prod", "feed-poller")
+    assert settings.service == "feed-poller"
     assert settings.ntfy_url == GOOD_CONFIG["NTFY_URL_PROD"]
     assert settings.config_file == str(config_file_for(tmp_path))
 
@@ -184,6 +186,38 @@ def test_the_loader_reads_no_environment_variable_other_than_the_three_documente
     # The only literal-or-name argument is the parameter of `_require_env`, so no test can be
     # satisfied by a variable spelled inline somewhere else.
     assert names <= {"<name>"}, f"the module reads environment variables directly: {sorted(names)}"
+
+    # ⭐ AND THE SECOND HALF, WHICH THE FIRST DOES NOT COVER. "Everything comes through one helper"
+    # is satisfied by a FOURTH variable read through that same helper — measured: a copy with one
+    # added still passed this test, and was caught only behaviourally, two files away. So the CALL
+    # SITES are checked too: every argument to `_require_env` must be one of the three constants.
+    allowed = {"SHARED_ROOT_VAR", "CONFIG_PATH_VAR", "DEPLOY_ENV_VAR"}
+    passed: set[str] = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_require_env"):
+            arg = node.args[0] if node.args else None
+            passed.add(arg.id if isinstance(arg, ast.Name) else f"<not a bare name: {arg!r}>")
+    assert passed, "no _require_env call site was found — this half of the test proves nothing"
+    assert passed <= allowed, (
+        f"the module reads environment variables beyond the three the standard declares: "
+        f"{sorted(passed - allowed)}. Each one is a fourth thing a container template has to "
+        f"know, which is the divergence this package exists to close.")
+
+
+def test_the_path_fault_and_the_encoding_fault_are_reported_as_different_things(
+        tmp_path: Path) -> None:
+    """⚠️ `UnicodeDecodeError` IS a `ValueError`, so one combined branch reported an embedded NUL
+    in the PATH — which `open()` rejects with a plain `ValueError` — as "the file is not UTF-8
+    text". The right refusal pointing the wrong way: an operator would go looking at the file's
+    encoding for a fault in the variable that named it."""
+    with pytest.raises(AlertEnvError, match="not a usable path"):
+        read_config(str(tmp_path / "with\x00nul.env"))
+
+    bad = tmp_path / "utf16.env"
+    bad.write_bytes("EMAIL_TO=ops@example.com\n".encode("utf-16"))
+    with pytest.raises(AlertEnvError, match="UTF-8"):
+        read_config(bad)
 
 
 def test_no_operator_path_is_a_default_or_a_fallback_anywhere_in_the_module() -> None:
@@ -233,7 +267,7 @@ def test_the_env_layer_refuses_a_missing_variable_rather_than_defaulting(
     monkeypatch.delenv(missing)
 
     with pytest.raises(AlertEnvError) as exc:
-        load_alert_settings_from_env("tape")
+        load_alert_settings_from_env("feed-poller")
     assert missing in str(exc.value)
 
 
@@ -248,7 +282,7 @@ def test_a_variable_set_to_blank_is_refused_because_that_is_what_an_unfilled_tem
     monkeypatch.setenv(SHARED_ROOT_VAR, blank)
     monkeypatch.setenv(DEPLOY_ENV_VAR, "prod")
     with pytest.raises(AlertEnvError, match="empty"):
-        load_alert_settings_from_env("tape")
+        load_alert_settings_from_env("feed-poller")
 
 
 def test_the_env_layer_reads_shared_root_and_builds_the_documented_subpath(
@@ -256,7 +290,7 @@ def test_the_env_layer_reads_shared_root_and_builds_the_documented_subpath(
     write_shared(tmp_path)
     monkeypatch.setenv(SHARED_ROOT_VAR, str(tmp_path))
     monkeypatch.setenv(DEPLOY_ENV_VAR, "dev")
-    settings = load_alert_settings_from_env("tape")
+    settings = load_alert_settings_from_env("feed-poller")
     assert settings.config_file == str(tmp_path / "configs" / "alerting.env")
     assert settings.ntfy_url == GOOD_CONFIG["NTFY_URL_DEV"]
 
@@ -278,13 +312,13 @@ def test_a_non_string_environment_is_refused_without_a_TypeError() -> None:
 def test_every_spelling_of_an_environment_produces_identical_settings(
         tmp_path: Path, spelling: str) -> None:
     """⭐ IDENTICAL SETTINGS, not merely the same URL. The prefix carries the environment name
-    too, so a loader that selected the right topic while writing `[PROD][tape]` into every title
-    would pass a URL-only assertion and ship two spellings of the same deployment to the operator.
+    too, so a loader that selected the right topic while writing `[PROD][feed-poller]` into each
+    title would pass a URL-only assertion and ship two spellings of one deployment to the operator.
     """
     write_shared(tmp_path)
-    canonical = load_alert_settings(config_file_for(tmp_path), "prod", "tape")
-    assert load_alert_settings(config_file_for(tmp_path), spelling, "tape") == canonical
-    assert canonical.title_prefix == "[prod][tape] "
+    canonical = load_alert_settings(config_file_for(tmp_path), "prod", "feed-poller")
+    assert load_alert_settings(config_file_for(tmp_path), spelling, "feed-poller") == canonical
+    assert canonical.title_prefix == "[prod][feed-poller] "
 
 
 def test_the_manifest_is_case_insensitive_the_same_way() -> None:
@@ -313,46 +347,47 @@ def test_the_environment_topic_is_required_even_for_a_service_that_has_its_own(
     produced no page, in a service nobody was thinking about.
     """
     config = drop(tmp_path, "NTFY_URL_PROD")
-    config.write_text(config.read_text(encoding="utf-8") +
-                      "NTFY_URL_TAPE=https://ntfy.example.com/tape\n", encoding="utf-8")
-    settings = load_alert_settings(config, "prod", "tape")
-    assert settings.ntfy_url == "https://ntfy.example.com/tape"   # the service itself is fine
+    config.write_text(
+        config.read_text(encoding="utf-8")
+        + "NTFY_URL_FEED_POLLER=https://ntfy.example.com/own\n", encoding="utf-8")
+    settings = load_alert_settings(config, "prod", "feed-poller")
+    assert settings.ntfy_url == "https://ntfy.example.com/own"   # the service itself is fine
     with pytest.raises(AlertEnvError, match="NTFY_URL_PROD"):
         validate_boot(settings, "prod", tmp_path / "appconfig")
 
 
 # ============================================ acceptance 4: the topic decides the prefix
 def test_a_dedicated_topic_wins_and_carries_no_prefix(tmp_path: Path) -> None:
-    write_shared(tmp_path, NTFY_URL_REAUTH_BOT="https://ntfy.example.com/reauth")
-    settings = load_alert_settings(config_file_for(tmp_path), "prod", "reauth-bot")
-    assert settings.ntfy_url == "https://ntfy.example.com/reauth"
+    write_shared(tmp_path, NTFY_URL_BACKUP_AGENT="https://ntfy.example.com/backup")
+    settings = load_alert_settings(config_file_for(tmp_path), "prod", "backup-agent")
+    assert settings.ntfy_url == "https://ntfy.example.com/backup"
     assert settings.title_prefix == ""
 
 
 def test_the_live_example_keeps_its_behaviour_in_both_environments(tmp_path: Path) -> None:
-    """⚠️ reauth-bot IS the live example the standard names, and this package must not change what
+    """⚠️ backup-agent IS the live example the standard names, and this package must not change what
     it does. Its own topic, in either environment, with no prefix — and the environment topic
     sitting right there in the same file, unused by it."""
-    write_shared(tmp_path, NTFY_URL_REAUTH_BOT="https://ntfy.example.com/reauth")
+    write_shared(tmp_path, NTFY_URL_BACKUP_AGENT="https://ntfy.example.com/backup")
     for env in ("dev", "prod"):
-        settings = load_alert_settings(config_file_for(tmp_path), env, "reauth-bot")
-        assert settings.ntfy_url == "https://ntfy.example.com/reauth"
+        settings = load_alert_settings(config_file_for(tmp_path), env, "backup-agent")
+        assert settings.ntfy_url == "https://ntfy.example.com/backup"
         assert settings.title_prefix == ""
 
 
 def test_a_service_on_the_shared_topic_carries_the_env_and_service_prefix(tmp_path: Path) -> None:
     write_shared(tmp_path)
-    settings = load_alert_settings(config_file_for(tmp_path), "dev", "cef-tracker")
+    settings = load_alert_settings(config_file_for(tmp_path), "dev", "report-mailer")
     assert settings.ntfy_url == GOOD_CONFIG["NTFY_URL_DEV"]
-    assert settings.title_prefix == "[dev][cef-tracker] "
+    assert settings.title_prefix == "[dev][report-mailer] "
 
 
 def test_a_blank_override_means_the_shared_topic_and_therefore_the_prefix(tmp_path: Path) -> None:
     """A cleared key means "stop using my own topic", not "use no topic at all"."""
-    write_shared(tmp_path, NTFY_URL_TAPE="   ")
-    settings = load_alert_settings(config_file_for(tmp_path), "prod", "tape")
+    write_shared(tmp_path, NTFY_URL_FEED_POLLER="   ")
+    settings = load_alert_settings(config_file_for(tmp_path), "prod", "feed-poller")
     assert settings.ntfy_url == GOOD_CONFIG["NTFY_URL_PROD"]
-    assert settings.title_prefix == "[prod][tape] "
+    assert settings.title_prefix == "[prod][feed-poller] "
 
 
 def test_a_missing_shared_topic_still_gets_the_prefix(tmp_path: Path) -> None:
@@ -362,9 +397,9 @@ def test_a_missing_shared_topic_still_gets_the_prefix(tmp_path: Path) -> None:
     that is already broken — so when the file is later fixed, the first alerts arrive unlabelled
     from a service the operator has to guess at.
     """
-    settings = load_alert_settings(drop(tmp_path, "NTFY_URL_PROD"), "prod", "tape")
+    settings = load_alert_settings(drop(tmp_path, "NTFY_URL_PROD"), "prod", "feed-poller")
     assert settings.ntfy_url == ""
-    assert settings.title_prefix == "[prod][tape] "
+    assert settings.title_prefix == "[prod][feed-poller] "
 
 
 def test_the_prefix_reaches_BOTH_outbound_titles(tmp_path: Path,
@@ -372,11 +407,11 @@ def test_the_prefix_reaches_BOTH_outbound_titles(tmp_path: Path,
     """⭐ THE HALF A RETURN-VALUE ASSERTION CANNOT SEE. `title_prefix` being correct on the
     settings object says nothing about whether anything applies it."""
     write_shared(tmp_path)
-    settings = load_alert_settings(config_file_for(tmp_path), "prod", "tape")
+    settings = load_alert_settings(config_file_for(tmp_path), "prod", "feed-poller")
     Alerter(settings).notify(ERROR, "Backup failed", "disk full")
     for name, spy in channels.items():
         assert spy.calls, f"the {name} channel was not asked to send anything"
-        assert spy.calls[0][2] == "[prod][tape] Backup failed"
+        assert spy.calls[0][2] == "[prod][feed-poller] Backup failed"
 
 
 def test_the_prefix_does_NOT_reach_the_dedup_key_the_error_record_or_the_log_line(
@@ -392,7 +427,7 @@ def test_the_prefix_does_NOT_reach_the_dedup_key_the_error_record_or_the_log_lin
     boundary and nowhere upstream of it.
     """
     write_shared(tmp_path)
-    settings = load_alert_settings(config_file_for(tmp_path), "prod", "tape")
+    settings = load_alert_settings(config_file_for(tmp_path), "prod", "feed-poller")
     state = tmp_path / "state.json"
     errors = tmp_path / "logs" / "errors.log"
     from dataclasses import replace
@@ -404,9 +439,9 @@ def test_the_prefix_does_NOT_reach_the_dedup_key_the_error_record_or_the_log_lin
     assert list(json.loads(state.read_text(encoding="utf-8"))) == ["Backup failed"]
     record = json.loads(errors.read_text(encoding="utf-8").splitlines()[0])
     assert record["title"] == "Backup failed"
-    assert "[prod][tape]" not in caplog.text
+    assert "[prod][feed-poller]" not in caplog.text
     # ...and the outbound copy really did carry it, so this is not passing because nothing works.
-    assert channels["ntfy"].calls[0][2] == "[prod][tape] Backup failed"
+    assert channels["ntfy"].calls[0][2] == "[prod][feed-poller] Backup failed"
 
 
 def test_the_prefix_is_cosmetic_and_cannot_cost_a_delivery(channels: dict[str, Spy]) -> None:
@@ -448,9 +483,9 @@ def test_a_non_string_prefix_is_refused_by_the_constructor() -> None:
 
 # ================================================================ the service→key transform
 @pytest.mark.parametrize(("service", "key"), [
-    ("tape", "NTFY_URL_TAPE"),
-    ("reauth-bot", "NTFY_URL_REAUTH_BOT"),
-    ("cef-tracker", "NTFY_URL_CEF_TRACKER"),
+    ("feed-poller", "NTFY_URL_FEED_POLLER"),
+    ("backup-agent", "NTFY_URL_BACKUP_AGENT"),
+    ("report-mailer", "NTFY_URL_REPORT_MAILER"),
     ("the.desk", "NTFY_URL_THE_DESK"),
     ("  spaced  name ", "NTFY_URL_SPACED_NAME"),
 ])
@@ -516,7 +551,7 @@ def test_smtp_user_absent_authenticates_as_email_from(
     default reaches SMTP AUTH; a dict assertion is satisfied by a default that a later line
     overwrites."""
     config = drop(tmp_path, "SMTP_USER")   # absent, not blank
-    settings = load_alert_settings(config, "prod", "tape")
+    settings = load_alert_settings(config, "prod", "feed-poller")
     _send_one(settings)
     assert smtp_login == [("svc@example.com", GOOD_CONFIG["SMTP_PASSWORD"])]
 
@@ -528,7 +563,7 @@ def test_smtp_user_present_and_different_is_honoured(
     verified alias and on a relay whose user is literally `apikey`, and a default that overwrote
     the configured value would fail authentication for exactly those deployments."""
     config = write_shared(tmp_path, SMTP_USER="apikey")
-    settings = load_alert_settings(config, "prod", "tape")
+    settings = load_alert_settings(config, "prod", "feed-poller")
     _send_one(settings)
     assert smtp_login == [("apikey", GOOD_CONFIG["SMTP_PASSWORD"])]
 
@@ -537,7 +572,7 @@ def test_a_blank_smtp_user_also_falls_back(tmp_path: Path,
                                            smtp_login: list[tuple[str, str]]) -> None:
     """Blank is how a cleared container Variable arrives, so it must mean the same as absent."""
     config = write_shared(tmp_path, SMTP_USER="")
-    settings = load_alert_settings(config, "prod", "tape")
+    settings = load_alert_settings(config, "prod", "feed-poller")
     _send_one(settings)
     assert smtp_login == [("svc@example.com", GOOD_CONFIG["SMTP_PASSWORD"])]
 
@@ -617,12 +652,12 @@ def test_a_directory_where_the_file_should_be_is_reported_as_unreadable(tmp_path
 
 
 # ======================================================== acceptance 6 & 7: boot validation
-def _validated(tmp_path: Path, service: str = "tape",
+def _validated(tmp_path: Path, service: str = "feed-poller",
                env: str = "prod") -> tuple[AlertSettings, Path, Path]:
     write_shared(tmp_path)
     settings = load_alert_settings(config_file_for(tmp_path), env, service)
     marker_dir = tmp_path / "appconfig"
-    return settings, marker_dir, marker_dir / MARKER_NAME
+    return settings, marker_dir, marker_dir / marker_name(env)
 
 
 def test_a_good_config_writes_the_marker_and_alerts_exactly_once(
@@ -660,9 +695,8 @@ def test_touching_the_config_makes_the_next_boot_validate_again(
     # A real edit, and its timestamp moved forward far enough that a coarse filesystem clock
     # cannot make this test depend on how fast the machine is.
     config.write_text(config.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8")
-    import os as _os
     marker_mtime = marker.stat().st_mtime
-    _os.utime(config, (marker_mtime + 10, marker_mtime + 10))
+    os.utime(config, (marker_mtime + 10, marker_mtime + 10))
 
     assert validate_boot(settings, "prod", marker_dir, alerter=alerter) is True
     assert len(channels["ntfy"].calls) == 1
@@ -676,12 +710,65 @@ def test_a_marker_exactly_as_old_as_the_config_validates_again(
     """
     settings, marker_dir, marker = _validated(tmp_path)
     validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings))
-    import os as _os
     stamp = marker.stat().st_mtime
-    _os.utime(Path(settings.config_file), (stamp, stamp))
+    os.utime(Path(settings.config_file), (stamp, stamp))
     channels["ntfy"].calls.clear()
 
     assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+
+
+def test_the_marker_is_always_left_STRICTLY_newer_than_the_config(tmp_path: Path) -> None:
+    """⭐⭐ THE INVARIANT THE SKIP DEPENDS ON, ASSERTED DIRECTLY — because asserting the SKIP is
+    only as good as the filesystem the test happens to run on.
+
+    "Write the config, then write the marker" produces a strictly greater timestamp only where the
+    clock granularity is finer than the gap between the two writes. This assertion holds on any
+    filesystem, and it is the one that went RED on Linux while the second-boot test below was
+    green on Windows.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert marker.stat().st_mtime > Path(settings.config_file).stat().st_mtime
+
+
+def test_a_marker_written_in_the_same_tick_as_the_config_is_still_dated_past_it(
+        tmp_path: Path) -> None:
+    """⭐ THE COARSE-FILESYSTEM CASE, REPRODUCED WITHOUT NEEDING A COARSE FILESYSTEM.
+
+    An ext4 built with 128-byte inodes has ONE-SECOND timestamps, which is what several CI
+    runners' scratch disks are. Both writes then land on the same second and the marker can never
+    outrank the config, so every boot re-validates and re-sends the confirmation alert — forever,
+    until somebody edits the file. Here the tie is created deliberately and the helper must break
+    it.
+    """
+    from kw_common.alerting_env import _outrank
+
+    config = write_shared(tmp_path)
+    marker = tmp_path / "app" / marker_name("prod")
+    marker.parent.mkdir(parents=True)
+    marker.write_bytes(b"")
+    stamp = config.stat().st_mtime
+    os.utime(marker, (stamp, stamp))
+    assert marker.stat().st_mtime == config.stat().st_mtime   # the tie really exists
+
+    _outrank(marker, config)
+    assert marker.stat().st_mtime > config.stat().st_mtime
+
+
+def test_outranking_leaves_an_already_newer_marker_alone(tmp_path: Path) -> None:
+    """It establishes an order; it does not stamp the marker every boot. A marker that already
+    wins keeps its own time, so "when was this configuration last validated" stays true."""
+    from kw_common.alerting_env import _outrank
+
+    config = write_shared(tmp_path)
+    marker = tmp_path / "app" / marker_name("prod")
+    marker.parent.mkdir(parents=True)
+    marker.write_bytes(b"")
+    stamp = config.stat().st_mtime + 500
+    os.utime(marker, (stamp, stamp))
+
+    _outrank(marker, config)
+    assert marker.stat().st_mtime == stamp
 
 
 def test_the_marker_is_written_into_the_apps_own_directory_and_never_the_shared_root(
@@ -691,11 +778,11 @@ def test_the_marker_is_written_into_the_apps_own_directory_and_never_the_shared_
     shared = tmp_path / "shared"
     app = tmp_path / "app"
     write_shared(shared)
-    settings = load_alert_settings(config_file_for(shared), "prod", "tape")
+    settings = load_alert_settings(config_file_for(shared), "prod", "feed-poller")
     validate_boot(settings, "prod", app, shared_root=shared, alerter=Alerter(settings))
 
-    assert (app / MARKER_NAME).is_file()
-    assert list(shared.rglob(MARKER_NAME)) == []
+    assert (app / marker_name("prod")).is_file()
+    assert list(shared.rglob(MARKER_NAME + "*")) == []
 
 
 @pytest.mark.parametrize("missing_key", ["EMAIL_TO", "SMTP_PASSWORD", "SMTP_PORT",
@@ -705,19 +792,19 @@ def test_a_missing_required_key_refuses_to_boot_and_alerts_nobody(
         missing_key: str) -> None:
     """⛔ THE REFUSAL MUST NOT REPORT ITSELF THROUGH THE CHANNEL IT IS REFUSING OVER."""
     config = drop(tmp_path, missing_key)
-    settings = load_alert_settings(config, "prod", "tape")
+    settings = load_alert_settings(config, "prod", "feed-poller")
     with pytest.raises(AlertEnvError) as exc:
         validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
 
     assert missing_key in str(exc.value)
     assert silence(channels) == []
-    assert not (tmp_path / "app" / MARKER_NAME).exists()
+    assert not (tmp_path / "app" / marker_name("prod")).exists()
 
 
 def test_a_blank_required_key_is_refused_the_same_way_as_an_absent_one(
         tmp_path: Path, channels: dict[str, Spy]) -> None:
     config = write_shared(tmp_path, EMAIL_TO="   ")
-    settings = load_alert_settings(config, "prod", "tape")
+    settings = load_alert_settings(config, "prod", "feed-poller")
     with pytest.raises(AlertEnvError, match="EMAIL_TO"):
         validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
     assert silence(channels) == []
@@ -728,7 +815,7 @@ def test_the_refusal_names_the_keys_and_never_their_values(tmp_path: Path) -> No
     into a bug report."""
     secret = "s3cret-app-password"  # noqa: S105 — a fixture value, and the point of the test
     config = write_shared(tmp_path, SMTP_PASSWORD=secret, EMAIL_TO="")
-    settings = load_alert_settings(config, "prod", "tape")
+    settings = load_alert_settings(config, "prod", "feed-poller")
     with pytest.raises(AlertEnvError) as exc:
         validate_boot(settings, "prod", tmp_path / "app")
     assert "EMAIL_TO" in str(exc.value)
@@ -741,7 +828,7 @@ def test_an_unreadable_config_refuses_to_boot_and_alerts_nobody(
         tmp_path: Path, channels: dict[str, Spy]) -> None:
     config = config_file_for(tmp_path)
     config.parent.mkdir(parents=True, exist_ok=True)
-    settings = AlertSettings(service="tape", config_file=str(config))
+    settings = AlertSettings(service="feed-poller", config_file=str(config))
     with pytest.raises(AlertEnvError, match="does not exist"):
         validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
     assert silence(channels) == []
@@ -752,7 +839,7 @@ def test_a_mis_encoded_config_refuses_to_boot_and_alerts_nobody(
     config = config_file_for(tmp_path)
     config.parent.mkdir(parents=True, exist_ok=True)
     config.write_bytes("EMAIL_TO=ops@example.com\n".encode("utf-16"))
-    settings = AlertSettings(service="tape", config_file=str(config))
+    settings = AlertSettings(service="feed-poller", config_file=str(config))
     with pytest.raises(AlertEnvError, match="UTF-8"):
         validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
     assert silence(channels) == []
@@ -763,7 +850,7 @@ def test_a_shared_root_that_is_not_mounted_is_reported_as_a_mount_problem(
     """⭐ A MISSING MOUNT AND A MISSING FILE SEND AN OPERATOR TO DIFFERENT PLACES, so they are
     different messages. One is a template volume that was never added; the other is a file that
     was never created."""
-    settings = AlertSettings(service="tape",
+    settings = AlertSettings(service="feed-poller",
                              config_file=str(config_file_for(tmp_path / "absent")))
     with pytest.raises(AlertEnvError, match="MOUNT"):
         validate_boot(settings, "prod", tmp_path / "app",
@@ -775,26 +862,45 @@ def test_a_mounted_root_with_no_configs_directory_is_reported_as_a_structure_pro
         tmp_path: Path) -> None:
     shared = tmp_path / "shared"
     shared.mkdir()
-    settings = AlertSettings(service="tape", config_file=str(config_file_for(shared)))
+    settings = AlertSettings(service="feed-poller", config_file=str(config_file_for(shared)))
     with pytest.raises(AlertEnvError, match="structure"):
         validate_boot(settings, "prod", tmp_path / "app", shared_root=shared)
 
 
 def test_settings_with_no_config_file_are_refused_rather_than_silently_passing(
         tmp_path: Path) -> None:
-    settings = AlertSettings(service="tape")
+    settings = AlertSettings(service="feed-poller")
     with pytest.raises(AlertEnvError, match="config_file"):
         validate_boot(settings, "prod", tmp_path / "app")
 
 
-def test_validation_without_an_installed_alerter_still_validates_and_says_so(
+def test_validation_without_an_installed_alerter_withholds_the_marker(
         tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    """Not a failure: an app may validate before it configures. Loud enough that "no alert
-    arrived" is explicable."""
+    """⭐⭐ THE "MARKED VALIDATED, ALERT NEVER LEFT" STATE, APPROACHED FROM THE OTHER SIDE.
+
+    `validate_boot` sends before it marks, precisely so a crash between the two cannot record a
+    boot as validated whose confirmation never went out. Writing the marker when there is no
+    `Alerter` at all produces exactly that state anyway — and worse, permanently: the marker then
+    suppresses every LATER boot's alert too, so the confirmation is lost until somebody edits the
+    config file. The configuration is valid, which is what was asked; the proof is what is
+    missing, so the marker is withheld and the next boot tries again.
+    """
     settings, marker_dir, marker = _validated(tmp_path)
     with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
         assert validate_boot(settings, "prod", marker_dir) is True
     assert "no Alerter" in caplog.text
+    assert not marker.exists()
+
+
+def test_the_boot_after_an_alerter_is_installed_does_announce(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """The other half of the test above: withholding the marker has to actually buy something."""
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir) is True          # no alerter
+    assert silence(channels) == []
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert len(channels["ntfy"].calls) == 1
     assert marker.is_file()
 
 
@@ -823,7 +929,7 @@ def test_the_validation_alert_names_no_value_from_the_config_file(
     password. It says which KEYS were used, never what they hold."""
     secret = "s3cret-app-password"  # noqa: S105 — a fixture value, and the point of the test
     write_shared(tmp_path, SMTP_PASSWORD=secret)
-    settings = load_alert_settings(config_file_for(tmp_path), "prod", "tape")
+    settings = load_alert_settings(config_file_for(tmp_path), "prod", "feed-poller")
     validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
 
     _, _, title, message = channels["ntfy"].calls[0]
@@ -831,13 +937,13 @@ def test_the_validation_alert_names_no_value_from_the_config_file(
     for value in GOOD_CONFIG.values():
         assert value not in body
     assert secret not in body
-    assert "tape" in body and "prod" in body
+    assert "feed-poller" in body and "prod" in body
 
 
 def test_the_validation_alert_says_which_kind_of_topic_the_service_is_on(
         tmp_path: Path, channels: dict[str, Spy]) -> None:
-    write_shared(tmp_path, NTFY_URL_TAPE="https://ntfy.example.com/tape")
-    settings = load_alert_settings(config_file_for(tmp_path), "prod", "tape")
+    write_shared(tmp_path, NTFY_URL_FEED_POLLER="https://ntfy.example.com/feed-poller")
+    settings = load_alert_settings(config_file_for(tmp_path), "prod", "feed-poller")
     validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
     assert "its own ntfy topic" in channels["ntfy"].calls[0][3]
 
@@ -851,9 +957,9 @@ def test_validate_boot_from_env_reads_all_three_variables(
     monkeypatch.setenv(CONFIG_PATH_VAR, str(app))
     monkeypatch.setenv(DEPLOY_ENV_VAR, "PROD")
 
-    settings = load_alert_settings_from_env("tape")
+    settings = load_alert_settings_from_env("feed-poller")
     assert validate_boot_from_env(settings, alerter=Alerter(settings)) is True
-    assert (app / MARKER_NAME).is_file()
+    assert (app / marker_name("prod")).is_file()
     assert len(channels["ntfy"].calls) == 1
 
 
@@ -863,7 +969,7 @@ def test_validate_boot_from_env_refuses_a_missing_variable(
         missing: str) -> None:
     shared = tmp_path / "shared"
     write_shared(shared)
-    settings = load_alert_settings(config_file_for(shared), "prod", "tape")
+    settings = load_alert_settings(config_file_for(shared), "prod", "feed-poller")
     for name, value in ((SHARED_ROOT_VAR, str(shared)),
                         (CONFIG_PATH_VAR, str(tmp_path / "app")),
                         (DEPLOY_ENV_VAR, "prod")):
@@ -874,6 +980,219 @@ def test_validate_boot_from_env_refuses_a_missing_variable(
         validate_boot_from_env(settings)
     assert missing in str(exc.value)
     assert silence(channels) == []
+
+
+# ==================================================== what round 1 of the gate found, pinned
+def test_promoting_a_service_between_environments_RE_VALIDATES(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐⭐ THE DEFECT A SINGLE MARKER HAD, AND IT IS THE ONE THIS PACKAGE EXISTS TO PREVENT.
+
+    Promoting a service dev → prod does not touch the fleet-shared file, so with ONE marker for
+    every environment the marker still outranked the config and validation NEVER RAN in the new
+    environment: `NTFY_URL_PROD` was never looked at, and the service came up with an empty topic
+    URL and did not refuse. "A silent divergence discovered when an alert does not arrive" is the
+    module docstring's own description of what it is for.
+
+    Here the prod topic is ABSENT, so a boot that really validates must REFUSE.
+    """
+    config = drop(tmp_path, "NTFY_URL_PROD")
+    marker_dir = tmp_path / "app"
+    dev = load_alert_settings(config, "dev", "feed-poller")
+    assert validate_boot(dev, "dev", marker_dir, alerter=Alerter(dev)) is True
+
+    prod = load_alert_settings(config, "prod", "feed-poller")
+    with pytest.raises(AlertEnvError, match="NTFY_URL_PROD"):
+        validate_boot(prod, "prod", marker_dir, alerter=Alerter(prod))
+
+
+def test_each_environment_keeps_its_own_marker(tmp_path: Path) -> None:
+    settings, marker_dir, _ = _validated(tmp_path, env="prod")
+    validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings))
+    dev = load_alert_settings(config_file_for(tmp_path), "dev", "feed-poller")
+    validate_boot(dev, "dev", marker_dir, alerter=Alerter(dev))
+
+    assert (marker_dir / marker_name("prod")).is_file()
+    assert (marker_dir / marker_name("dev")).is_file()
+    assert marker_name("prod") != marker_name("dev")
+
+
+def test_a_service_named_after_an_environment_is_refused() -> None:
+    """⭐ IT WOULD DERIVE A RESERVED KEY. A service literally named `prod` reads `NTFY_URL_PROD` —
+    the shared topic every file carries — as its own dedicated override: the wrong topic, no title
+    prefix, and a validation alert announcing it is "on its own ntfy topic"."""
+    for name in ("dev", "prod", "PROD", " Dev "):
+        with pytest.raises(AlertEnvError, match="environment"):
+            ntfy_key(name)
+
+
+@pytest.mark.parametrize("key", ["NTFY_URL_PROD", "SMTP_PASSWORD", "EMAIL_TO"])
+def test_a_key_left_at_the_CHANGE_ME_placeholder_refuses_to_boot(
+        tmp_path: Path, channels: dict[str, Spy], key: str) -> None:
+    """⭐ THE TEMPLATE ASSERTS THIS, so it has to be true. Before it was, every placeholder was
+    non-blank, so the untouched template validated, announced that the configuration "checks out",
+    and wrote the marker — after which no later boot re-validated either."""
+    config = write_shared(tmp_path, **{key: "CHANGE-ME"})
+    settings = load_alert_settings(config, "prod", "feed-poller")
+    with pytest.raises(AlertEnvError, match=key):
+        validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
+    assert silence(channels) == []
+
+
+def test_the_shipped_template_AS_IS_refuses_to_boot(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐⭐ THE CLAIM PINNED TO THE FILE THAT MAKES IT, rather than to a value this test invented.
+
+    `alerting.env.template` tells an operator that a file left as-is will refuse to boot. This
+    copies the SHIPPED template to where the setup document puts it and runs the sequence the
+    setup document gives, so the template and the check cannot drift apart: change either and this
+    fails.
+    """
+    config = config_file_for(tmp_path)
+    config.parent.mkdir(parents=True)
+    config.write_bytes(TEMPLATE.read_bytes())
+
+    settings = load_alert_settings(config, "prod", "feed-poller")
+    with pytest.raises(AlertEnvError, match="CHANGE-ME"):
+        validate_boot(settings, "prod", tmp_path / "app", shared_root=tmp_path,
+                      alerter=Alerter(settings))
+    assert silence(channels) == []
+
+
+@pytest.mark.parametrize("bad_url", ["bare-topic", "http://ntfy.example.com/t",
+                                     "https://u:pw@ntfy.example.com/t"])
+def test_a_present_but_unusable_ntfy_url_refuses_to_boot(
+        tmp_path: Path, channels: dict[str, Spy], bad_url: str) -> None:
+    """⭐ NON-BLANK IS NOT USABLE, and a bare topic is the likeliest operator typo of the lot —
+    `urllib` cannot post to it, so the channel is dead while looking configured. Boot used to pass
+    it AND announce that the configuration checks out."""
+    config = write_shared(tmp_path, NTFY_URL_PROD=bad_url)
+    settings = load_alert_settings(config, "prod", "feed-poller")
+    with pytest.raises(AlertEnvError, match="ntfy"):
+        validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
+    assert silence(channels) == []
+
+
+@pytest.mark.parametrize("port", ["notanumber", "0", "70000", "-1"])
+def test_an_unusable_smtp_port_refuses_to_boot(tmp_path: Path, port: str) -> None:
+    config = write_shared(tmp_path, SMTP_PORT=port)
+    settings = load_alert_settings(config, "prod", "feed-poller")
+    with pytest.raises(AlertEnvError, match="SMTP_PORT"):
+        validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
+
+
+def test_an_email_from_that_is_not_a_bare_mailbox_refuses_to_boot_rather_than_looking_ready(
+        tmp_path: Path) -> None:
+    """⭐⭐ THE REGRESSION THE `SMTP_USER` DEFAULT INTRODUCED, PINNED AT BOOT.
+
+    `EMAIL_FROM` is a mail HEADER and may read `Alerts <box@host>`; `SMTP_USER` is an AUTH
+    IDENTITY and must be a bare ASCII mailbox. Copying the first into the second turned an honest
+    "email alerts DISABLED" into `email_ready() == True` for a channel that failed 100% of sends.
+    The default now declines, so the channel reports itself unusable — and boot refuses.
+    """
+    config = drop(tmp_path, "SMTP_USER")
+    config.write_text(config.read_text(encoding="utf-8").replace(
+        "EMAIL_FROM=svc@example.com", "EMAIL_FROM=Service Alerts <svc@example.com>"),
+        encoding="utf-8")
+    settings = load_alert_settings(config, "prod", "feed-poller")
+    with pytest.raises(AlertEnvError, match="email"):
+        validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
+
+
+def test_every_refusal_LOGS_before_it_raises(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ "LOG LOUDLY AND REFUSE TO BOOT" IS THE STANDARD'S WORDING AND BOTH HALVES ARE REQUIRED.
+
+    The raising half was true from the start and the logging half was not: the layout, key and
+    read checks all raised having emitted nothing at all, while the README, the CHANGELOG and this
+    module's own docstrings said "logs and raises". An adopter that catches `AlertEnvError` to
+    print its own one-liner then had no record of WHICH check failed.
+    """
+    cases = {
+        "missing mount": lambda: validate_boot(
+            AlertSettings(service="svc",
+                          config_file=str(config_file_for(tmp_path / "absent"))),
+            "prod", tmp_path / "app", shared_root=tmp_path / "absent"),
+        "missing file": lambda: validate_boot(
+            AlertSettings(service="svc", config_file=str(_touchdir(tmp_path / "b"))),
+            "prod", tmp_path / "app"),
+        "missing key": lambda: validate_boot(
+            load_alert_settings(drop(tmp_path / "c", "EMAIL_TO"), "prod", "svc"),
+            "prod", tmp_path / "app"),
+        "placeholder": lambda: validate_boot(
+            load_alert_settings(_placeholder_config(tmp_path / "d"), "prod", "svc"),
+            "prod", tmp_path / "app"),
+        "unusable topic": lambda: validate_boot(
+            load_alert_settings(write_shared(tmp_path / "e", NTFY_URL_PROD="bare"),
+                                "prod", "svc"),
+            "prod", tmp_path / "app"),
+    }
+    for label, run in cases.items():
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="kw_common.alerting_env"), \
+                pytest.raises(AlertEnvError):
+            run()
+        assert caplog.records, f"the {label} refusal logged nothing before raising"
+
+
+def _placeholder_config(root: Path) -> Path:
+    """A config whose password is still the shipped template's marker."""
+    return write_shared(root, SMTP_PASSWORD="CHANGE-ME")  # noqa: S106 — a marker, not a secret
+
+
+def _touchdir(root: Path) -> Path:
+    """A config path whose PARENT exists and whose file does not."""
+    path = config_file_for(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def test_the_prefix_uses_the_same_service_name_the_settings_carry(tmp_path: Path) -> None:
+    """⭐ ONE NORMALISATION, NOT TWO. `AlertSettings` strips the service name in its constructor,
+    so building the prefix from the RAW argument gave two spellings of one service — and the
+    prefix is the one that reaches an HTTP header and a mail Subject, where a newline kills every
+    channel while the settings object looks clean."""
+    write_shared(tmp_path)
+    settings = load_alert_settings(config_file_for(tmp_path), "prod", "  feed-poller \n")
+    assert settings.service == "feed-poller"
+    assert settings.title_prefix == "[prod][feed-poller] "
+
+
+def test_a_control_character_in_the_prefix_is_refused_by_the_constructor() -> None:
+    """It becomes an HTTP header value and a mail Subject, both of which reject a CR or LF — so
+    such a prefix does not corrupt a header, it fails EVERY alert on EVERY channel while the boot
+    report still says both are ready."""
+    for bad in ("[prod][a\nb] ", "[prod][a\rb] ", "[prod][a\x00b] "):
+        with pytest.raises(ValueError, match="control character"):
+            AlertSettings(service="svc", title_prefix=bad)
+
+
+def test_a_hostile_title_cannot_take_down_a_channel_it_never_reached(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐ THE PER-CHANNEL CONTAINMENT INVARIANT, WHICH BUILDING THE PREFIXED TITLE ABOVE THE LOOP
+    BROKE. An f-string calls `format()` on the caller's title, and a caller can pass a non-string;
+    built once for both channels, a title whose `__format__` raises reported `failed` for a
+    channel that was never even attempted."""
+    class Hostile:
+        """Only `__format__` raises, which isolates the defect exactly.
+
+        `notify()`'s log line uses lazy `%s` formatting on purpose — that is what keeps a hostile
+        `__str__` inside `logging` — so a stand-in that broke BOTH would fail for a second reason
+        and prove nothing about the f-string that was hoisted above the channel loop.
+        """
+
+        def __format__(self, spec: str) -> str:
+            raise RuntimeError("no format")
+
+        def __str__(self) -> str:
+            return "hostile"
+
+    write_shared(tmp_path)
+    settings = load_alert_settings(config_file_for(tmp_path), "prod", "feed-poller")
+    from dataclasses import replace
+    # ntfy unconfigured, so it must report "skipped" — never "failed".
+    settings = replace(settings, ntfy_url="")
+    results = Alerter(settings).notify(ERROR, Hostile(), "body")  # type: ignore[arg-type]
+    assert results["ntfy"] == "skipped"
 
 
 # ============================================================ the package's own boundaries
@@ -979,7 +1298,9 @@ def test_the_setup_documents_download_url_names_the_version_this_package_actuall
     import kw_common
 
     text = SETUP_DOC.read_text(encoding="utf-8")
-    urls = [ln for ln in text.splitlines() if "raw.githubusercontent.com" in ln]
+    # The FETCH lines, matched on the scheme so a sentence merely NAMING the host — the one
+    # explaining what `-L` is for — is not mistaken for a command that pins a tag.
+    urls = [ln for ln in text.splitlines() if "https://raw.githubusercontent.com/" in ln]
     assert len(urls) >= 2, "the per-OS download commands are no longer where this test looks"
     stale = [ln for ln in urls if f"/v{kw_common.__version__}/" not in ln]
     assert stale == [], (
