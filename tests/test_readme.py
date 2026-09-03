@@ -23,51 +23,73 @@ from pathlib import Path
 README = Path(__file__).resolve().parents[1] / "README.md"
 
 
-def _quickstart() -> str:
+def _snippets() -> list[str]:
+    """EVERY ```python block in the README.
+
+    ⚠️ THIS USED TO DEMAND EXACTLY ONE, and that was a bound on the README rather than a property
+    of it: adding a second adoption example — which 1.2.0 did, for `alerting_env` — turned a
+    passing suite red for a reason that had nothing to do with either example being wrong. Worse
+    is the direction it pushed, because the cheapest way to make it green again is to delete a
+    block or stop fencing it as Python, which is exactly how an example escapes the checks below.
+
+    So every block is checked, and each carries its own index in the failure message.
+    """
     md = README.read_text(encoding="utf-8")
     blocks = re.findall(r"```python\n(.*?)```", md, re.S)
-    assert len(blocks) == 1, (
-        f"expected exactly one ```python block in README.md, found {len(blocks)} — this test "
-        f"needs updating to say which one is the quick-start")
-    return blocks[0]
+    assert blocks, "README.md has no ```python block at all"
+    return blocks
+
+
+def _quickstart() -> str:
+    """The blocks as one unit, for the checks that do not care which block a name came from."""
+    return "\n".join(_snippets())
 
 
 def test_the_readme_has_a_quickstart_at_all() -> None:
-    """A vacuity guard. Every check below reads this block; if the extraction silently returned
+    """A vacuity guard. Every check below reads these blocks; if the extraction silently returned
     nothing, they would all pass over an empty string."""
     src = _quickstart()
     assert "configure(" in src
     assert "notify(" in src
+    # 1.2.0 added a SECOND adoption example, which is what this file used to forbid outright.
+    assert len(_snippets()) >= 2
 
 
-def test_the_quickstart_parses() -> None:
-    compile(_quickstart(), str(README), "exec")
+def test_every_snippet_parses() -> None:
+    for n, src in enumerate(_snippets()):
+        compile(src, f"{README} [python block {n}]", "exec")
 
 
-def test_every_name_the_quickstart_uses_is_one_it_imports() -> None:
+def test_every_name_a_snippet_uses_is_one_it_imports() -> None:
     """⭐ THE DEFECT THAT GOT THROUGH, PINNED.
 
-    Walks the snippet and requires every name it READS to be one it imported, one it defined, or
+    Walks each snippet and requires every name it READS to be one it imported, one it defined, or
     a builtin. `warn_if_unconfigured` was none of the three.
+
+    ⚠️ PER BLOCK, NOT OVER THE BLOCKS CONCATENATED. A reader copies ONE block, so a name that
+    block 2 uses and only block 1 imports is exactly the `NameError` this test exists to catch —
+    and joining them first is the tidy-looking change that makes it invisible.
     """
-    tree = ast.parse(_quickstart())
+    for n, src in enumerate(_snippets()):
+        tree = ast.parse(src)
 
-    available: set[str] = set(dir(builtins))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            available.update(a.asname or a.name for a in node.names)
-        elif isinstance(node, ast.Import):
-            available.update((a.asname or a.name).split(".")[0] for a in node.names)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            available.add(node.name)
-        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            available.add(node.id)
+        available: set[str] = set(dir(builtins))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                available.update(a.asname or a.name for a in node.names)
+            elif isinstance(node, ast.Import):
+                available.update((a.asname or a.name).split(".")[0] for a in node.names)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                available.add(node.name)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                available.add(node.id)
 
-    used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load)}
-    missing = sorted(used - available)
-    assert missing == [], (
-        f"the README quick-start uses {missing} without importing it — copy-pasting it raises "
-        f"NameError")
+        used = {x.id for x in ast.walk(tree)
+                if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Load)}
+        missing = sorted(used - available)
+        assert missing == [], (
+            f"README python block {n} uses {missing} without importing it — copy-pasting it "
+            f"raises NameError")
 
 
 def test_everything_the_quickstart_imports_from_the_library_really_exists() -> None:

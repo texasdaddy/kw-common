@@ -350,13 +350,18 @@ def test_email_readiness_never_names_the_password(
     — but a blanked password is never written to the config file at all, so that assertion could
     not fail whatever the code did. Here the password is real and a DIFFERENT required setting is
     blanked, so the value is genuinely present in the config the code just read.
+
+    ⚠️ THE BLANKED SETTING IS `SMTP_HOST`, AND IT USED TO BE `SMTP_USER`. `SMTP_USER` is optional
+    as of 1.2.0 — it defaults to `EMAIL_FROM` — so blanking it no longer produces an unready
+    channel and this test would have asserted nothing at all. Any REQUIRED setting serves; the
+    property under test is about the message, not about which key is absent.
     """
     secret = "s3cret-app-password"  # noqa: S105 — a fixture value, and the point of the test
-    write_email_config(settings, SMTP_PASSWORD=secret, SMTP_USER="")
+    write_email_config(settings, SMTP_PASSWORD=secret, SMTP_HOST="")
     with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
         assert AlertConfig.load(settings).email_ready() is False
 
-    assert "SMTP_USER" in caplog.text          # the NAME of what is missing
+    assert "SMTP_HOST" in caplog.text          # the NAME of what is missing
     assert secret not in caplog.text           # never the value of what is not
     # And the password is really in the config the check just read, so the assertion above is
     # answering a question that could have gone the other way.

@@ -7,6 +7,90 @@ All notable changes to this project are documented here. The format follows
 A breaking change to a name in a module's `__all__` is a MAJOR bump, and its entry names every
 consumer repository that needs a code change.
 
+## [1.2.0] - 2026-09-03
+
+The alerting **convention** becomes a function signature. The fleet's ops-alerting standard has
+specified one shared configuration file and three container variables for a while; five templates
+each declared a different shape of alerting variable and **not one declared the variable the
+standard actually names**, because a convention that exists only as prose gets interpreted. This
+release makes it executable: a missing variable is now an error at boot rather than a divergence
+discovered when an alert does not arrive.
+
+`kw_common.alerting` stays environment-free — that is what makes it portable, and putting file and
+environment reading back into it would undo the removal 1.0.1 made deliberately. The deployment
+knowledge lives in a **sibling module** instead.
+
+### Added
+
+- **`kw_common.alerting_env`** — two layers, on purpose:
+  - `load_alert_settings(config_path, deploy_env, service)` is pure. It reads no environment
+    variable and has no default path, so it works outside this deployment and is testable without
+    touching `os.environ`.
+  - `load_alert_settings_from_env(service)` is the convention: it reads `SHARED_ROOT` and
+    `DEPLOY_ENV` and **refuses, loudly, when either is unset or blank.** Blank is refused as well
+    as absent, because a container platform passes an unfilled Variable as an empty string.
+- **`validate_boot(...)` / `validate_boot_from_env(...)`** — the startup check. It verifies the
+  mount, the structure, that the file is readable, and that every key this environment requires
+  carries a value; on success it sends **one** confirmation alert and writes an empty marker into
+  `CONFIG_PATH`, and later boots skip the check while that marker is newer than the config file.
+  ⛔ **A failure logs and raises and does not attempt to alert** — it cannot report a broken
+  alerting channel through that channel.
+- **The required-key manifest, owned here** — `required_keys(deploy_env)`. Otherwise every app
+  answers "what does prod require?" independently and they disagree the first time a key is added.
+- **`alerting.env.template`** and **`docs/alerting-setup.md`** — the setup contract, owned once.
+  Per-OS commands create the structure and fetch the template with `mkdir` + `curl -fLo` or
+  `New-Item` + `Invoke-WebRequest -OutFile`; **nothing is piped into a shell**, and the page says
+  to review any file you download and that you proceed at your own risk. A consumer README carries
+  a prerequisite block and a **link** to that page — never a copy.
+- **`AlertSettings.title_prefix`** — applied to the email subject and the ntfy title, and to
+  nothing else.
+
+### Changed
+
+- **`SMTP_USER` is now OPTIONAL and defaults to `EMAIL_FROM`.** They are the same value in this
+  deployment today and they are different things — the auth identity and the header — so the key
+  stays and simply is not required. A file that sets it to something different is honoured, which
+  is what a verified alias or a relay whose user is literally `apikey` needs. Applied where the
+  file is READ, so it survives the per-notification re-read that lets a password rotation take
+  effect without a restart.
+- **`_parse_env_file` split into a read and a parse.** One parser, two error policies: `alerting`
+  reads fail-soft (a missing or mis-encoded file means the email channel is unconfigured, which is
+  right for a notification already in flight) and `alerting_env.read_config` reads fail-loud (at
+  boot, "the file is empty" and "the file is UTF-16" must not look alike). A second parser would
+  let boot validation accept a file the send path then reads differently.
+- `tests/test_readme.py` demanded EXACTLY ONE `python` block in the README, which was a bound on
+  the document rather than a property of it — and the cheapest way to satisfy it was to delete a
+  block. It now checks every block, per block.
+
+### Notes for adopters
+
+- **The title prefix is a property of the TOPIC, not of the service.** A service on the shared
+  environment topic gets `[<env>][<service>]` in front of its alert titles, because on a shared
+  topic nothing else says who is talking. A service with its own `NTFY_URL_<SERVICE>` topic gets
+  **no** prefix. reauth-bot is the live example and keeps exactly what it does today.
+- **The prefix reaches the two outbound channels and nothing else.** The de-duplication state key,
+  the retrievable error record and the process log line all keep the RAW title, so promoting a
+  service from dev to prod does not re-page every escalating condition it had already reported.
+- **`NTFY_URL_<SERVICE>` has exactly one spelling**: the service name upper-cased with every
+  non-alphanumeric character replaced by `_`, so `reauth-bot` is `NTFY_URL_REAUTH_BOT`. A key
+  spelled any other way is ignored and the service quietly lands back on the shared topic with a
+  prefix it should not have. `alerting_env.ntfy_key(service)` is exported so nothing has to guess.
+- **`state_file` and `error_log` are NOT in the shared file and are not loader arguments.** They
+  are the app's own paths under its own volume; use `dataclasses.replace(settings, ...)`.
+- **`NTFY_URL_<ENV>` is required even for a service that has its own topic.** The file is shared:
+  a file missing `NTFY_URL_PROD` is broken for every service without an override, and the next
+  service to adopt is exactly that one.
+- ⚠️ **`CONFIG_PATH` is not the config file.** `load_alert_settings`'s first parameter is called
+  `config_path` and is the alerting.env FILE; the `CONFIG_PATH` variable is the app's own
+  read-write DIRECTORY, where the marker goes. The validation function spells that one
+  `marker_dir` rather than repeating the ambiguity.
+
+### Out of scope, deliberately
+
+Adopting this anywhere — each service's adoption is its own package — any container template edit,
+and user-facing notifications, which run off per-user preferences and never share a channel, a
+topic or a config file with operator alerting.
+
 ## [1.1.0] - 2026-09-02
 
 The leak guard becomes a module. It was a **file that seven repositories each kept a copy of**,

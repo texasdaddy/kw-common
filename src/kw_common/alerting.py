@@ -518,6 +518,12 @@ class AlertSettings:
                    entirely — nothing is read, nothing is written, every call is delivered.
     `error_log`    path for the retrievable JSONL error log. `None` disables that sink.
 
+    `title_prefix` is put in front of the title on the way OUT, on both channels and nowhere
+                   else. `""` (the default) means none. `kw_common.alerting_env` sets it to
+                   `[<env>][<service>] ` for a service on a SHARED ntfy topic and leaves it empty
+                   for one with its own, because that is a property of the topic rather than of
+                   the service.
+
     `allow_cleartext_ntfy` opts a deployment IN to an `http://` topic URL. Defaults to `False`,
                    which turns a cleartext topic into an unconfigured channel. See `ntfy_ready()`
                    for why a topic URL is treated as a credential rather than an address.
@@ -540,6 +546,19 @@ class AlertSettings:
     # every positional argument after it in code this library does not get to see. Readability
     # inside this file is not worth that; the docstring above groups it where a reader looks.
     allow_cleartext_ntfy: bool = False
+    # ⭐ APPENDED for the same reason as the field above — a dataclass field's POSITION is the
+    # constructor signature — and DEFAULTED TO EMPTY so it is inert for every existing caller.
+    #
+    # What it is for: on a SHARED ntfy topic, nothing in a push notification says which service
+    # is talking, so `kw_common.alerting_env` puts `[<env>][<service>] ` in front of the title. On
+    # a service's OWN topic the topic is already the identifier and the prefix is noise, so it is
+    # empty. The decision belongs to whoever knows the deployment; this module only carries it.
+    #
+    # ⚠️ DISPLAY ONLY. It reaches the email subject and the ntfy `Title` and NOTHING else — the
+    # de-duplication state file, the error-log record and the process log line all keep the RAW
+    # title. A condition's identity must not change when its deployment does, or promoting a
+    # service from dev to prod re-fires every escalating condition it had already reported.
+    title_prefix: str = ""
 
     def __post_init__(self) -> None:
         # Raising here is deliberate and does NOT weaken the "notify() never raises" invariant:
@@ -616,6 +635,14 @@ class AlertSettings:
         # every blank path above gets set wrong: straight out of a container Variable. The string
         # `"false"` is TRUE to Python, so a deployment that spelled its opt-out correctly in the
         # template would have silently opted IN. Refuse the string and make the operator convert.
+        # A `str` and nothing else. `None` is the obvious thing to reach for when a caller means
+        # "no prefix", and it would reach the two send paths as the literal text `None` in front
+        # of every alert title — visible, wrong, and only in production.
+        if not isinstance(self.title_prefix, str):
+            raise ValueError(
+                f"AlertSettings.title_prefix must be a string ('' for none), got "
+                f"{type(self.title_prefix).__name__}")
+
         if not isinstance(self.allow_cleartext_ntfy, bool):
             raise ValueError(
                 "AlertSettings.allow_cleartext_ntfy must be True or False, got "
@@ -657,6 +684,25 @@ def _parse_env_file(path: str) -> dict[str, str]:
         log.warning("alert config %s unreadable (%s) — email alerts disabled until it is fixed",
                     path, type(exc).__name__)
         return values
+    return _parse_env_text(raw)
+
+
+def _parse_env_text(raw: str) -> dict[str, str]:
+    """The parse itself, over text that has already been read.
+
+    ⭐⭐ SPLIT OUT SO THERE IS EXACTLY ONE PARSER, WITH TWO ERROR POLICIES ABOVE IT.
+    `_parse_env_file` reads fail-SOFT: a missing or mis-encoded file means the email channel is
+    unconfigured, which is the right answer for a notification already in flight.
+    `kw_common.alerting_env.read_config` reads fail-LOUD, because at BOOT "the file is empty" and
+    "the file is UTF-16" must not look alike. Two policies, one parse — a second parser would be a
+    second answer to the same question, and boot validation would then be able to accept a file
+    the send path reads differently.
+
+    This function is imported by `alerting_env` despite the leading underscore, deliberately: it
+    is a seam inside one package, not a public surface, and exporting it would make the parse
+    format a semver contract it is not.
+    """
+    values: dict[str, str] = {}
     # ⭐ `split("\n")`, NEVER `splitlines()` — the second half of the same fix. `str.splitlines()`
     # breaks on far more than a newline — `\v`, `\f`, `\x1c`-`\x1e`, `\x85`, U+2028 and U+2029 are
     # all line boundaries to it — and no config-file format intends any of them as one. The
@@ -848,8 +894,25 @@ class AlertConfig:
                           "parser; the traceback says which.", path, type(exc).__name__,
                           exc_info=True)
                 parsed = {}
+        email = {k: parsed.get(k, "").strip() for k in EMAIL_KEYS}
+        # ⭐ `SMTP_USER` IS OPTIONAL AND DEFAULTS TO `EMAIL_FROM`. They are the same value in this
+        # fleet today and they are NOT the same thing: `SMTP_USER` is the AUTH IDENTITY the relay
+        # checks, `EMAIL_FROM` is the header the recipient reads. They diverge on a verified alias
+        # and on a relay whose user is literally `apikey`, so the key stays — it just is not
+        # something an operator should have to type twice.
+        #
+        # ⚠️ APPLIED HERE, NOT IN THE LOADER, because this file is re-read on EVERY notification
+        # so that rotating the password takes effect without a restart. A default injected once at
+        # boot would be discarded by the first send.
+        #
+        # ⚠️ AND IT PRESERVES "NOTHING IS CONFIGURED". An absent or empty file leaves `EMAIL_FROM`
+        # blank, so `SMTP_USER` stays blank too and `email_ready()` still reports the channel
+        # unconfigured rather than misconfigured — the distinction its own comment calls
+        # load-bearing.
+        if not email["SMTP_USER"]:
+            email["SMTP_USER"] = email["EMAIL_FROM"]
         return cls(ntfy_url=settings.ntfy_url or "",
-                   email={k: parsed.get(k, "").strip() for k in EMAIL_KEYS},
+                   email=email,
                    config_file=path,
                    allow_cleartext_ntfy=_opted_into_cleartext(settings))
 
@@ -1565,6 +1628,26 @@ def _is_cert_failure(exc: BaseException) -> bool:
 
 
 # --- the alerter ------------------------------------------------------------------------------
+def _title_prefix(settings: object) -> str:
+    """The outbound title prefix for these settings, or `""`. NEVER raises.
+
+    ⭐⭐ DEFENSIVE ON PURPOSE, AND THE REASON IS ALREADY WRITTEN DOWN ONE FUNCTION BELOW:
+    "an `Alerter` takes any settings-shaped object and validates nothing". A stand-in without this
+    attribute, a `dataclass` predating it, or a `property` that raises are all real inputs — and
+    reading the attribute straight in `_dispatch` made every one of them cost the WHOLE
+    notification. Measured: three existing tests went from `"sent"` to `"failed"`, with the
+    outer guard reporting `AttributeError` and no channel attempted.
+
+    The prefix is COSMETIC. Nothing about it may cost a delivery, so anything that is not a plain
+    string becomes no prefix at all.
+    """
+    try:
+        value = getattr(settings, "title_prefix", "")
+    except Exception:  # noqa: BLE001 — a property on caller-supplied settings can raise anything
+        return ""
+    return value if isinstance(value, str) else ""
+
+
 @dataclass(frozen=True)
 class Alerter:
     """One service's alerting, bound to its injected settings.
@@ -2019,6 +2102,11 @@ class Alerter:
     # --- dispatch -------------------------------------------------------------------------
     def _dispatch(self, spec: SeveritySpec, title: str, message: str) -> dict[str, str]:
         cfg = self.config()
+        # ⭐ THE PREFIX IS APPLIED HERE AND ONLY HERE — at the boundary where the notification
+        # leaves the process. Everything upstream (the de-duplication key, the error record, the
+        # log line) has already used the raw title, which is what keeps a condition's identity
+        # independent of the deployment it is running in. See `AlertSettings.title_prefix`.
+        title = f"{_title_prefix(self.settings)}{title}"
         results: dict[str, str] = {}
         for name, send in _CHANNELS:
             # Readiness is evaluated INSIDE this channel's own guard. Hoisting it out — which

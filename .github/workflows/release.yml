@@ -230,7 +230,8 @@ jobs:
           sdist="$(ls dist/*.tar.gz)"
           echo "inspecting ${sdist}"
           names="$(tar tzf "$sdist")"
-          for required in '/tests/conftest.py' '/.leakguard.json' '/.github/workflows/ci.yml'; do
+          for required in '/tests/conftest.py' '/.leakguard.json' '/.github/workflows/ci.yml' \
+                          '/alerting.env.template' '/docs/alerting-setup.md'; do
             echo "$names" | grep -q "${required}\$" || {
               echo "::error::the sdist has no ${required} — its suite ships without something it"
               echo "::error::depends on. Check MANIFEST.in."
@@ -273,13 +274,20 @@ jobs:
           cd /tmp
           /tmp/consumer/bin/python -c "
           import kw_common, kw_common.alerting as a, kw_common.leakguard as g
+          import kw_common.alerting_env as e
           import os
           assert kw_common.__version__ == os.environ['GITHUB_REF_NAME'].lstrip('v'), (
               kw_common.__version__, os.environ['GITHUB_REF_NAME'])
           assert a.notify and a.AlertSettings and a.configure
           assert g.main and g.cli and g.load_config and g.CONFIG_FILENAME == '.leakguard.json'
-          print('installed', kw_common.__version__, 'with', len(a.__all__), '+', len(g.__all__),
-                'exports')
+          # The environment layer, from the PUBLISHED wheel. The three variable names are what a
+          # container template declares, so they are asserted rather than merely imported.
+          assert e.load_alert_settings and e.load_alert_settings_from_env and e.validate_boot
+          assert (e.SHARED_ROOT_VAR, e.CONFIG_PATH_VAR, e.DEPLOY_ENV_VAR) == (
+              'SHARED_ROOT', 'CONFIG_PATH', 'DEPLOY_ENV')
+          assert e.CONFIG_RELPATH == 'configs/alerting.env'
+          print('installed', kw_common.__version__, 'with',
+                len(a.__all__), '+', len(e.__all__), '+', len(g.__all__), 'exports')
           "
       # ⭐ THE CONSOLE SCRIPT IS A SEPARATE CLAIM FROM THE IMPORT, and it is the one a consumer's
       # CI depends on. An entry point aimed at the wrong callable installs fine, imports fine, and
