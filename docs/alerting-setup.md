@@ -101,8 +101,10 @@ ships as `CHANGE-ME` and which boot validation refuses. The template documents e
 version:
 
 * **email** — `EMAIL_TO`, `EMAIL_FROM`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_PASSWORD` are required.
-  `SMTP_USER` is optional and defaults to `EMAIL_FROM`; set it only when the auth identity and the
-  From header genuinely differ.
+  `SMTP_USER` is optional and defaults to `EMAIL_FROM` **only when `EMAIL_FROM` is a plain
+  `local@domain`**. A From header carrying a display name (`Alerts <box@host>`) or non-ASCII text
+  is a valid header and is not a credential, so it will not be used as one — such a deployment
+  must set `SMTP_USER` explicitly, and boot refuses until it does.
 * **ntfy** — `NTFY_URL_DEV` and `NTFY_URL_PROD` are the topics services share. Each is a **full
   URL**, never a bare topic name.
 * **a dedicated topic** — optional, one service, `NTFY_URL_<SERVICE>`. It wins over the shared
@@ -111,7 +113,7 @@ version:
   `_` and the ends trimmed, so `backup-agent` is `NTFY_URL_BACKUP_AGENT`. There is exactly one
   spelling: a key spelled any other way is ignored and the service quietly lands back on the
   shared topic. A service may not be named `dev` or `prod` — that would derive a shared
-  environment key — and `kw_common.alerting_env.ntfy_key("<service>")` prints the answer if you
+  environment key — and `kw_common.alerting_env.ntfy_key("<service>")` returns the answer if you
   would rather not derive it by hand.
 
 ## 5. Set the three variables
@@ -151,8 +153,9 @@ either is unset. `validate_boot_from_env` additionally reads `CONFIG_PATH` and c
 * the file reads and is UTF-8;
 * every key this environment requires carries a value, and none of them is still `CHANGE-ME`;
 * every configured channel is one the library can actually send on — a bare topic instead of a
-  full ntfy URL, an unusable `SMTP_PORT`, or an `EMAIL_FROM` that is not a plain mailbox all refuse
-  here rather than failing silently on the first real alert.
+  full ntfy URL, an unusable `SMTP_PORT`, or an `EMAIL_FROM` that is not a plain mailbox **and no
+  `SMTP_USER` to stand in for it** all refuse here rather than failing silently on the first real
+  alert. (With `SMTP_USER` set explicitly, a display-name `EMAIL_FROM` is perfectly fine.)
 
 Then it sends **one** confirmation alert and writes an empty marker into `CONFIG_PATH`. Later boots
 skip the check while that marker is newer than the config file, so editing the file is what makes

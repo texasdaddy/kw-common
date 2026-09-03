@@ -677,6 +677,13 @@ def _is_bare_mailbox(value: str) -> bool:
         value.encode("ascii")
     except UnicodeEncodeError:
         return False
+    # ⛔ A CONTROL CHARACTER IS A NO, and this line is what makes the docstring's "anything it does
+    # not recognise is a NO" true rather than aspirational. `.strip()` removes only WHITESPACE, so
+    # an embedded NUL or SOH survived every check below and was copied into `SMTP_USER` — leaving
+    # `email_ready()` reporting True for a channel that cannot authenticate, which is precisely
+    # the direction this predicate exists to close.
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+        return False
     # `<`/`>` are the display-name form; whitespace, `,` and `;` mean more than a mailbox;
     # `(`/`)` are a comment. Any of them and this is a header value, not a credential.
     return not any(ch in value for ch in '<>,;()"\\ \t')

@@ -18,16 +18,16 @@ that later reads its configuration out of a database — imports only the first,
 
 ⭐ THE POINT OF THE PACKAGE: THE CONVENTION IS A FUNCTION SIGNATURE, NOT PROSE.
 
-Five container templates currently declare five different shapes of alerting variable and not one
-of them declares the variable the standard has specified since the alerting redesign. Every new
+Container templates in this deployment each declared a different shape of alerting variable, and
+not one declared the variable the standard has specified since the alerting redesign. Every new
 build re-invented its own configuration because the convention existed only as documentation, and
 documentation is interpreted. A missing variable is now an ERROR AT BOOT rather than a silent
 divergence discovered when an alert does not arrive.
 
 ⛔ NO OPERATOR PATH IS A DEFAULT HERE, IN CODE OR AS A FALLBACK. Not the shared root, not the
 config directory, not the environment. All three arrive as values. A default path is one that
-silently "works" in the exact deployment it is wrong for, and this library is installed by six
-repositories on machines this file has never seen.
+silently "works" in the exact deployment it is wrong for, and this library is installed on
+machines this file has never seen.
 
 ## The three variables
 
@@ -133,7 +133,7 @@ class AlertEnvError(RuntimeError):
 # ⭐ THE VARIABLE NAMES ARE CONSTANTS, NOT STRING LITERALS SPRINKLED THROUGH THE CODE. A consumer
 # writing its container template reads them from here (or from the setup document, which is
 # generated from the same names), so a template and the code that reads it cannot disagree about
-# spelling — which is precisely how five templates ended up declaring five different variables.
+# spelling — which is precisely how a set of templates ended up declaring different variables.
 SHARED_ROOT_VAR = "SHARED_ROOT"
 CONFIG_PATH_VAR = "CONFIG_PATH"
 DEPLOY_ENV_VAR = "DEPLOY_ENV"
@@ -151,8 +151,8 @@ ENVIRONMENTS = ("dev", "prod")
 
 # ⭐⭐ THE REQUIRED-KEY MANIFEST LIVES HERE, NEXT TO THE LOADER, AND NOWHERE ELSE.
 # Otherwise every app answers "what does prod require" independently, and they disagree the first
-# time a key is added — which is the same failure as five templates with five variable shapes, one
-# layer down.
+# time a key is added — which is the same failure as templates with differing variable shapes,
+# one layer down.
 #
 # ⚠️ `SMTP_USER` IS ABSENT FROM THIS LIST ON PURPOSE and is listed as optional below. It defaults
 # to `EMAIL_FROM`. They are the same value in this deployment today but they are different things:
@@ -237,6 +237,20 @@ def ntfy_key(service: str) -> str:
     """
     if not isinstance(service, str) or not service.strip():
         raise _refuse("service must be a non-blank name")
+    # ⛔ REFUSED HERE, WHERE THE CALLER IS ALREADY CATCHING `AlertEnvError`. `.strip()` removes only
+    # LEADING AND TRAILING whitespace, so an INTERIOR control character survived into the title
+    # prefix and was then refused by `AlertSettings.__post_init__` with a bare `ValueError` — which
+    # walks straight through an adopter's `except AlertEnvError`, the one thing the setup document
+    # tells them to catch. Same refusal, this module's own exception type.
+    #
+    # ⚠️ ASKED OF THE STRIPPED VALUE, and the first attempt asked it of the raw one — which refused
+    # a name with a TRAILING newline that `.strip()` handles perfectly well. A false refusal of a
+    # configuration that was fine is the worse error of the two, and the suite caught it.
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in service.strip()):
+        raise _refuse(
+            f"service={service!r} contains a control character. It would reach the ntfy Title "
+            f"header and the mail Subject, both of which refuse one, so every alert on every "
+            f"channel would fail.")
     stem = _NON_KEY_CHARS.sub("_", service.strip()).strip("_").upper()
     if not stem:
         raise _refuse(
@@ -593,6 +607,19 @@ def _check_layout(config: Path, shared_root: str | os.PathLike[str] | None) -> N
 _PLACEHOLDER = "CHANGE-ME"
 
 
+def _is_placeholder(value: str) -> bool:
+    """Whether this value is still the template's marker rather than a setting.
+
+    ⚠️ THE BOUNDARY IS A HYPHEN, NOT A BARE PREFIX. The template spells several of its markers
+    `CHANGE-ME-to-your-...`, so an exact match is not enough — but a bare `startswith` FALSE-
+    REFUSED a real value that merely begins the same way (`CHANGE-MEMORABLE` as a password was
+    measured refused). A boot check that refuses a CORRECT configuration is worse than one that is
+    slightly permissive: it gets switched off, and net safety goes down.
+    """
+    text = value.strip().upper()
+    return text == _PLACEHOLDER or text.startswith(_PLACEHOLDER + "-")
+
+
 def _check_required(values: dict[str, str], env: str, config: Path) -> None:
     """Every key this environment requires carries a real value — not blank, not a placeholder."""
     required = required_keys(env)
@@ -604,8 +631,7 @@ def _check_required(values: dict[str, str], env: str, config: Path) -> None:
             f"{config} is missing or blank for: {', '.join(missing)}. Those are the keys "
             f"{env!r} requires; {', '.join(OPTIONAL_KEYS)} are optional. Refusing to boot rather "
             f"than starting a service whose alerts go nowhere.")
-    unfilled = [k for k in required
-                if values.get(k, "").strip().upper().startswith(_PLACEHOLDER)]
+    unfilled = [k for k in required if _is_placeholder(values.get(k, ""))]
     if unfilled:
         raise _refuse(
             f"{config} still carries the {_PLACEHOLDER} placeholder for: {', '.join(unfilled)}. "
@@ -639,13 +665,38 @@ def _check_usable(settings: AlertSettings, config: Path) -> None:
     # ⭐ `smtp_port_fault` EXISTS FOR EXACTLY THIS CALL — pure, logs nothing, sends nothing,
     # and documented as the way to ask "is this port acceptable" at BOOT rather than by provoking
     # a send-time ERROR that logs on every notification and pages on none.
+    if settings.ntfy_url and settings.title_prefix:
+        # ⭐ ASKED ONLY WHEN ntfy IS CONFIGURED, and that scoping is the point. `http.client`
+        # encodes a header value as LATIN-1, so a prefix carrying (say) a currency sign fails every
+        # ntfy send with a `UnicodeEncodeError` while email is perfectly fine — which is why this
+        # cannot be a refusal in `AlertSettings.__post_init__`, where it would reject a legitimate
+        # non-ASCII prefix for an email-only deployment. The constructor refuses CONTROL characters,
+        # which break both channels; this refuses what breaks only the one that is configured.
+        try:
+            settings.title_prefix.encode("latin-1")
+        except UnicodeEncodeError:
+            dead.append(
+                "the alert title prefix contains a character ntfy's Title header cannot carry "
+                "(it is encoded latin-1), so every ntfy send would fail — the prefix is built "
+                "from the service name, so rename the service or give it its own topic")
     fault = smtp_port_fault((cfg.email or {}).get("SMTP_PORT", ""))
     if fault:
         dead.append(f"SMTP_PORT is unusable: {fault}")
     if dead:
+        # ⚠️ THE CLOSING SENTENCE IS BRANCH-DEPENDENT, because the blanket one was FALSE for the
+        # port. `smtp_port()` falls back to the documented default and `email_ready()` deliberately
+        # does not consult the port, so a port fault alone would still have delivered on both
+        # channels: "your alerts go nowhere" would have been a claim-inflated reason for a refusal
+        # that is really about being explicit at boot. The refusal stays; the reason gets honest.
+        goes_nowhere = len(dead) > 1 or not dead[0].startswith("SMTP_PORT")
+        why = ("Refusing to boot rather than starting a service whose alerts go nowhere."
+               if goes_nowhere else
+               "Refusing to boot: the port would fall back to the default and mail would very "
+               "likely still be delivered, but a setting this file states and states wrongly is "
+               "fixed at boot, not discovered later.")
         raise _refuse(
             f"{config} parses and carries every required key, but: " + "; ".join(dead) + ". "
-            "Refusing to boot rather than starting a service whose alerts go nowhere.")
+            + why)
 
 
 def _announce(settings: AlertSettings, env: str, values: dict[str, str], config: Path,

@@ -1293,6 +1293,159 @@ def test_a_hostile_title_cannot_take_down_a_channel_it_never_reached(
     assert results["ntfy"] == "skipped"
 
 
+# ============================ what the CONFIRMING pass found IN the round-one fixes, pinned
+@pytest.mark.parametrize("password", ["CHANGE-MEMORABLE", "change-mesmerising", "CHANGEMENOW",
+                                      "CHANGE", "CHANGE-ME-NOT!x9"])
+def test_a_real_value_that_merely_BEGINS_like_the_placeholder_still_boots(
+        tmp_path: Path, password: str) -> None:
+    """⭐⭐ A FALSE REFUSAL IS THE WORSE ERROR, and the first version of the placeholder check made
+    one: a bare `startswith("CHANGE-ME")` refused `CHANGE-MEMORABLE` as an unfilled template.
+
+    A boot check that refuses a CORRECT configuration is the kind that gets switched off, and then
+    net safety goes DOWN — so the boundary is the hyphen the template actually uses.
+
+    ⚠️ `CHANGE-ME-NOT!x9` is here deliberately and IS refused nowhere: it begins `CHANGE-ME-`, so
+    it is caught. That is the accepted cost of the template spelling its markers
+    `CHANGE-ME-to-your-...`, and it is a password nobody has.
+    """
+    if password == "CHANGE-ME-NOT!x9":  # noqa: S105 — a fixture value, and the point of the test
+        pytest.skip("documented in this test's docstring as the accepted false positive")
+    config = write_shared(tmp_path, SMTP_PASSWORD=password)
+    settings = load_alert_settings(config, "prod", "feed-poller")
+    assert validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings)) is True
+
+
+def test_the_exact_placeholder_and_its_hyphenated_forms_are_still_refused(tmp_path: Path) -> None:
+    """The other direction, so the loosened boundary did not loosen it away entirely."""
+    for value in ("CHANGE-ME", "change-me", "  CHANGE-ME  ", "CHANGE-ME-to-your-ops-address"):
+        config = write_shared(tmp_path, EMAIL_TO=value)
+        settings = load_alert_settings(config, "prod", "feed-poller")
+        with pytest.raises(AlertEnvError, match="EMAIL_TO"):
+            validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
+
+
+def test_a_control_character_in_the_service_name_raises_AlertEnvError_not_ValueError(
+        tmp_path: Path) -> None:
+    """⛔ THE EXCEPTION TYPE IS PART OF THE CONTRACT. The setup document tells an adopter to let
+    `AlertEnvError` stop the process; a bare `ValueError` from the settings constructor walks
+    straight through that handler. `.strip()` removes only LEADING and TRAILING whitespace, so an
+    INTERIOR control character reached the title prefix and was refused one layer too late."""
+    write_shared(tmp_path)
+    for name in ("feed\tpoller", "feed\x01poller", "svc\x7f", "a\nb"):
+        with pytest.raises(AlertEnvError, match="control character"):
+            load_alert_settings(config_file_for(tmp_path), "prod", name)
+
+
+def test_a_service_name_with_SURROUNDING_whitespace_is_still_fine(tmp_path: Path) -> None:
+    """The false refusal the first version of that check made: a trailing newline is whitespace
+    `.strip()` handles, and refusing it would refuse a name that was never a problem."""
+    write_shared(tmp_path)
+    settings = load_alert_settings(config_file_for(tmp_path), "prod", "  feed-poller\n")
+    assert settings.service == "feed-poller"
+
+
+@pytest.mark.parametrize("value", ["al\x00erts@example.com", "alerts\x01@example.com",
+                                   "alerts@exa\x7fmple.com"])
+def test_a_control_character_stops_EMAIL_FROM_standing_in_for_SMTP_USER(
+        tmp_path: Path, value: str) -> None:
+    """⭐ `_is_bare_mailbox` promises "anything it does not recognise is a NO", and an embedded NUL
+    walked past every check: `.strip()` removes only whitespace, so it was copied into `SMTP_USER`
+    and `email_ready()` reported True for a channel that cannot authenticate — the exact "dead
+    while looking configured" direction that predicate exists to close."""
+    assert alerting._is_bare_mailbox(value) is False
+    config = drop(tmp_path, "SMTP_USER")
+    config.write_text(
+        config.read_text(encoding="utf-8").replace("EMAIL_FROM=svc@example.com",
+                                                   f"EMAIL_FROM={value}"), encoding="utf-8")
+    settings = load_alert_settings(config, "prod", "feed-poller")
+    with pytest.raises(AlertEnvError, match="email"):
+        validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
+
+
+@pytest.mark.parametrize("mailbox", ["ops+alerts@example.com", "a@b", "ops@example.technology",
+                                     "o'brien@example.com", "a.b_c-d@sub.example.com"])
+def test_a_legitimate_bare_mailbox_still_stands_in(mailbox: str) -> None:
+    """The restrictive direction, so tightening the predicate did not break the case it exists
+    for: `+`-addressing, a long TLD, an apostrophe and a subdomain are all real mailboxes."""
+    assert alerting._is_bare_mailbox(mailbox) is True
+
+
+def test_a_prefix_ntfys_header_cannot_carry_refuses_to_boot_only_when_ntfy_is_configured(
+        tmp_path: Path) -> None:
+    """⭐ SCOPED TO THE CHANNEL IT BREAKS. `http.client` encodes a header value LATIN-1, so a
+    currency sign in the prefix fails every ntfy send while email is perfectly fine — which is why
+    this cannot live in `AlertSettings.__post_init__`, where it would reject a legitimate
+    non-ASCII prefix for an email-only deployment."""
+    from dataclasses import replace
+
+    write_shared(tmp_path)
+    settings = load_alert_settings(config_file_for(tmp_path), "prod", "poller-€")
+    assert settings.title_prefix == "[prod][poller-€] "     # accepted by the constructor
+    with pytest.raises(AlertEnvError, match="latin-1"):
+        validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
+
+    # ...and with no ntfy topic the same prefix is fine, because nothing would fail.
+    email_only = replace(settings, ntfy_url="")
+    assert validate_boot(email_only, "prod", tmp_path / "app2",
+                         alerter=Alerter(email_only)) is True
+
+
+def test_a_port_only_fault_does_not_claim_the_alerts_would_go_nowhere(tmp_path: Path) -> None:
+    """⚠️ CLAIM-INFLATION IN A REFUSAL. `smtp_port()` falls back to the documented default and
+    `email_ready()` deliberately does not consult the port, so a port fault alone would still have
+    delivered on BOTH channels. The refusal stays — a setting stated wrongly is fixed at boot —
+    but the reason has to be true."""
+    config = write_shared(tmp_path, SMTP_PORT="0")
+    settings = load_alert_settings(config, "prod", "feed-poller")
+    with pytest.raises(AlertEnvError) as exc:
+        validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
+    assert "SMTP_PORT" in str(exc.value)
+    assert "go nowhere" not in str(exc.value)
+
+    # ...while a fault that really does silence a channel still says so.
+    config = write_shared(tmp_path, NTFY_URL_PROD="bare-topic")
+    settings = load_alert_settings(config, "prod", "feed-poller")
+    with pytest.raises(AlertEnvError, match="go nowhere"):
+        validate_boot(settings, "prod", tmp_path / "app3", alerter=Alerter(settings))
+
+
+def test_the_templates_OWN_transform_examples_are_checked_against_the_code() -> None:
+    """⭐⭐ THE DOCUMENTATION DEFECT THAT NOTHING COULD CATCH, TURNED INTO SOMETHING THAT CAN.
+
+    The `NTFY_URL_<SERVICE>` rule is stated in three places and two of them described a
+    PER-CHARACTER substitution, while the code collapses a RUN and trims the ends. Every published
+    example happened to fall in the set where the two agree, so it read plausibly — and an
+    operator with a doubled or trailing separator would have written a key the loader never looks
+    up and landed on the shared topic, with a prefix, silently.
+
+    Prose cannot be tested. EXAMPLES can, so the template now carries examples that exercise a run
+    and a trailing separator, and this reads them out of the shipped file and asks the code.
+    """
+    import re as _re
+
+    examples = _re.findall(r'service "([^"]+)"\s*->\s*(NTFY_URL_\S+)',
+                           TEMPLATE.read_text(encoding="utf-8"))
+    assert len(examples) >= 4, (
+        f"the template shows {len(examples)} transform example(s); it needs enough to cover a "
+        f"plain name, a hyphen, a RUN of separators and a trailing one")
+    for service, key in examples:
+        assert ntfy_key(service) == key, (
+            f"the template tells an operator that {service!r} is {key}, but the loader looks up "
+            f"{ntfy_key(service)}")
+    # ⭐ AND THE EXAMPLES MUST DISTINGUISH THE RIGHT RULE FROM THE WRONG ONE. Every previously
+    # published example fell in the set where per-character and per-run substitution AGREE, which
+    # is exactly why the wrong wording read plausible for two rounds. Compute what the wrong rule
+    # would produce and require at least one example where the two differ.
+    def per_character(service: str) -> str:
+        return "NTFY_URL_" + _re.sub(r"[^A-Za-z0-9]", "_", service).upper()
+
+    distinguishing = [s for s, _ in examples if ntfy_key(s) != per_character(s)]
+    assert distinguishing, (
+        "no example separates the per-RUN rule from the per-CHARACTER one, so this test would "
+        "have passed on the wording that was wrong. Add a name with a doubled or trailing "
+        "separator.")
+
+
 # ============================================================ the package's own boundaries
 def test_importing_alerting_env_does_not_drag_in_the_leak_guard() -> None:
     """Contract rule 5: modules are independently importable. `alerting_env` needs `alerting` —

@@ -9,11 +9,11 @@ consumer repository that needs a code change.
 
 ## [1.2.0] - 2026-09-03
 
-The alerting **convention** becomes a function signature. The fleet's ops-alerting standard has
-specified one shared configuration file and three container variables for a while; five templates
-each declared a different shape of alerting variable and **not one declared the variable the
-standard actually names**, because a convention that exists only as prose gets interpreted. This
-release makes it executable: a missing variable is now an error at boot rather than a divergence
+The alerting **convention** becomes a function signature. The ops-alerting standard has specified
+one shared configuration file and three container variables for a while; the templates each
+declared a different shape of alerting variable and **not one declared the variable the standard
+actually names**, because a convention that exists only as prose gets interpreted. This release
+makes it executable: a missing variable is now an error at boot rather than a divergence
 discovered when an alert does not arrive.
 
 `kw_common.alerting` stays environment-free — that is what makes it portable, and putting file and
@@ -78,15 +78,16 @@ knowledge lives in a **sibling module** instead.
 - **The title prefix is a property of the TOPIC, not of the service.** A service on the shared
   environment topic gets `[<env>][<service>]` in front of its alert titles, because on a shared
   topic nothing else says who is talking. A service with its own `NTFY_URL_<SERVICE>` topic gets
-  **no** prefix. The one service in this deployment that already has its own topic keeps exactly
-  what it does today.
+  **no** prefix. A service that already has its own topic keeps exactly what it does today.
 - **The prefix reaches the two outbound channels and nothing else.** The de-duplication state key,
   the retrievable error record and the process log line all keep the RAW title, so promoting a
   service from dev to prod does not re-page every escalating condition it had already reported.
-- **`NTFY_URL_<SERVICE>` has exactly one spelling**: the service name upper-cased with every
-  non-alphanumeric character replaced by `_`, so `backup-agent` is `NTFY_URL_BACKUP_AGENT`. A key
-  spelled any other way is ignored and the service quietly lands back on the shared topic with a
-  prefix it should not have. `alerting_env.ntfy_key(service)` is exported so nothing has to guess.
+- **`NTFY_URL_<SERVICE>` has exactly one spelling**: the service name upper-cased, with each RUN
+  of non-alphanumeric characters replaced by a SINGLE `_` and the ends dropped — so `backup-agent`
+  is `NTFY_URL_BACKUP_AGENT` and `feed--poller` is `NTFY_URL_FEED_POLLER`, not `FEED__POLLER`. A
+  key spelled any other way is never looked up and the service quietly lands back on the shared
+  topic with a prefix it should not have. `alerting_env.ntfy_key(service)` returns the answer, and
+  the template's worked examples are checked against it by a test rather than by proofreading.
 - **`state_file` and `error_log` are NOT in the shared file and are not loader arguments.** They
   are the app's own paths under its own volume; use `dataclasses.replace(settings, ...)`.
 - **`NTFY_URL_<ENV>` is required even for a service that has its own topic.** The file is shared:
