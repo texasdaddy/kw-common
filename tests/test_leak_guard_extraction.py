@@ -226,8 +226,12 @@ def test_no_config_file_means_NOTHING_is_allowed(tmp_path: Path) -> None:
     _git(repo, "add", "notes.md")
     assert not (repo / guard.CONFIG_FILENAME).exists(), "vacuity guard: there must be no config"
     assert _run(repo).returncode == 1, "an unconfigured repository was cleared"
-    assert guard.DEFAULT_CONFIG.allow_literals == () and guard.DEFAULT_CONFIG.path_exempt == (), (
+    assert guard.DEFAULT_CONFIG.allow_literals == (), (
         "the shipped default allows something; a library must assume nothing about its consumer")
+    assert guard.PATH_EXEMPT == (), (
+        "the ENGINE ships a path exemption. It is not configurable, so this can only have been "
+        "edited into the module itself — which is a reviewed change, but not one this library "
+        "should be making on a consumer's behalf")
 
 
 # =================================================================================================
@@ -259,9 +263,12 @@ def test_a_config_that_defeats_a_DENY_CASE_is_refused(tmp_path: Path) -> None:
 def test_a_NARROW_allowance_is_still_accepted(tmp_path: Path) -> None:
     """The other direction, and the one that stops the check above being a guard that says no.
 
-    ⚠️ THIS IS ALSO THE HONEST STATEMENT OF WHAT THE REFUSAL DOES NOT COVER. The corpus holds one
-    sample per pattern and a permitted span only suppresses a hit it fully CONTAINS, so a single
-    real address can still be allowed one line at a time. That is not the hole the check closes:
+    ⚠️ THIS IS ALSO THE HONEST STATEMENT OF WHAT THE REFUSAL DOES NOT COVER. The corpus is
+    FINITE — 32 content samples across 8 labels, 9 paths and 8 messages — and a permitted span
+    only suppresses a hit it fully CONTAINS, so a single real address can still be allowed one
+    line at a time. ("One sample per pattern" is what this said, and it is wrong; the same
+    error was corrected in the module and left here, which is the instance-not-the-class shape
+    this repository treats as a defect.) That is not the hole the check closes:
     each such entry is explicit, justified, and visible in the repository's own file — which is
     more than the hand-edited engine tail it replaces ever was.
     """
@@ -294,12 +301,13 @@ def test_a_NARROW_allowance_is_still_accepted(tmp_path: Path) -> None:
         pytest.param('{"allow_literals": [{"literal": "x"}]}', "'why'", id="no-justification"),
         pytest.param('{"allow_literals": [{"literal": "", "why": "w"}]}', "non-empty",
                      id="empty-literal"),
-        pytest.param('{"path_exempt": [{"pattern": "nope", "path_regex": "^a$", "why": "w"}]}',
-                     "names no pattern", id="unknown-pattern-label"),
-        pytest.param('{"path_exempt": [{"pattern": "cgnat address", "path_regex": "^[", '
-                     '"why": "w"}]}', "not a valid regex", id="uncompilable-regex"),
-        pytest.param('{"path_exempt": [{"patern": "cgnat address", "path_regex": "^a$", '
-                     '"why": "w"}]}', "unknown key", id="typo-in-an-entry-key"),
+        pytest.param('{"allow_literals": [{"literal": "x", "whyy": "w"}]}',
+                     "unknown key", id="typo-in-an-entry-key"),
+        # ⭐ A WITHDRAWN KEY IS REFUSED, AND SAYS SO. A repository that carried a `path_exempt`
+        # entry is meeting a removed feature, not making a typo, and "unknown key" alone would
+        # send it hunting for a spelling mistake that is not there.
+        pytest.param('{"path_exempt": [{"pattern": "cgnat address", "path_regex": "^a$", '
+                     '"why": "w"}]}', "WITHDRAWN", id="the-withdrawn-key"),
     ],
 )
 def test_a_configuration_this_scanner_cannot_understand_STOPS_the_scan(
@@ -443,6 +451,14 @@ def test_a_VENDORED_guard_still_exempts_its_own_source(tmp_path: Path) -> None:
     Removing the fallback narrows the exemption; it must not remove it. A guard run from inside
     the repository it scans has to recognise its own file, or every one of its synthetic deny
     cases becomes a finding and the repository can never be clean.
+
+    ⚠️ EITHER HALF OF `_is_self` SATISFIES THIS, and they cannot be separated here: the running
+    guard IS the vendored copy, so its path resolves inside the root AND its bytes are its own.
+    Disabling the path branch alone leaves this test green — measured. That is not a hole,
+    because the path branch is pinned where it CAN be isolated: `test_scan_path_has_NO_SELF_
+    EXEMPTION` in the engine-adds suite and `test_the_guards_own_source_is_skipped_in_range_
+    mode_BY_EXACT_PATH_ONLY` in the range suite both fail when it is removed. Recorded so the
+    next reader does not take this test for a proof it is not.
     """
     repo = _repo(tmp_path, "vendored")
     vendored = repo / _VENDORED_REL
@@ -495,15 +511,25 @@ def test_the_four_engine_add_surfaces_still_catch_from_an_INSTALLED_guard(
     path_leak.unlink()
     _git(repo, "rm", "-q", "--cached", path_leak.name)
 
-    # ---- surface 4: the same question under a name the suffix list would skip.
-    asset = repo / f"icons/{_HOST}.png"
+    # ---- surface 4: a leak in the CONTENT of a file whose NAME says "binary asset".
+    #
+    # ⛔ THE NAME IS CLEAN AND THE CONTENT LEAKS, which is the whole point and was NOT how this
+    # plant was first written. It named the asset after the host, so the PATH scan answered it
+    # before any read — the assertion held with the suffix repair fully reverted, measured. The
+    # repair under test is "the bytes decide, not the filename": a text file called `.png` is
+    # read like any other text file.
+    asset = repo / "icons/logo.png"
     asset.parent.mkdir()
-    asset.write_text("this is ASCII text, whatever the name says\n", encoding="utf-8")
+    asset.write_text(f"AGENT_URL=http://{_HOST}:9999/mcp\n", encoding="utf-8")
     _git(repo, "add", "icons")
-    assert guard._binary_suffix(f"icons/{_HOST}.png"), "vacuity guard: .png must be a skip suffix"
+    assert guard._binary_suffix("icons/logo.png"), "vacuity guard: .png must be a skip suffix"
+    assert not guard.scan_path("icons/logo.png"), (
+        "vacuity guard: the NAME must be clean, or the path scan answers this and the suffix "
+        "repair is not what is being measured")
     suffixed = _run(repo)
     assert suffixed.returncode == 1, (
         f"surface 4 (a leak under a skip-suffix NAME) is not caught:\n{_out(suffixed)}")
+    assert "icons/logo.png" in _out(suffixed), _out(suffixed)
     _git(repo, "rm", "-q", "-r", "--cached", "icons")
 
     # ---- surface 3: the INDEX. Staged with the leak, then tidied in the worktree, so only the
@@ -545,71 +571,33 @@ def test_the_four_engine_add_surfaces_still_catch_from_an_INSTALLED_guard(
 # -------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "path_regex",
-    [".", ".+", ".*", "(tests/fixtures/)?", "^", "[a-z./]*", "docs|src|tests|README"],
-    ids=["any-char", "one-or-more", "zero-or-more", "optional-group", "empty-anchor",
-         "char-class-star", "alternation-over-everything"],
-)
-def test_a_WIDE_path_exempt_is_refused(tmp_path: Path, path_regex: str) -> None:
-    """⛔⛔ A COMPLETE OFF-SWITCH, found by three independent verification agents at once.
-
-    `_deny_cases_defeated` used to measure the deny corpus with NO `rel_path`, and `scan_text`
-    consults `_exempt` only `if rel_path` — so the "this configuration DEFEATS the guard's own
-    deny cases" refusal was structurally blind to `path_exempt`. A repository could write one
-    entry with a regex matching every path, silence a pattern across its whole tree on both the
-    content and the path surfaces, and have the config ACCEPTED. Measured before the fix: a tree
-    with an RFC1918 address in a tracked file scanned `no internal info found`, exit 0, in all
-    three scan modes.
-
-    ⚠️ THE CHECK IS NOT A REGEX-SHAPE RULE. "It must be anchored", "it must not match the empty
-    string" — `.+` is neither anchored nor empty-matching and is still total, and this file's own
-    history is a list of matchers that lost that arms race. What is measured is the PROPERTY: a
-    path exemption may not stop a deny case being caught on a path an ordinary repository has.
-    """
-    repo = _repo(tmp_path, f"wide_{abs(hash(path_regex))}")
-    (repo / "leak.txt").write_text(f"DATABASE_URL=postgres://u:p@{_ADDR}:5432/db\n",
-                                   encoding="utf-8")
-    _git(repo, "add", "leak.txt")
-    assert _run(repo).returncode == 1, "vacuity guard: the leak must be caught without the config"
-
-    _write_config(repo, {"path_exempt": [
-        {"pattern": "private IPv4 (RFC1918)", "path_regex": path_regex,
-         "why": "test fixture: wide enough to be an off-switch"}]})
-    res = _run(repo)
-    assert res.returncode == 2, (
-        f"a path_exempt regex that matches every path was accepted — the guard can be switched "
-        f"off from a config file:\n{_out(res)}")
-    assert "DEFEATS" in _out(res), _out(res)
-
-
-def test_a_NARROW_path_exempt_is_still_accepted_and_honoured(tmp_path: Path) -> None:
-    """The direction that must NOT break: a scoped exemption is the mechanism's whole purpose.
-
-    A repository that keeps its own synthetic deny cases — a fixtures directory, a vendored
-    corpus — has to be able to say so. `^tests/fixtures/` matches none of the probe paths, so it
-    is accepted, and the file under it really is excused.
-    """
-    repo = _repo(tmp_path, "narrowpath")
-    fixtures = repo / "tests" / "fixtures"
-    fixtures.mkdir(parents=True)
-    (fixtures / "hosts.txt").write_text(f"{_HOST}\n", encoding="utf-8")
-    _git(repo, "add", "tests")
-    assert _run(repo).returncode == 1, "vacuity guard: the fixture must red without the exemption"
-
-    _write_config(repo, {"path_exempt": [
-        {"pattern": "private lan domain", "path_regex": "^tests/fixtures/",
-         "why": "synthetic hosts, needed to prove the pattern still bites"}]})
-    res = _run(repo)
-    assert res.returncode == 0, (
-        f"a properly scoped path exemption was refused; the mechanism is now unusable:"
-        f"\n{_out(res)}")
-
-    # ...and it is scoped. The same host OUTSIDE the exempted path must still red.
-    (repo / "prod.conf").write_text(f"AGENT=http://{_HOST}/\n", encoding="utf-8")
-    _git(repo, "add", "prod.conf")
-    assert _run(repo).returncode == 1, (
-        "the exemption reached beyond its path regex — a scoped carve-out that is not scoped")
+# -------------------------------------------------------------------------------------------
+# ⛔⛔ THE `path_exempt` TESTS THAT SAT HERE ARE GONE BECAUSE THE FEATURE IS GONE, and the
+# sequence is the point rather than the deletion.
+#
+# Round 1 of the gate found a complete OFF-SWITCH: the refusal check measured the deny corpus
+# with no path, `scan_text` consults the exemption only when a path is given, so
+# `{"path_regex": "."}` silenced a pattern tree-wide and was ACCEPTED. The repair measured the
+# corpus at a list of ordinary probe paths, and a test here asserted a wide regex was refused
+# and a narrow one honoured — both passing.
+#
+# Round 2 took the repair apart in one pass. The probe list is a nine-name allowlist wearing the
+# word "property": `\.go$`, `^internal/`, `^terraform/` and twenty more were accepted and were
+# total against a real repository; a negative lookahead over the nine names turned a pattern off
+# everywhere in a single line; the narrowest legitimate exemption there is — one named file —
+# was REFUSED whenever that file was called `README.md` or `Dockerfile`; and an accepted regex
+# was unbounded, `^internal/(a+)+b$` not finishing in two minutes inside a module whose own rule
+# is that nothing may hang.
+#
+# Two designs, both fail-open, one round apart, for a feature NO acceptance criterion asked for —
+# what was asked for is an allow-LIST. So it was withdrawn rather than repaired a third time, and
+# what remains is pinned instead: a config naming `path_exempt` is REFUSED with a sentence saying
+# it was withdrawn (see the malformed-config cases above), and `PATH_EXEMPT` is asserted empty as
+# an ENGINE constant that only an edit to the module can change.
+#
+# `test_the_PROBE_PATH_loop_alone_refuses_a_wide_exemption` went with them: it isolated a loop
+# that no longer exists.
+# -------------------------------------------------------------------------------------------
 
 
 def test_an_allow_literal_may_not_defeat_the_PATH_or_MESSAGE_deny_cases(tmp_path: Path) -> None:
@@ -660,12 +648,60 @@ def test_an_UNTRACKED_config_is_refused(tmp_path: Path) -> None:
     assert res.returncode == 2, (
         f"an untracked config governed the scan; the allowances are invisible to review:"
         f"\n{_out(res)}")
-    assert "NOT TRACKED" in _out(res), _out(res)
+    assert "the INDEX has no" in _out(res), _out(res)
 
     # The other direction: the very same file, tracked, is honoured.
     _git(repo, "add", "-f", guard.CONFIG_FILENAME)
     assert _run(repo).returncode == 0, "a tracked config was not honoured"
 
+
+
+def test_an_edit_that_is_not_STAGED_does_not_govern_the_scan(tmp_path: Path) -> None:
+    """⛔⛔ THE INFINITE REGRESS, TERMINATED — the reason the config is read from the INDEX.
+
+    The first version of this rule asked git whether the PATH was tracked and then read the FILE:
+    two questions about two different objects. A verification agent drove them apart with
+    `git update-index --skip-worktree`, which leaves `git status` EMPTY while the worktree copy
+    governs every scan — an allowance in no reviewable state of the repository. A plain unstaged
+    edit does the same with one ` M`.
+
+    Patching that (compare the bytes, then handle `--assume-unchanged`, then…) is the regress this
+    module's own rules say to stop and change the KIND of assertion for. So the bytes that govern
+    the scan ARE the bytes in the index: there is no second copy left to diverge.
+
+    Both halves of the divergence are driven here, because `--skip-worktree` is the invisible one
+    and an ordinary unstaged edit is the one that actually happens.
+    """
+    repo = _repo(tmp_path, "unstaged")
+    (repo / "leak.txt").write_text(f"AGENT=http://{_HOST}/\n", encoding="utf-8")
+    _git(repo, "add", "leak.txt")
+    _write_config(repo, {"_note": "committed and benign: nothing is allowed"})
+    _git(repo, "commit", "-q", "-m", "seed with a benign config")
+    assert _run(repo).returncode == 1, "vacuity guard: the leak must red under the committed config"
+
+    # An unstaged edit that WOULD allow the leak, if the worktree copy were the one read.
+    permissive = json.dumps({"allow_literals": [{"literal": _HOST, "why": "test fixture"}]})
+    (repo / guard.CONFIG_FILENAME).write_text(permissive, encoding="utf-8")
+    res = _run(repo)
+    assert res.returncode == 1, (
+        f"an UNSTAGED edit to the config governed the scan, so what runs is not what anybody can "
+        f"review:\n{_out(res)}")
+    assert "differs from the index" in _out(res), (
+        f"the guard used the index copy but did not say so; silently ignoring an edit the operator "
+        f"just made is its own surprise:\n{_out(res)}")
+
+    # ...and the invisible form. `--skip-worktree` hides the edit from `git status` entirely.
+    _git(repo, "update-index", "--skip-worktree", guard.CONFIG_FILENAME)
+    assert not _git(repo, "status", "--porcelain").strip(), (
+        "vacuity guard: --skip-worktree did not hide the edit, so this half proves nothing")
+    assert _run(repo).returncode == 1, (
+        "a --skip-worktree config governed the scan while `git status` was empty")
+
+    # The other direction: STAGE it and it applies. The rule is "the index decides", not "no".
+    _git(repo, "update-index", "--no-skip-worktree", guard.CONFIG_FILENAME)
+    _git(repo, "add", guard.CONFIG_FILENAME)
+    assert _run(repo).returncode == 0, (
+        "a staged config was not honoured — the index is supposed to be what decides")
 
 def test_a_BOM_on_a_valid_config_does_not_red_the_build(tmp_path: Path) -> None:
     """⚠️ A GUARD THAT REDDENS CORRECT WORK GETS SWITCHED OFF, so this is a real defect class.
@@ -780,7 +816,14 @@ def test_line_endings_do_not_stop_the_guard_recognising_its_own_source(tmp_path:
     own = _SCRIPT.read_bytes()
     repo = _repo(tmp_path, "crlf")
     crlf = own.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
-    assert crlf != own, "vacuity guard: the fixture is not actually CRLF"
+    # ⚠️ SKIP, DO NOT FAIL, WHEN THE CHECKOUT IS ALREADY CRLF. The two forms are then identical and
+    # there is nothing left to measure — and failing would red the suite on precisely the
+    # configuration this normalisation exists for, which is the wrong way round. `.gitattributes`
+    # (`* text=auto eol=lf`) keeps it from arising here; an installed copy on a machine configured
+    # otherwise is where it would. Found when a harness rewrote the module with CRLF and this
+    # assertion fired.
+    if crlf == own:
+        pytest.skip("this checkout already holds the guard with CRLF endings; nothing differs")
     (repo / "vendored.py").write_bytes(crlf)
     _git(repo, "add", "vendored.py")
     assert _run(repo).returncode == 0, (
@@ -788,33 +831,15 @@ def test_line_endings_do_not_stop_the_guard_recognising_its_own_source(tmp_path:
 
 
 # -------------------------------------------------------------------------------------------
-# ⭐ ISOLATING CASES. The refusal check has three loops, and a wide `path_exempt` is caught by
-# TWO of them at once — so a mutation that deletes either one survives, and neither is really
-# pinned. Each test below constructs the case where ONLY its loop can refuse: the rule is that
-# to isolate a predicate you build the scenario no other arm can exclude.
+# ⭐ ISOLATING CASES. The refusal check runs the deny corpus over THREE surfaces, and a
+# literal wide enough to matter usually loses cases on more than one of them — so a mutation
+# deleting any single loop SURVIVES, and no loop is really pinned. Measured: two such
+# mutations survived their first run for exactly that reason. Each test below constructs the
+# case where ONLY its surface can refuse, which is what isolating a predicate means.
+#
+# (A fourth isolated a probe-path loop that bounded a CONFIGURED path exemption. That feature
+# was withdrawn — see the block above — and the loop went with it.)
 # -------------------------------------------------------------------------------------------
-
-
-def test_the_PROBE_PATH_loop_alone_refuses_a_wide_exemption(tmp_path: Path) -> None:
-    """`unraid pool path` has NO entry in `_MUST_FAIL_PATHS`, so the path-corpus loop is silent.
-
-    A wide `path_exempt` on it can therefore only be refused by running the CONTENT corpus at
-    ordinary probe paths — which is precisely the loop whose absence was the off-switch.
-    """
-    assert "unraid pool path" not in {label for label, _ in guard._MUST_FAIL_PATHS}, (
-        "vacuity guard: this label now HAS a path deny case, so the path loop could refuse the "
-        "config below and this test no longer isolates the probe-path loop")
-    repo = _repo(tmp_path, "probeonly")
-    (repo / "notes.md").write_text(f"path: {_LEAK_PATH}\n", encoding="utf-8")
-    _git(repo, "add", "notes.md")
-    _write_config(repo, {"path_exempt": [
-        {"pattern": "unraid pool path", "path_regex": ".",
-         "why": "test fixture: total, and invisible to every loop but the probe-path one"}]})
-
-    res = _run(repo)
-    assert res.returncode == 2 and "DEFEATS" in _out(res), (
-        f"a total path exemption on a pattern with no path deny case was accepted — the deny "
-        f"corpus is not being measured at ordinary paths:\n{_out(res)}")
 
 
 def test_the_PATH_CORPUS_loop_alone_refuses_a_literal(tmp_path: Path) -> None:
@@ -890,7 +915,6 @@ def test_a_REFUSED_config_leaves_the_previous_allowances_in_place() -> None:
     assert good.allow_literals == guard.ALLOW_LITERALS, (
         "a REFUSED config left its allowances installed — the rollback in `apply_config` is gone, "
         "and the next scan in this process runs under rules that were rejected")
-    assert good.path_exempt == guard.PATH_EXEMPT
     guard.apply_config(guard.DEFAULT_CONFIG)
 
 
@@ -918,10 +942,21 @@ def test_the_config_flag_is_parsed_STRICTLY(tmp_path: Path, argv: list[str],
 
 
 def test_a_config_that_is_UNREADABLE_or_not_UTF8_stops_the_scan(tmp_path: Path) -> None:
-    """The two `load_config` failure branches, neither of which any test reached.
+    """A config that cannot be READ stops the scan, on BOTH of the paths that read one.
 
-    Both must exit 2 rather than degrading to "no config" — the same rule as a parse error, for
-    the same reason: a clean verdict looks identical either way.
+    Exiting 2 rather than degrading to "no config" is the same rule as a parse error, for the
+    same reason: a clean verdict looks identical either way.
+
+    ⛔ THERE ARE TWO DECODES, and an earlier version of this test reached only one.
+    `resolve_config` decodes the index blob; `load_config` decodes a file named with
+    `--config`. A mutation making the second decode with `errors="replace"` survived the whole
+    suite — a non-UTF-8 `--config` would have been scanned under a config full of replacement
+    characters instead of refused. Both are driven below.
+
+    ⚠️ `load_config`'s OSError branch is NOT reachable through the CLI and this test does not
+    pretend otherwise: `find_config` refuses a `--config` that is not a file first, which is
+    the better message. The branch stays for a caller using `load_config` directly, and for
+    the read that races a deletion. Its docstring used to claim this test covered it.
     """
     # Not UTF-8: a lone continuation byte cannot start a sequence.
     repo = _repo(tmp_path, "notutf8")
@@ -929,6 +964,15 @@ def test_a_config_that_is_UNREADABLE_or_not_UTF8_stops_the_scan(tmp_path: Path) 
     _git(repo, "add", guard.CONFIG_FILENAME)
     res = _run(repo)
     assert res.returncode == 2, f"a non-UTF-8 config did not stop the scan:\n{_out(res)}"
+    assert "UTF-8" in _out(res), _out(res)
+
+    # ⛔ THE SAME QUESTION DOWN THE OTHER PATH — a NAMED config that is not UTF-8. This half is
+    # what a surviving mutation exposed: it exercises `load_config`'s decode, where the case
+    # above exercises `resolve_config`'s.
+    named = tmp_path / "not-utf8.json"
+    named.write_bytes(b'{"allow_literals": [\x80]}')
+    res = _run(repo, "--config", str(named))
+    assert res.returncode == 2, f"a non-UTF-8 --config did not stop the scan:\n{_out(res)}"
     assert "UTF-8" in _out(res), _out(res)
 
     # Unreadable: a DIRECTORY at the config's path. `is_file()` is false, so discovery passes over

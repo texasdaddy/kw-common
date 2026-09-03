@@ -78,7 +78,9 @@ shared library, and saying so is a better outcome than bending the rule.
 
 1. **It imports cleanly in isolation.** Copy the module alone into an empty directory and import
    it: no consumer module appears in `sys.modules`, and neither does any other `kw_common` module.
-   *(Enforced by `tests/test_isolation.py`, which does exactly that in a subprocess.)*
+   *(Enforced for `alerting` by `tests/test_isolation.py`, which does exactly that in a
+   subprocess, and for `leakguard` by a narrower check in `test_leak_guard_extraction.py`.
+   Generalising that file over every module is issue #12 — it binds one `MODULE_PATH` today.)*
 2. **Configuration is INJECTED, never assumed.** No hardcoded filename, environment-variable name,
    path, topic or service name. The caller passes what it uses. Anything a consumer must customise
    is a parameter or a registered hook — **never a constant the consumer is expected to edit after
@@ -159,19 +161,13 @@ revert your rules and your rules cannot hold back an upgrade.
   "_note": "a key prefixed with `_` is a comment - the only spelling this scanner ignores",
   "allow_literals": [
     {"literal": "github.com/<owner>", "why": "functional: this repository's own clone URL"}
-  ],
-  "path_exempt": [
-    {"pattern": "private lan domain", "path_regex": "^tests/fixtures/",
-     "why": "synthetic hosts, needed to prove the pattern still bites"}
   ]
 }
 ```
 
-* **`allow_literals`** suppresses a hit that falls *inside* an exact literal. It never deletes
-  text and never skips a line, so a permitted token cannot grant amnesty to a real leak sharing
-  the line with it.
-* **`path_exempt`** excuses **one named pattern** on **one path regex**. It is never a whole-file
-  skip: `pattern` must name a pattern the engine actually has, or the config is refused.
+* **`allow_literals`** is the whole surface. It suppresses a hit that falls *inside* an exact
+  literal — it never deletes text, never skips a line, and cannot remove or widen a pattern, so a
+  permitted token cannot grant amnesty to a real leak sharing the line with it.
 * **`why` is required on every entry.** "Keep each one justified" is enforced rather than
   requested.
 
@@ -179,37 +175,63 @@ Five properties are deliberate and worth knowing before you write one:
 
 1. **No config means nothing is allowed.** A missing or misnamed file can only ever make the scan
    *stricter*.
-2. **The config must be TRACKED.** A `.leakguard.json` that is gitignored, or simply never added,
-   is refused — because the whole justification for injecting the allowances is that they become
-   reviewable, and a file nobody can see in the repository governs every local scan while
-   `git status` stays empty. `--config <path>` is exempt from that rule: it is written out in the
-   invocation, which is the visibility that matters.
+2. **The guard reads the config from the INDEX, not from your working copy.** So the rules that
+   govern a scan are exactly the rules a commit would record — `git add` an edit before expecting
+   it to apply, and the guard says so if the two differ. A file on disk that the index does not
+   have is an error rather than silence. This is what makes the allowances reviewable, which is the
+   whole justification for injecting them; the earlier version asked whether the path was *tracked*
+   and then read the *file*, and `git update-index --skip-worktree` drove those apart with
+   `git status` staying empty. `--config <path>` is exempt: it is written out in the invocation,
+   which is the visibility that matters, and may legitimately live outside the repository.
 3. **A config this scanner cannot understand STOPS the scan** (exit 2) — it never degrades to "no
-   config". An unknown key, a missing `why`, a regex that will not compile, a `--config` path that
-   does not exist: all errors. A silently ignored rule is worse than no rule, because a clean
-   verdict looks identical either way. (A UTF-8 BOM is fine — Windows editors write them.)
+   config". An unknown key, a missing `why`, a `--config` path that does not exist: all errors. A
+   silently ignored rule is worse than no rule, because a clean verdict looks identical either way.
+   (A UTF-8 BOM is fine — Windows editors write them.)
 4. **A config that would gut the guard is refused.** Applying your allowances must not stop any of
-   the engine's own deny cases being caught, on any of the three surfaces (content, paths,
-   messages) or on any ordinary path. So an `allow_literals` entry as wide as a pool root — the
-   `/mnt/<pool>` prefix itself, spelled out — is refused, and so is any `path_exempt` regex wide
-   enough to match an ordinary file: `.`, `.+`, `.*`, `(tests/fixtures/)?`. A scoped one such as
-   `^tests/fixtures/` is accepted and honoured. (This paragraph cannot show you the refused
-   literal, for the reason the placeholder section below explains: the guard scans this file.) What
-   the check does *not* catch is written down beside it in the code: the corpus holds one sample
-   per pattern, so single real values can still be allowed one explicit, justified line at a time.
-5. **The guard skips at most one file: its own source, recognised as its own.** Either it is
-   literally this file (the guard is vendored inside the repository being scanned), or the file's
-   *bytes* are the running guard's own bytes. Nothing else can claim that, and no config can widen
-   it — change one character of the guard's source and it is scanned like any other file.
-   (Earlier versions fell back to a hardcoded `scripts/check_no_internal_info.py`, which silently
-   exempted whatever a repository happened to keep at that path — the path every repository in
-   this fleet vendored its copy at.)
+   the engine's own deny cases being caught, on any of the three surfaces: file content, file
+   paths, commit messages. So an `allow_literals` entry as wide as a pool root — the `/mnt/<pool>`
+   prefix itself, spelled out — is refused. (This paragraph cannot show you the refused literal,
+   for the reason the placeholder section below explains: the guard scans this file.) What the
+   check does *not* catch is written down beside it in the code: the corpus is finite, so single
+   real values can still be allowed one explicit, justified line at a time.
+5. **The only file whose CONTENT the guard skips outright is its own source, recognised as its
+   own.** (A `SKIP_SUFFIXES` asset whose bytes really are binary is skipped too, but that is a
+   read the guard would learn nothing from — rename a text file to `.png` and it is still
+   scanned.) Either the guard's own source is
+   literally that file — the guard is vendored inside the repository being scanned, or installed
+   in editable mode from it — or the file's *bytes* are the running guard's own bytes. Nothing
+   else in your repository can claim either. (Earlier versions fell back to a hardcoded
+   `scripts/check_no_internal_info.py`, which silently exempted whatever a repository happened to
+   keep at that path — the path every repository in this fleet vendored its copy at.)
+
+   ⚠️ Stated precisely, because the obvious summary of it is wrong: when the running guard IS the
+   repository's own file, that file's content is skipped **unconditionally**, and appending a real
+   leak to it would not be caught by this guard. That is inherent in a guard whose source carries
+   its own deny corpus, it is the one exemption the engine has always had, and the layer that
+   covers that file is a separate real-literal check run from outside the repository — which
+   deliberately does *not* skip it.
+
+### There is no path-exemption setting, and that is the result of two failed designs
+
+A repository briefly could excuse one named pattern on one path regex. Both attempts to bound
+that regex were fail-open, one review round apart:
+
+* the first never measured it at all, so `{"path_regex": "."}` turned a pattern off across a whole
+  tree and the config was accepted;
+* the second measured the deny corpus at a list of "ordinary" probe paths — which is a nine-name
+  allowlist wearing the word "property". `\.go$`, `^internal/` and `^terraform/` sailed past it and
+  were total against a real repository, a negative lookahead over the nine names turned a pattern
+  off everywhere in one line, and it *refused* the narrowest exemption there is (a single file)
+  whenever that file was called `README.md` or `Dockerfile`.
+
+No acceptance criterion asked for it — what was asked for is an allow-list — so it was withdrawn
+rather than repaired a third time. A config naming `path_exempt` is refused with a message saying
+so. `PATH_EXEMPT` survives as an engine constant for the project-side guard that shares this
+engine; changing it takes an edit to the module, which is a reviewed change rather than a line of
+data.
 
 This repository's own `.leakguard.json` is the worked example, and the test suite reads the real
-file rather than a fixture so that a broken config here fails a test here. Note what it does
-**not** contain: any `path_exempt` entry for the engine's own source. The first version of it
-excused all eight patterns on that one path, which is a whole-file skip written in data — a real
-leak appended to the engine's source passed. Property 5 is what replaced it.
+file rather than a fixture so that a broken config here fails a test here.
 
 ### This repository is PUBLIC
 

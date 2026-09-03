@@ -95,8 +95,9 @@ KNOWN LIMITS (state them; do not pretend to coverage)
         because it is no longer the only thing the commit-time layer runs. `git add cfg.txt` while
         it holds a leak, then overwrite cfg.txt with a clean version and do not re-stage: the tree
         scan is honestly clean and the index — and so the commit — still carries the leak (issue
-        #33). `--staged` is the scan that answers the index's question, and `.githooks/pre-commit`
-        runs both. The two shapes tried and REMOVED before it stay recorded so they are not
+        #33). `--staged` is the scan that answers the index's question, and a consuming
+        repository's `pre-commit` hook runs both. The two shapes tried and REMOVED before it stay
+        recorded so they are not
         re-attempted: reading each staged blob made the hook take 78 s on a 1000-file worktree,
         and one `cat-file --batch` DESYNCHRONISED on a gitlink — `:<path>` on a submodule returns
         a COMMIT object whose body the parser must skip — mis-attributing one file's content to
@@ -185,10 +186,10 @@ IF IT FIRES ON SOMETHING LEGITIMATE
     guard, which is the failure the package exists to prevent. The allowances used to be a tail
     hand-edited into the bottom of this file, and that is exactly why seven copies of it drifted.
 
-    Do not loosen a pattern, and never reach for a blanket per-file skip: this file's whole value
-    is that it cannot be satisfied by looking away. `path_exempt` excuses ONE pattern on ONE path
-    regex, and a configuration that stops any of this guard's own deny cases being caught — on any
-    ordinary path, on any of the three surfaces — is REFUSED rather than applied.
+    Do not loosen a pattern, and do not look for a per-file skip: there is none to configure, and
+    this file's whole value is that it cannot be satisfied by looking away. A configuration that
+    stops any of this guard's own deny cases being caught — on any of the three surfaces — is
+    REFUSED rather than applied.
 """
 
 from __future__ import annotations
@@ -212,17 +213,18 @@ from typing import NamedTuple
 # major bump. An earlier version of this comment said everything outside the list was `_`-prefixed,
 # which was simply untrue.
 #
-# ⛔ `ALLOW_LITERALS` AND `PATH_EXEMPT` ARE DELIBERATELY NOT EXPORTED. `apply_config` REBINDS them,
-# so `from kw_common.leakguard import ALLOW_LITERALS` captures a snapshot that stops tracking the
+# ⛔ `ALLOW_LITERALS` IS DELIBERATELY NOT EXPORTED. `apply_config` REBINDS it, so
+# `from kw_common.leakguard import ALLOW_LITERALS` captures a snapshot that stops tracking the
 # module the moment any scan configures itself — an exported name that cannot behave the way an
-# importer would expect. Read the live values off the module (`leakguard.ALLOW_LITERALS`), or
-# better, hold the `GuardConfig` you applied.
+# importer would expect. Read the live value off the module (`leakguard.ALLOW_LITERALS`), or
+# better, hold the `GuardConfig` you applied. `PATH_EXEMPT` is not exported either: it is an
+# engine constant that only an edit to this file changes.
 __all__ = [
     # the command line
     "main", "cli", "USAGE", "UsageError",
     # the configuration a repository injects
     "CONFIG_FILENAME", "GuardConfig", "DEFAULT_CONFIG", "ConfigError",
-    "find_config", "load_config", "parse_config", "apply_config",
+    "find_config", "load_config", "resolve_config", "parse_config", "apply_config",
     # the scan
     "PATTERNS", "compile_patterns", "compile_for", "scan_text", "scan_path", "scan_range",
     "selftest", "tracked_files", "repo_root",
@@ -440,13 +442,13 @@ MESSAGE_PATTERN_OVERRIDES: dict[str, str | None] = {
 # string shape, and the corpora require the first to pass. It is caught in file CONTENT, which is
 # where such a host is actually configured. Do not read the surviving LABEL as coverage.
 
-# ⭐⭐ THE TWO NAMES BELOW ARE THE ENTIRE CONFIGURATION SURFACE, AND BOTH DEFAULT TO EMPTY.
+# ⭐⭐ `ALLOW_LITERALS` BELOW IS THE ENTIRE CONFIGURATION SURFACE, AND IT DEFAULTS TO EMPTY.
 #
-# They used to be a hand-edited TAIL that each repository carried its own version of, which is
+# It used to be a hand-edited TAIL that each repository carried its own version of, which is
 # exactly what made the guard un-shareable: a whole-file copy from upstream clobbered the tail,
 # so every port either lost a repository's allowances or preserved them by hand and drifted. Now
 # the engine ships in a package and the allowances are INJECTED from the SCANNED repository —
-# see `load_config` and `CONFIG_FILENAME` further down.
+# see `resolve_config` and `CONFIG_FILENAME` further down.
 #
 # ⛔ THE DEFAULT ALLOWS NOTHING, AND THAT DIRECTION IS DELIBERATE. A repository with no config
 # file gets the strictest possible scan, so a missing, misnamed or unreadable config can only
@@ -457,19 +459,22 @@ MESSAGE_PATTERN_OVERRIDES: dict[str, str | None] = {
 
 # Per-PATH exemptions for a single pattern, as (pattern label, path regex).
 #
-# EMPTY BY DEFAULT, AND THAT IS THE EXPECTED STATE for a shape-based denylist: every pattern
-# above describes a value that has no business appearing anywhere in an ordinary repository,
-# including in build output. The mechanism exists because the engine is shared with the
-# project-side real-literal guard, which DOES need one (a scan for the operator's given name
-# false-positives on the home-directory path baked into `__pycache__` bytecode), and because a
-# repository that VENDORS a leak-guard corpus of its own needs to say so somewhere the next
-# reader can see it. Keeping one engine and moving the difference into data is what stops two
-# copies drifting into disagreeing about what a repository contains.
+# ⛔⛔ AN ENGINE CONSTANT, NOT CONFIGURATION — a repository CANNOT set this. It was briefly
+# settable from `.leakguard.json` and two different attempts to bound the regex were both
+# fail-open, one round apart; `GuardConfig` records them. Changing it now takes an edit to this
+# file, which is a reviewed change rather than a line of data.
 #
-# ⚠️ This is a per-PATTERN, per-PATH carve-out and never a blanket file skip. Naming every
-# pattern on one path in a config file is possible and is visible in that file; adding a
-# whole-file skip to the ENGINE would recreate the "satisfied by looking away" hole the
-# docstring forbids, invisibly, for every consumer at once.
+# EMPTY HERE, AND THAT IS THE EXPECTED STATE for a shape-based denylist: every pattern above
+# describes a value that has no business appearing anywhere in an ordinary repository, including
+# in build output. The mechanism exists because the engine is shared with the project-side
+# real-literal guard, which DOES need one — a scan for the operator's given name false-positives
+# on the home-directory path baked into `__pycache__` bytecode. Keeping one engine and moving
+# that difference into its own copy's data is what stops the two drifting into disagreeing about
+# what a repository contains.
+#
+# ⚠️ This is a per-PATTERN, per-PATH carve-out and never a blanket file skip. A whole-file skip
+# here would recreate the "satisfied by looking away" hole the docstring forbids, invisibly, for
+# every consumer at once.
 PATH_EXEMPT: tuple[tuple[str, str], ...] = ()
 
 # Literals that LOOK like a hit but are allowed. Keep each one justified — the config format
@@ -613,9 +618,9 @@ SKIP_SUFFIXES = (".png", ".jpg", ".jpeg", ".ico", ".gif", ".pdf", ".zip", ".gz",
 # invisible amnesty to any file that later took that name.
 #
 # So: the exemption follows THE FILE, and when the file is not inside the scanned repository at
-# all, NOTHING is exempt. `_self_rel_path` returns `None` for that case and every caller treats
-# `None` as "no file is self". A repository that wants a leak-guard corpus of its own exempted
-# says so in its OWN config, per pattern and per path, where it is visible — see `PATH_EXEMPT`.
+# all, the PATH test grants nothing. `_self_rel_path` returns `None` for that case and every
+# caller treats `None` as "no file is self"; the only other way a file is recognised is by being
+# byte-identical to this module's own source — see `_is_self`.
 #
 # ⚠️ BOTH SCANS USE THIS, and they must agree. The range scan gets its paths from the
 # `diff --git a/X b/X` header, which is already repo-relative and posix-separated — the same
@@ -654,12 +659,9 @@ _PATH_EXEMPT_RX: tuple[tuple[str, re.Pattern[str]], ...] = tuple(
 CONFIG_FILENAME = ".leakguard.json"
 
 _CONFIG_EXAMPLE = """{
+  "_note": "a key prefixed with `_` is a comment - the only spelling this scanner ignores",
   "allow_literals": [
     {"literal": "github.com/<owner>", "why": "functional: the clone URL of this repository"}
-  ],
-  "path_exempt": [
-    {"pattern": "private lan domain", "path_regex": "^tests/fixtures/",
-     "why": "synthetic hosts, needed to prove the pattern still bites"}
   ]
 }"""
 
@@ -675,17 +677,36 @@ class ConfigError(Exception):
 
 
 class GuardConfig(NamedTuple):
-    """Everything a repository is allowed to say about how it is scanned.
+    """Everything a repository is allowed to say about how it is scanned: an allow-LIST.
 
-    ⛔ THIS IS THE COMPLETE LIST, AND IT IS DELIBERATELY SHORT. Neither field can REMOVE a
-    pattern, widen one, or skip a file wholesale: `allow_literals` suppresses a hit inside an
-    exact literal, and `path_exempt` excuses ONE named pattern on ONE path regex. A consumer
-    cannot turn the guard off from here, which is the property that makes injecting the
-    configuration safer than editing the engine — the thing it replaces could do all three.
+    ⛔ ONE FIELD, AND THAT IS THE RESULT OF DELETING THE OTHER ONE. `allow_literals` suppresses a
+    hit that falls inside an EXACT literal — it cannot remove a pattern, widen one, or skip a
+    file, and every entry is a value somebody wrote down and justified.
+
+    ⛔⛔ `path_exempt` WAS HERE AND WAS WITHDRAWN, and the reason is worth more than the feature.
+    It let a repository excuse one named pattern on one path REGEX, and the question "is this
+    regex narrow enough" turned out to have no honest answer:
+
+      1. The first design measured the deny corpus with no path at all, so the exemption was never
+         exercised by the check that was supposed to bound it. `{"path_regex": "."}` turned a
+         pattern off across a whole tree, on the content and path surfaces, in all three scan
+         modes, and the configuration was ACCEPTED.
+      2. The second measured the corpus at a list of ordinary probe paths. That is a nine-name
+         allowlist wearing the word "property": `\\.go$`, `^internal/`, `^terraform/` and twenty
+         more were accepted and were total against a real repository, and a negative lookahead
+         over the nine names turned a pattern off everywhere in one line. It ALSO refused the
+         narrowest legitimate exemption there is — a single file — whenever that file was named
+         `README.md` or `Dockerfile`, so it was inverted against its own stated purpose. And an
+         accepted regex was unbounded: `^internal/(a+)+b$` did not finish in two minutes, in a
+         module whose own rule is that nothing may hang.
+
+    Two designs, both fail-open, one round apart. No acceptance criterion asked for it — what was
+    asked for is an allow-LIST — so it is withdrawn rather than repaired a third time. `PATH_EXEMPT`
+    remains an ENGINE-level constant, per-pattern and per-path, for the project-side guard that
+    shares this engine; what a repository can no longer do is set it from data.
     """
 
     allow_literals: tuple[str, ...] = ()
-    path_exempt: tuple[tuple[str, str], ...] = ()
 
 
 DEFAULT_CONFIG = GuardConfig()
@@ -741,13 +762,20 @@ def parse_config(text: str, where: str) -> GuardConfig:
     # "ignore anything unrecognised" would swallow `allow_litrals` — a typo that silently drops a
     # repository's entire allow-list while the scan reports a confident pass. No key this scanner
     # reads begins with `_`, so the two cases cannot be confused.
-    unknown = sorted(k for k in set(raw) - {"allow_literals", "path_exempt"}
-                     if not k.startswith("_"))
+    unknown = sorted(k for k in set(raw) - {"allow_literals"} if not k.startswith("_"))
     if unknown:
+        # ⭐ `path_exempt` GETS ITS OWN SENTENCE, because a repository that carried one is not
+        # making a typo — it is meeting a withdrawn feature, and "unknown key" would send it
+        # looking for a spelling mistake that is not there. See `GuardConfig` for why it went.
+        withdrawn = ("\nNote: `path_exempt` was WITHDRAWN. Two designs for bounding its regex were "
+                     "both fail-open (see GuardConfig); no acceptance criterion needed it, and it "
+                     "is not coming back as data. `PATH_EXEMPT` remains an engine constant."
+                     if "path_exempt" in unknown else "")
         raise ConfigError(
             f"{where}: unknown key(s) {unknown}. A key this scanner does not read is far more "
             f"likely to be a typo in one it does than a note to a human, and a silently ignored "
-            f"rule is worse than no rule. For a note, prefix the key with `_`:\n{_CONFIG_EXAMPLE}")
+            f"rule is worse than no rule. For a note, prefix the key with `_`:"
+            f"{withdrawn}\n{_CONFIG_EXAMPLE}")
 
     literals: list[str] = []
     for i, entry in enumerate(_entries(raw.get("allow_literals", []), "allow_literals")):
@@ -756,92 +784,97 @@ def parse_config(text: str, where: str) -> GuardConfig:
         _field(entry, "why", where_i, ("literal", "why"))
         literals.append(literal)
 
-    known = {label for label, _ in PATTERNS}
-    exempt: list[tuple[str, str]] = []
-    for i, entry in enumerate(_entries(raw.get("path_exempt", []), "path_exempt")):
-        where_i = f"{where}: path_exempt[{i}]"
-        fields = ("pattern", "path_regex", "why")
-        label = _field(entry, "pattern", where_i, fields)
-        rx = _field(entry, "path_regex", where_i, fields)
-        _field(entry, "why", where_i, fields)
-        if label not in known:
-            raise ConfigError(
-                f"{where_i}: {label!r} names no pattern, so this entry would never do anything. "
-                f"Known patterns: {sorted(known)}")
-        try:
-            re.compile(rx)
-        except re.error as exc:
-            raise ConfigError(f"{where_i}: {rx!r} is not a valid regex ({exc})") from None
-        exempt.append((label, rx))
-
-    return GuardConfig(tuple(literals), tuple(exempt))
-
-
-def _is_tracked(root: Path, name: str) -> bool:
-    """Does git list this path in the index? Bounded, like every other git call here."""
-    try:
-        out = subprocess.run(["git", "ls-files", "-z", "--", name], cwd=root,
-                             capture_output=True, timeout=_GIT_TIMEOUT_S)
-    except (OSError, subprocess.TimeoutExpired):
-        # ⛔ UNANSWERABLE IS NOT YES. If git cannot be asked, the config's visibility cannot be
-        # established, and a scan running under rules nobody can review is the thing this check
-        # exists to prevent.
-        return False
-    return out.returncode == 0 and bool(out.stdout.strip(b"\x00"))
+    return GuardConfig(tuple(literals))
 
 
 def find_config(root: Path, explicit: str | None) -> Path | None:
-    """The config file to read: the one named, else the repository's own TRACKED one, else none.
+    """The config file NAMED on the command line, validated. `None` when none was named.
 
     ⛔ AN EXPLICIT `--config` THAT DOES NOT EXIST IS AN ERROR. Falling back to discovery there
     would mean a typo'd path scans under rules the operator did not choose and reports a verdict
     they would read as authoritative.
 
-    ⛔⛔ A DISCOVERED CONFIG MUST BE TRACKED, and this is a real hole rather than tidiness. The
-    justification for moving the allowances into the scanned repository is that they become
-    reviewable — "an explicit line with a written justification in a file in that repository". A
-    file that is gitignored, or simply never added, is none of those things: it governs every local
-    scan, including the pre-commit and pre-push paths a developer meets most, while `git status` is
-    empty and no reviewer can see it. Measured: `.gitignore`-ing a `.leakguard.json` that allowed a
-    `.lan` host turned the local scan green with nothing in the repository to show why.
-
-    ⚠️ `--config` IS DELIBERATELY EXEMPT from that rule. It is written out on the command line — in
-    a CI workflow, in a hook, in the invocation the operator can see — so it is already visible in
-    the place that matters, and requiring it to be tracked would forbid the legitimate case of a
-    config held outside the repository being scanned.
+    ⚠️ DISCOVERY IS NOT HERE ANY MORE — it is `resolve_config`, and it reads the INDEX rather than
+    the filesystem. `root` is kept in the signature because a caller has it and a future explicit
+    form may want to resolve relative to it; it is unused today, and saying so beats a reader
+    wondering what it does.
     """
-    if explicit is not None:
-        path = Path(explicit)
-        if not path.is_file():
-            raise ConfigError(f"--config {explicit!r}: no such file")
-        return path
-    candidate = root / CONFIG_FILENAME
-    if not candidate.is_file():
+    if explicit is None:
         return None
-    if not _is_tracked(root, CONFIG_FILENAME):
-        raise ConfigError(
-            f"{candidate} exists but is NOT TRACKED by git, so it would change what this scan "
-            f"allows while being invisible to everyone reviewing this repository. Either "
-            f"`git add {CONFIG_FILENAME}`, or delete it and pass `--config <path>` explicitly.")
-    return candidate
+    path = Path(explicit)
+    if not path.is_file():
+        raise ConfigError(f"--config {explicit!r}: no such file")
+    return path
 
 
 def load_config(path: Path | None) -> GuardConfig:
-    """Read and validate a config file; `None` means "no file", which allows nothing."""
+    """Read and validate a config file from the FILESYSTEM; `None` means "no file"."""
     if path is None:
         return DEFAULT_CONFIG
     try:
-        # ⚠️ `utf-8-sig`, NOT `utf-8`. It reads plain UTF-8 identically and additionally strips a
-        # BOM — which Windows PowerShell 5.1 writes by default from `Out-File`, and Notepad from
-        # "Save As UTF-8". Without it a semantically perfect config exits 2 on the workstation this
-        # fleet is operated from, which is a guard reddening correct work: the failure mode that
-        # gets a guard switched off.
-        text = path.read_text(encoding="utf-8-sig")
+        text = path.read_text(encoding=_CONFIG_ENCODING)
     except OSError as exc:
         raise ConfigError(f"{path}: cannot be read ({exc})") from None
     except UnicodeDecodeError:
         raise ConfigError(f"{path}: is not UTF-8 text") from None
     return parse_config(text, str(path))
+
+
+# ⚠️ `utf-8-sig`, NOT `utf-8`. It reads plain UTF-8 identically and additionally strips a BOM —
+# which Windows PowerShell 5.1 writes by default from `Out-File`, and Notepad from "Save As
+# UTF-8". Without it a semantically perfect config exits 2 on the workstation this fleet is
+# operated from, which is a guard reddening correct work: the failure mode that gets a guard
+# switched off.
+_CONFIG_ENCODING = "utf-8-sig"
+
+
+def resolve_config(root: Path, explicit: str | None) -> GuardConfig:
+    """The configuration this scan runs under: the file NAMED, else the INDEX, else none.
+
+    ⛔⛔ THE DISCOVERED CONFIG IS READ FROM THE INDEX, NOT FROM THE WORKTREE, and that is a change
+    of KIND rather than one more patch. The previous version asked git whether the PATH was tracked
+    and then read the FILE — two different questions about two different objects. They diverge, and
+    a verification agent drove the divergence: `git update-index --skip-worktree .leakguard.json`
+    leaves `git status` empty while the worktree copy — allowing a real address — governs every
+    scan. A plain unstaged edit does the same with one ` M`.
+
+    Patching that (compare the bytes, then handle `--assume-unchanged`, then …) is the infinite
+    regress this module's own rules warn about: when the next round finds the same defect one step
+    over, change what is being ASSERTED. So the bytes that govern the scan ARE the bytes in the
+    index. There is no gap left to exploit, because there is no second copy: `--skip-worktree`
+    cannot help, an unstaged edit has no effect, and "staged but not yet committed" stops being a
+    hole and becomes the stated semantics — the index is exactly what a commit would record, which
+    is the question `--staged` asks anyway.
+
+    ⚠️ A FILE ON DISK THAT THE INDEX DOES NOT HAVE IS AN ERROR, not silence. Ignoring it would let
+    an author write a config, see a clean scan, and believe their allowances applied when nothing
+    of the kind happened.
+
+    ⚠️ AND A DIVERGENCE IS ANNOUNCED. If the worktree copy differs from the index copy, the scan
+    says which one it used. Reading the index is the safe choice, but a silent one would be its own
+    small surprise — the operator edited a file and the guard ignored it.
+    """
+    named = find_config(root, explicit)
+    if named is not None:
+        return load_config(named)
+
+    blob = staged_blob(root, CONFIG_FILENAME)
+    on_disk = root / CONFIG_FILENAME
+    if blob is None:
+        if on_disk.is_file():
+            raise ConfigError(
+                f"{on_disk} exists but the INDEX has no {CONFIG_FILENAME}, so it would change what "
+                f"this scan allows while being invisible to everyone reviewing this repository. "
+                f"`git add {CONFIG_FILENAME}`, or delete it and pass `--config <path>` explicitly.")
+        return DEFAULT_CONFIG
+    try:
+        text = blob.decode(_CONFIG_ENCODING)
+    except UnicodeDecodeError:
+        raise ConfigError(f"{CONFIG_FILENAME} (in the index): is not UTF-8 text") from None
+    if on_disk.is_file() and _lf(on_disk.read_bytes()) != _lf(blob):
+        print(f"note: {CONFIG_FILENAME} differs from the index; this scan used the INDEX copy, "
+              f"which is what a commit would record. `git add {CONFIG_FILENAME}` to use your edit.")
+    return parse_config(text, f"{CONFIG_FILENAME} (as the index holds it)")
 
 
 def apply_config(config: GuardConfig) -> None:
@@ -878,50 +911,17 @@ def apply_config(config: GuardConfig) -> None:
     single wide literal — or the single wide path exemption — that silently turns a whole pattern
     off across a tree.
     """
-    global ALLOW_LITERALS, PATH_EXEMPT, _PATH_EXEMPT_RX
-    previous = (ALLOW_LITERALS, PATH_EXEMPT, _PATH_EXEMPT_RX)
+    global ALLOW_LITERALS
+    previous = ALLOW_LITERALS
     ALLOW_LITERALS = config.allow_literals
-    PATH_EXEMPT = config.path_exempt
-    _PATH_EXEMPT_RX = tuple((label, re.compile(rx)) for label, rx in config.path_exempt)
     defeated = _deny_cases_defeated(compile_patterns())
     if defeated:
-        ALLOW_LITERALS, PATH_EXEMPT, _PATH_EXEMPT_RX = previous
+        ALLOW_LITERALS = previous
         raise ConfigError(
             "this configuration DEFEATS the guard's own deny cases, so it is refused:\n  "
             + "\n  ".join(defeated)
             + "\nAn allowance may excuse a value the corpus does not cover; it may not excuse "
               "the corpus. Narrow the literal until the cases above are caught again.")
-
-
-# ⭐⭐ ORDINARY PATHS, and this list is the property the refusal below actually asserts:
-# A PATH EXEMPTION MAY NOT SILENCE A DENY CASE ON A PATH AN ORDINARY REPOSITORY HAS.
-#
-# ⛔ THE CHECK USED TO RUN AT NO PATH AT ALL, and that made it structurally blind to half the
-# configuration surface. `scan_text` consults `_exempt` only `if rel_path`, so measuring the deny
-# corpus with the default empty path meant `path_exempt` was never exercised — and a repository
-# could write `{"pattern": "private IPv4 (RFC1918)", "path_regex": ".+"}`, turn that pattern off
-# across its whole tree on both the content and path surfaces, and have the config ACCEPTED by a
-# check whose docstring said a consumer cannot turn the guard off from here. Measured: a tree with
-# an RFC1918 address in a tracked file scanned `no internal info found`, exit 0.
-#
-# ⚠️ NOT A CHECK ON THE SHAPE OF THE REGEX. "It must start with `^`", "it must not match the empty
-# string" — those match the ROUTE, and this file's own history is a list of matchers that lost that
-# arms race (`(tests/fixtures/)?` matches the empty string; `.+` does not, and both are total).
-# Measuring the property costs one scan per sample per probe path and cannot be spelled around.
-#
-# A NARROW exemption matches none of these and is accepted — `^src/kw_common/leakguard\.py$`,
-# `^tests/fixtures/`, `^docs/vendor/`. That is the legitimate use: a path a repository knows carries
-# synthetic deny cases. Excusing a pattern on `src/` or `docs/` is not a scoped exemption, it is the
-# pattern turned off, and it is refused with the sample and the path that proved it.
-_PROBE_PATHS: tuple[str, ...] = (
-    "README.md",
-    "src/app.py",
-    "tests/test_app.py",
-    "docs/notes.md",
-    ".github/workflows/ci.yml",
-    "config/settings.yaml",
-    "Dockerfile",
-)
 
 
 def _deny_cases_defeated(compiled: list[tuple[str, re.Pattern[str]]]) -> list[str]:
@@ -933,18 +933,22 @@ def _deny_cases_defeated(compiled: list[tuple[str, re.Pattern[str]]]) -> list[st
     path and message deny cases at once. Measured: `{"literal": "host-a.lan."}` was accepted, and
     the shipped `--selftest` then failed with two PATH cases and one MESSAGE case uncaught.
 
+    ⚠️ NO `rel_path` IS PASSED, and that is a consequence of withdrawing `path_exempt` rather than
+    a return to the bug it once was. `scan_text` consults `_exempt` only when a path is given, and
+    `PATH_EXEMPT` is an engine constant again — empty here, changeable only by editing the engine,
+    which is a reviewed change. No configured value's effect depends on which path a sample is
+    scanned at any more. An intermediate version ran the corpus at a list of "ordinary" probe
+    paths to bound a configured exemption; that list was a nine-name allowlist, and `\\.go$` or
+    `^internal/` sailed straight past it. `GuardConfig` records both failed designs.
+
     Empty is the healthy answer.
     """
     defeated = []
-    # CONTENT — at each probe path, so a path exemption is exercised rather than skipped, and at
-    # no path at all, which is what a scan of a value with no file behind it does.
+    # CONTENT.
     for want_label, sample in list(_MUST_FAIL) + list(_MUST_FAIL_ADJACENT):
-        for rel in ("", *_PROBE_PATHS):
-            if want_label not in {label for _, label, _ in scan_text(sample, compiled, rel)}:
-                where = f" at {rel}" if rel else ""
-                defeated.append(f"{want_label}: {sample!r} is no longer caught{where}")
-                break   # one report per sample; the first path that loses it is enough to act on
-    # PATHS — `scan_path` runs the path override set AND consults `_exempt` itself.
+        if want_label not in {label for _, label, _ in scan_text(sample, compiled)}:
+            defeated.append(f"{want_label}: {sample!r} is no longer caught")
+    # PATHS — `scan_path` runs the path override set.
     for want_label, rel in _MUST_FAIL_PATHS:
         if want_label not in {label for label, _ in scan_path(rel)}:
             defeated.append(f"{want_label}: the PATH {rel!r} is no longer caught")
@@ -2125,7 +2129,7 @@ def refs_being_published(root: Path, rev_range: str) -> list[tuple[str, str, str
         offending commits") was not even the right fix (`git tag -d` was).
 
     Both disappear if the question is "what refs is this push sending", which the caller already
-    knows: `.githooks/pre-push` is handed `<local_ref>` on stdin, and CI has `GITHUB_REF`. Both now
+    knows: a `pre-push` hook is handed `<local_ref>` on stdin, and CI has `GITHUB_REF`. Both now
     put the REF in the range they pass, so the range NAMES the tag and this reads it.
 
     ⭐ NESTED TAGS ARE WALKED. `git tag -a outer -m … inner` produces a chain, and reading only the
@@ -3084,7 +3088,7 @@ def main(argv: list[str]) -> int:
     # rules nobody chose. `compile_patterns()` is called AFTER `apply_config` because a scan must
     # never run against a pattern set assembled before the allowances were checked.
     try:
-        apply_config(load_config(find_config(root, args.config)))
+        apply_config(resolve_config(root, args.config))
     except ConfigError as exc:
         print(f"{exc}", file=sys.stderr)
         return 2

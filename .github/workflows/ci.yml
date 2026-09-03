@@ -244,10 +244,20 @@ jobs:
       # CI actually depends on. An entry point aimed at the wrong callable installs fine, imports
       # fine, and fails the first time anybody runs it — in their repository, after the tag.
       #
-      # ⚠️ RUN AGAINST THIS CHECKOUT FROM AN INSTALLED GUARD. That is the acceptance case the
-      # extraction turns on: `site-packages` is not inside this repository, so the self-exemption
-      # cannot fire and the tree is cleared by `.leakguard.json` — the injected configuration —
-      # or not at all.
+      # ⚠️ RUN AGAINST THIS CHECKOUT FROM AN INSTALLED GUARD — the posture every consumer is in,
+      # and the one this repository would otherwise never exercise.
+      #
+      # ⛔ WHAT CLEARS THIS TREE, stated exactly, because the previous version of this comment got
+      # it wrong in a way that would send an operator the wrong direction. `site-packages` is not
+      # inside this repository, so the guard cannot recognise its own source BY PATH here — it
+      # recognises it BY BYTES, which is why the engine's own synthetic deny corpus is skipped and
+      # the scan is clean. `.leakguard.json` is not what clears it: its three literals are inert
+      # against the shape denylist, and there is no path-exemption setting at all.
+      #
+      # So if this step ever REDS on the engine's own file, the answer is NOT to add an exemption
+      # for it — that was tried, it was a whole-file skip written in data, and a real leak walked
+      # through it (see CHANGELOG 1.1.0). The answer is that the identity test has stopped
+      # working, and `tests/test_leak_guard_extraction.py` says which half.
       - name: The installed console script scans this repository
         run: |
           set -eu

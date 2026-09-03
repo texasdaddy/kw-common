@@ -27,7 +27,7 @@ the 4,200 lines of engine tests that moved here with the code.
   the package and depends on nothing outside the standard library.
 - **Injected configuration: `.leakguard.json` in the repository being scanned**, or a path given
   with `--config`. This is the part that makes the extraction possible at all — see the adopter
-  notes below for the format and for the four fail-closed properties it was designed around.
+  notes below for the format and for the five fail-closed properties it was designed around.
 - **`--config <path>` / `--config=<path>`** on the command line, and `GuardConfig`,
   `DEFAULT_CONFIG`, `ConfigError`, `find_config`, `load_config`, `parse_config`, `apply_config`,
   `CONFIG_FILENAME` and `cli` in the module's `__all__`.
@@ -104,45 +104,60 @@ on lines that were previously, and correctly, permitted.
   "_note": "a key prefixed with `_` is a comment - the only spelling this scanner ignores",
   "allow_literals": [
     {"literal": "github.com/<owner>", "why": "functional: this repository's own clone URL"}
-  ],
-  "path_exempt": [
-    {"pattern": "private lan domain", "path_regex": "^tests/fixtures/",
-     "why": "synthetic hosts, needed to prove the pattern still bites"}
   ]
 }
 ```
 
-Five properties, each chosen in the fail-closed direction and each worth knowing before you write
-a config:
+`allow_literals` is the whole surface. It suppresses a hit that falls INSIDE an exact literal; it
+cannot remove a pattern, widen one, or skip a file. Five properties, each chosen in the fail-closed
+direction and each worth knowing before you write a config:
 
 1. **No config file means nothing is allowed.** A missing or misnamed file can only make a scan
    *stricter*. The opposite default — shipping this fleet's own allowances — would mean an
    installed library silently permitting values in a repository that never asked, and a consumer
    would have to edit installed code to tighten it, which is the fork this package exists to
    prevent.
-2. **The config must be TRACKED.** A gitignored or never-added `.leakguard.json` is refused. The
-   whole justification for injecting the allowances is that they become reviewable, and a file
-   nobody can see governs every local scan — the pre-commit and pre-push paths especially — while
-   `git status` stays empty. `--config <path>` is exempt: it is written out in the invocation.
+2. **The config is read from the INDEX, not from your working copy.** What governs a scan is
+   exactly what a commit would record, so `git add` an edit before expecting it to apply — the
+   guard prints a note when the two differ. A file on disk that the index does not have is an
+   error rather than silence. `--config <path>` is exempt: it is written out in the invocation,
+   which is the visibility that matters.
 3. **A config this scanner cannot understand STOPS the scan** (exit 2). It never degrades to "no
-   config": an unknown or misspelled key, a missing `why`, a regex that will not compile, a
-   `--config` path that does not exist. The difference between "your rules were applied" and "your
-   rules were unreadable, so none were" is invisible in a clean verdict. A UTF-8 BOM is accepted —
-   Windows editors write them, and reddening a correct config is how a guard gets switched off.
+   config": an unknown or misspelled key, a missing `why`, a `--config` path that does not exist.
+   The difference between "your rules were applied" and "your rules were unreadable, so none were"
+   is invisible in a clean verdict. A UTF-8 BOM is accepted — Windows editors write them, and
+   reddening a correct config is how a guard gets switched off.
 4. **`why` is required on every entry**, so "keep each one justified" is enforced rather than
-   requested. `path_exempt` excuses ONE named pattern on ONE path regex; a `pattern` naming no real
-   pattern is an error rather than an entry that quietly does nothing, and a regex wide enough to
-   match an ordinary file (`.`, `.+`, `.*`, `(tests/fixtures/)?`) is refused as an off-switch. A
-   scoped one — `^tests/fixtures/` — is accepted and honoured.
-5. **The guard skips at most one file: its own source, recognised as its own.** Either it is
-   literally that file (you vendored the guard inside the repository it scans), or the file's
-   BYTES are the running guard's own bytes. Nothing else can claim that and no config can widen
-   it: change one character of the guard's source and it is scanned like any other file.
+   requested. An entry whose justification is blank or whitespace is refused.
+5. **The only file whose CONTENT is skipped outright is the guard's own source, recognised as
+   its own.** (A `SKIP_SUFFIXES` asset whose bytes really are binary is skipped as well; a text
+   file merely NAMED `.png` is not.) Either it is
+   literally that file — you vendored the guard inside the repository it scans, or installed it in
+   editable mode from there — or the file's BYTES are the running guard's own bytes. Nothing else
+   in your repository can claim either.
 
-**If your repository keeps a leak-guard corpus of its own** (synthetic deny cases, fixtures full of
-`.lan` hosts), declare it with `path_exempt` per pattern, scoped to the directory that holds it.
-This repository's own `.leakguard.json` is the worked example, and the suite reads the real file so
-a broken config here fails a test here.
+   ⚠️ Stated precisely, because the short version of it is wrong: where the running guard IS the
+   repository's own file, that file's content is skipped UNCONDITIONALLY. That is inherent in a
+   guard whose source carries its own deny corpus; the layer that covers that one file is a
+   separate real-literal check run from outside the repository, which deliberately does not skip
+   it.
+
+**There is no path-exemption setting.** A repository could briefly excuse one named pattern on one
+path regex, and both attempts to bound that regex were fail-open, one review round apart: the first
+never measured it (`{"path_regex": "."}` turned a pattern off tree-wide and was accepted); the
+second measured the deny corpus at a list of "ordinary" probe paths, which is a nine-name allowlist
+wearing the word "property" — `\.go$` and `^internal/` sailed past it, a negative lookahead over
+the nine names turned a pattern off everywhere in one line, and it REFUSED the narrowest exemption
+there is (a single file) whenever that file was called `README.md` or `Dockerfile`. No acceptance
+criterion asked for it, so it was withdrawn rather than repaired a third time. A config naming
+`path_exempt` is refused with a message saying so, and `PATH_EXEMPT` survives as an engine constant
+that only an edit to the module changes.
+
+**If your repository keeps a leak-guard corpus of its own** (synthetic deny cases, fixtures full
+of `.lan` hosts), there is no setting for it: assemble those values at RUNTIME from fragments,
+the way this repository's own test suites do, so the file carries no matchable literal at rest.
+This repository's `.leakguard.json` is the worked example of what a config now looks like, and
+the suite reads the real file so a broken config here fails a test here.
 
 **What is NOT in this release:** adoption anywhere. Each consuming repository takes it as its own
 change, and `unraid-templates` — where this engine came from — should re-adopt rather than keep its

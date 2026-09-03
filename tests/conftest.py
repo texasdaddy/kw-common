@@ -158,9 +158,9 @@ def _leakguard_config_is_restored() -> object:
     the failure surfaces as an unreproducible verdict in a file that never mentions config at all.
     So this both restores the default AND says which test left it changed.
     """
-    before = (leakguard.ALLOW_LITERALS, leakguard.PATH_EXEMPT)
+    before = leakguard.ALLOW_LITERALS
     yield
-    after = (leakguard.ALLOW_LITERALS, leakguard.PATH_EXEMPT)
+    after = leakguard.ALLOW_LITERALS
     if after != before:
         leakguard.apply_config(leakguard.DEFAULT_CONFIG)
         pytest.fail(
@@ -184,14 +184,13 @@ def injected_literals() -> object:
     config = leakguard.load_config(REPO_CONFIG)
     assert config.allow_literals, (
         f"{REPO_CONFIG} declares no allow_literals, so every test using this fixture is vacuous")
-    # ⛔ AND IT MUST DECLARE NO PATH EXEMPTIONS. The first version of this file excused all eight
-    # patterns on the engine's own path — a whole-file skip written in data, through which a REAL
-    # leak appended to that file passed. The guard recognises its own source by its BYTES now, so
-    # there is nothing left for a path exemption here to do, and an entry reappearing would mean
-    # the identity test has stopped working and somebody papered over it.
-    assert not config.path_exempt, (
-        f"{REPO_CONFIG} declares path_exempt entries. This repository needs none: the guard "
-        f"recognises its own source by content. An entry here is a whole-file skip in disguise.")
+    # ⛔ AND THE FIELD IT USED TO CARRY NO LONGER EXISTS. `path_exempt` was configurable for two
+    # rounds and both attempts to bound it were fail-open; `GuardConfig` records them. A config
+    # naming it is now REFUSED, so this repository's own file must not name it either — and the
+    # `_run` cases below pin the refusal.
+    assert not hasattr(config, "path_exempt"), (
+        "GuardConfig has a `path_exempt` field again. It was withdrawn because no acceptance "
+        "criterion needed it and two designs for bounding it were both fail-open.")
     leakguard.apply_config(config)
     yield config
     leakguard.apply_config(leakguard.DEFAULT_CONFIG)
