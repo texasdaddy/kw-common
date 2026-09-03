@@ -257,6 +257,20 @@ def test_the_relative_config_path_is_the_only_path_the_module_knows() -> None:
     assert not Path(CONFIG_RELPATH).is_absolute()
 
 
+def test_the_marker_name_is_pinned_to_its_literal() -> None:
+    """⭐ THE SAME VACUITY GUARD, FOR THE CONSTANT THAT DID NOT HAVE ONE.
+
+    Every marker test builds its expected path FROM `MARKER_NAME`, so the constant is asserted
+    against itself: renaming it, or dropping the leading dot the comment calls deliberate, is
+    invisible to all of them. `CONFIG_RELPATH` has had this guard from the start; the asymmetry
+    was the gap.
+    """
+    assert MARKER_NAME == ".alerting-validated"
+    assert MARKER_NAME.startswith("."), "the marker is a dotfile on purpose"
+    assert marker_name("prod") == ".alerting-validated-prod"
+    assert marker_name("DEV") == ".alerting-validated-dev"
+
+
 # ============================================================ acceptance 2: it fails loudly
 @pytest.mark.parametrize("missing", [SHARED_ROOT_VAR, DEPLOY_ENV_VAR])
 def test_the_env_layer_refuses_a_missing_variable_rather_than_defaulting(
@@ -268,10 +282,13 @@ def test_the_env_layer_refuses_a_missing_variable_rather_than_defaulting(
 
     with pytest.raises(AlertEnvError) as exc:
         load_alert_settings_from_env("feed-poller")
-    assert missing in str(exc.value)
+    # ⭐ IT MUST LEAD WITH THE ONE THAT IS MISSING. `missing in str(exc.value)` was satisfied
+    # UNCONDITIONALLY: the message ends by listing all three variable names as guidance, so a
+    # refusal hardcoded to say the wrong one passed both of these tests. Measured.
+    assert str(exc.value).startswith(missing), str(exc.value)
 
 
-@pytest.mark.parametrize("blank", ["", "   "])
+@pytest.mark.parametrize("blank", ["", "   ", "\t\n"])
 def test_a_variable_set_to_blank_is_refused_because_that_is_what_an_unfilled_template_looks_like(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blank: str) -> None:
     """⚠️ THE COMMON CASE, NOT THE EXOTIC ONE. A container platform passes every unset optional
@@ -467,10 +484,26 @@ def test_the_prefix_is_cosmetic_and_cannot_cost_a_delivery(channels: dict[str, S
         def title_prefix(self) -> str:
             raise RuntimeError("this settings object is hostile")
 
-    for stand_in in (NoPrefix(), PrefixRaises()):
+    class PrefixIsNone(NoPrefix):
+        # `None` is the obvious spelling of "no prefix", and a settings object predating the field
+        # can carry it.
+        title_prefix = None
+
+    class PrefixIsTruthyNonString(NoPrefix):
+        # ⭐⭐ THE CASE THAT MAKES THE `isinstance` GUARD LOAD-BEARING — and the first version of
+        # this test used `None` ALONE, which SURVIVED removing the guard. Measured, not reasoned:
+        # `_dispatch` only prefixes when the value is truthy, so a FALSY non-string is already
+        # handled one layer down and proves nothing about the guard. A truthy non-string is the
+        # only input that separates the two, and without it `_title_prefix`'s stated contract —
+        # "anything that is not a plain string becomes no prefix at all" — was asserted by nothing.
+        title_prefix = 5
+
+    for stand_in in (NoPrefix(), PrefixRaises(), PrefixIsNone(), PrefixIsTruthyNonString()):
         channels["ntfy"].calls.clear()
         results = Alerter(stand_in).notify(ERROR, "still delivered", "...")  # type: ignore[arg-type]
         assert results["ntfy"] == "sent", f"{type(stand_in).__name__} cost the notification"
+        # ⚠️ THE TITLE, not just the delivery: a guard that returned `str(value)` would deliver
+        # happily and put "None" in front of it.
         assert channels["ntfy"].calls[0][2] == "still delivered"
 
 
@@ -615,6 +648,23 @@ def test_read_config_and_the_send_path_agree_on_a_hostile_file(tmp_path: Path) -
     assert read_config(path)["EMAIL_TO"] == "ops@example.com"
 
 
+def test_read_config_sees_a_LONE_CR_the_same_way_the_send_path_does(tmp_path: Path) -> None:
+    r"""⭐ THE HALF CRLF CANNOT REACH, and the half that makes `newline=""` load-bearing.
+
+    Universal-newline translation rewrites `\r\n` AND a lone `\r` to `\n` before the parser sees a
+    character, so a CRLF sample proves nothing about the flag: strip it and CRLF still parses
+    identically. A LONE CR does not — without `newline=""` the value is split and a recipient is
+    SILENTLY DROPPED, which is the exact defect `alerting`'s parser comments describe. Measured
+    both ways: dropping the flag here survived every other test in this file.
+
+    Written with `write_bytes`, because a text write would translate it back.
+    """
+    path = tmp_path / "lone-cr.env"
+    path.write_bytes(b"EMAIL_TO=a@example.com\rb@example.invalid\n")
+    assert read_config(path)["EMAIL_TO"] == "a@example.com\rb@example.invalid"
+    assert read_config(path) == alerting._parse_env_file(str(path))
+
+
 def test_a_missing_file_is_an_error_here_and_not_an_error_in_the_send_path(
         tmp_path: Path) -> None:
     """⚠️ THE TWO POLICIES, SIDE BY SIDE, so neither can be "harmonised" into the other. Silence
@@ -647,8 +697,11 @@ def test_a_directory_where_the_file_should_be_is_reported_as_unreadable(tmp_path
     line naming the path."""
     path = tmp_path / "configs"
     path.mkdir()
-    with pytest.raises(AlertEnvError):
+    with pytest.raises(AlertEnvError) as exc:
         read_config(path)
+    # The docstring above promises a line NAMING the path; without this the message could be the
+    # single word "unreadable" and the test would still pass.
+    assert str(path) in str(exc.value)
 
 
 # ======================================================== acceptance 6 & 7: boot validation
@@ -715,6 +768,45 @@ def test_a_marker_exactly_as_old_as_the_config_validates_again(
     channels["ntfy"].calls.clear()
 
     assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+
+
+def test_an_alert_that_never_left_does_not_mark_the_boot_validated(tmp_path: Path) -> None:
+    """⭐⭐ THE ORDER, WHICH THE SUCCESS PATH CANNOT DISTINGUISH.
+
+    `validate_boot` sends and then marks. Both orderings look identical when the send works, so
+    the whole suite was blind to swapping them — measured: the swap survived every other test.
+    The difference only shows when the send does NOT work, and then it is permanent: a marker
+    written for an alert that never left suppresses every later boot's alert too, so the service
+    goes quiet and stays quiet.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+
+    class Hostile:
+        """An `Alerter` whose `notify` raises. `_announce` does not guard the call, deliberately —
+        the real `Alerter.notify` is the thing that never raises."""
+
+        def notify(self, *args: object, **kwargs: object) -> dict[str, str]:
+            raise RuntimeError("the channel exploded")
+
+    with pytest.raises(RuntimeError):
+        validate_boot(settings, "prod", marker_dir, alerter=Hostile())  # type: ignore[arg-type]
+    assert not marker.exists(), "an alert that never left must not mark this boot validated"
+
+
+def test_a_refusal_names_EVERY_missing_key_not_just_the_first(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """An operator with three missing keys must not get three sequential boot failures. Every
+    other case here drops exactly ONE key, so reporting only the first survived all of them."""
+    config = drop(tmp_path, "EMAIL_TO", "SMTP_HOST", "SMTP_PASSWORD")
+    settings = load_alert_settings(config, "prod", "feed-poller")
+    with pytest.raises(AlertEnvError) as exc:
+        validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
+    for key in ("EMAIL_TO", "SMTP_HOST", "SMTP_PASSWORD"):
+        assert key in str(exc.value)
+    # ...and it says which keys are OPTIONAL, so the operator is not left guessing whether the
+    # ones it did not name are also required.
+    assert "SMTP_USER" in str(exc.value)
+    assert silence(channels) == []
 
 
 def test_the_marker_is_always_left_STRICTLY_newer_than_the_config(tmp_path: Path) -> None:
@@ -797,6 +889,11 @@ def test_a_missing_required_key_refuses_to_boot_and_alerts_nobody(
         validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
 
     assert missing_key in str(exc.value)
+    # ⭐ AND NOT THE OTHERS. `missing_key in message` is equally true of a message that lists
+    # EVERY required key, which is what a refusal reduced to "these are the keys prod requires"
+    # would say — the operator then loses the whole diagnostic and the test stays green.
+    present = [k for k in required_keys("prod") if k != missing_key]
+    assert not [k for k in present if k in str(exc.value)], str(exc.value)
     assert silence(channels) == []
     assert not (tmp_path / "app" / marker_name("prod")).exists()
 
@@ -829,8 +926,9 @@ def test_an_unreadable_config_refuses_to_boot_and_alerts_nobody(
     config = config_file_for(tmp_path)
     config.parent.mkdir(parents=True, exist_ok=True)
     settings = AlertSettings(service="feed-poller", config_file=str(config))
-    with pytest.raises(AlertEnvError, match="does not exist"):
+    with pytest.raises(AlertEnvError, match="does not exist") as exc:
         validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
+    assert str(config) in str(exc.value)      # which file, not just that one was missing
     assert silence(channels) == []
 
 
@@ -978,7 +1076,7 @@ def test_validate_boot_from_env_refuses_a_missing_variable(
 
     with pytest.raises(AlertEnvError) as exc:
         validate_boot_from_env(settings)
-    assert missing in str(exc.value)
+    assert str(exc.value).startswith(missing), str(exc.value)   # see the loader test above
     assert silence(channels) == []
 
 
