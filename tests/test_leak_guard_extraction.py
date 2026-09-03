@@ -186,6 +186,13 @@ def test_an_explicit_config_path_is_honoured_and_a_missing_one_is_an_ERROR(
     assert missing.returncode == 2, (
         f"a --config path that does not exist must be a usage error, not a silent fall back to "
         f"the repository's own file or to the defaults:\n{_out(missing)}")
+    # ⛔ AND IT MUST SAY SO. Exit 2 alone is satisfied by a DIFFERENT error path — delete the
+    # `is_file()` guard and `load_config` raises "cannot be read (FileNotFoundError)", which is
+    # also exit 2 and reads like a permissions problem. The operator has to be told which of the
+    # two happened, and this assertion is what stops the specific message being lost.
+    assert "no such file" in _out(missing), (
+        f"the error does not say the named config is missing, so it is indistinguishable from an "
+        f"unreadable or malformed one:\n{_out(missing)}")
 
 
 def test_selftest_REFUSES_a_config_rather_than_ignoring_one(tmp_path: Path) -> None:
@@ -261,6 +268,12 @@ def test_a_NARROW_allowance_is_still_accepted(tmp_path: Path) -> None:
     repo = _repo(tmp_path, "narrow")
     (repo / "notes.md").write_text(f"addr {_ADDR_NOT_IN_THE_CORPUS}\n", encoding="utf-8")
     _git(repo, "add", "notes.md")
+    # ⚠️ THE "BEFORE" DIRECTION, which this test lacked. Asserting only that the configured tree
+    # passes is equally true of a pattern that had stopped matching the value altogether — it
+    # would go on passing while measuring nothing.
+    assert _run(repo).returncode == 1, (
+        "vacuity guard: the address must be caught WITHOUT the config, or a clean verdict below "
+        "says nothing about the allowance")
     _write_config(repo, {"allow_literals": [
         {"literal": _ADDR_NOT_IN_THE_CORPUS,
          "why": "test fixture: one address, not the whole pattern"}]})
@@ -398,6 +411,11 @@ def test_the_same_leak_at_that_path_reds_the_RANGE_scan_too(tmp_path: Path) -> N
     res = _run(repo, "--range", f"{base}..HEAD")
     assert res.returncode == 1, (
         f"the range scan exempted a leak at the old vendored guard path:\n{_out(res)}")
+    # ⛔ AND IT MUST BE THAT FILE. Exit 1 also means "something unreadable, or a range git could
+    # not resolve", so the exit code alone does not pin the surface — the tree half of this pair
+    # asserts the path for exactly that reason, and this half did not.
+    assert _VENDORED_REL in _out(res), (
+        f"the range scan RED for some reason other than the planted leak:\n{_out(res)}")
 
 
 def test_a_guard_OUTSIDE_the_scanned_repo_resolves_NO_self_path() -> None:
@@ -509,9 +527,15 @@ def test_the_four_engine_add_surfaces_still_catch_from_an_INSTALLED_guard(
     message = _run(repo, "--range", f"{base}..HEAD")
     assert message.returncode == 1, (
         f"surface 2 (a leaking commit-message BODY) is not caught:\n{_out(message)}")
-    assert "<commit message>" in _out(message), (
-        f"the finding is not attributed to the MESSAGE surface, so it may be the diff or the "
-        f"identity being reported instead:\n{_out(message)}")
+    # ⛔ THE FINDING LINE, NOT THE OUTPUT. A range report always prints a remediation footer
+    # containing the literal "`<commit message>` finding is the message, not the diff", so
+    # `"<commit message>" in output` is satisfied by BOILERPLATE — it is true of a range whose
+    # only finding is a diff line and whose messages are spotless. Verified: a verification agent
+    # constructed exactly that and the assertion held. Findings are the indented lines.
+    finding_lines = [ln for ln in _out(message).splitlines() if ln.startswith("  ")]
+    assert any("<commit message>" in ln for ln in finding_lines), (
+        f"no FINDING is attributed to the message surface — the diff or the identity may be what "
+        f"was reported:\n{_out(message)}")
 
 
 
@@ -762,6 +786,173 @@ def test_line_endings_do_not_stop_the_guard_recognising_its_own_source(tmp_path:
     assert _run(repo).returncode == 0, (
         "a CRLF copy of the guard's own source was not recognised as the guard")
 
+
+# -------------------------------------------------------------------------------------------
+# ⭐ ISOLATING CASES. The refusal check has three loops, and a wide `path_exempt` is caught by
+# TWO of them at once — so a mutation that deletes either one survives, and neither is really
+# pinned. Each test below constructs the case where ONLY its loop can refuse: the rule is that
+# to isolate a predicate you build the scenario no other arm can exclude.
+# -------------------------------------------------------------------------------------------
+
+
+def test_the_PROBE_PATH_loop_alone_refuses_a_wide_exemption(tmp_path: Path) -> None:
+    """`unraid pool path` has NO entry in `_MUST_FAIL_PATHS`, so the path-corpus loop is silent.
+
+    A wide `path_exempt` on it can therefore only be refused by running the CONTENT corpus at
+    ordinary probe paths — which is precisely the loop whose absence was the off-switch.
+    """
+    assert "unraid pool path" not in {label for label, _ in guard._MUST_FAIL_PATHS}, (
+        "vacuity guard: this label now HAS a path deny case, so the path loop could refuse the "
+        "config below and this test no longer isolates the probe-path loop")
+    repo = _repo(tmp_path, "probeonly")
+    (repo / "notes.md").write_text(f"path: {_LEAK_PATH}\n", encoding="utf-8")
+    _git(repo, "add", "notes.md")
+    _write_config(repo, {"path_exempt": [
+        {"pattern": "unraid pool path", "path_regex": ".",
+         "why": "test fixture: total, and invisible to every loop but the probe-path one"}]})
+
+    res = _run(repo)
+    assert res.returncode == 2 and "DEFEATS" in _out(res), (
+        f"a total path exemption on a pattern with no path deny case was accepted — the deny "
+        f"corpus is not being measured at ordinary paths:\n{_out(res)}")
+
+
+def test_the_PATH_CORPUS_loop_alone_refuses_a_literal(tmp_path: Path) -> None:
+    """A literal that swallows the `cgnat address` PATH deny case and nothing else.
+
+    It does not appear in any content or message sample, so the probe-path and message loops
+    cannot refuse it. Only running `_MUST_FAIL_PATHS` through `scan_path` can.
+    """
+    # ⚠️ Assembled: this file is scanned, and the value is a deny shape by construction.
+    literal = "100.127." + "255.254.conf"
+    repo = _repo(tmp_path, "pathcorpus")
+    _write_config(repo, {"allow_literals": [
+        {"literal": literal, "why": "test fixture: swallows exactly one PATH deny case"}]})
+
+    res = _run(repo)
+    assert res.returncode == 2 and "PATH" in _out(res), (
+        f"a literal that defeats a PATH deny case and nothing else was accepted — the path "
+        f"corpus is not being measured:\n{_out(res)}")
+
+
+def test_the_MESSAGE_CORPUS_loop_alone_refuses_a_literal(tmp_path: Path) -> None:
+    """The third loop, isolated the same way: a literal present only in a MESSAGE deny sample."""
+    literal = "see /" + "/mnt/" + "user/appdata/svc"
+    repo = _repo(tmp_path, "msgcorpus")
+    _write_config(repo, {"allow_literals": [
+        {"literal": literal, "why": "test fixture: swallows exactly one MESSAGE deny case"}]})
+
+    res = _run(repo)
+    assert res.returncode == 2 and "MESSAGE" in _out(res), (
+        f"a literal that defeats a MESSAGE deny case and nothing else was accepted — the message "
+        f"corpus is not being measured:\n{_out(res)}")
+
+
+def test_the_ADJACENT_deny_corpus_is_measured_too(tmp_path: Path) -> None:
+    """`_MUST_FAIL_ADJACENT` is thirteen of the thirty-two cases and was droppable unnoticed.
+
+    Those cases ARE the amnesty class this engine was rewritten to close — a permitted token
+    written flush against a leak — so a config allowed to defeat one is a config allowed to
+    reintroduce the bug the allow-span design exists to prevent.
+    """
+    want_label, sample = guard._MUST_FAIL_ADJACENT[0]
+    repo = _repo(tmp_path, "adjacent")
+    _write_config(repo, {"allow_literals": [
+        {"literal": sample,
+         "why": "test fixture: the whole adjacent sample, so the hit falls inside it"}]})
+
+    res = _run(repo)
+    assert res.returncode == 2 and want_label in _out(res), (
+        f"a literal that defeats an ADJACENT deny case was accepted; those thirteen cases are "
+        f"the amnesty bypass this engine was rewritten to close:\n{_out(res)}")
+
+
+def test_a_REFUSED_config_leaves_the_previous_allowances_in_place() -> None:
+    """`apply_config` rolls back on refusal, and nothing measured that.
+
+    Every other test refuses a config in a SUBPROCESS that then exits, so a failure to roll back
+    is invisible to them. In a long-lived process — a consumer importing this module, or a scan of
+    several repositories — a half-applied config would silently govern the next question asked.
+    """
+    good = guard.GuardConfig(allow_literals=("kept-by-the-rollback",))
+    guard.apply_config(good)
+    assert good.allow_literals == guard.ALLOW_LITERALS, "vacuity guard: the good config took"
+
+    defeating = guard.GuardConfig(allow_literals=("/mnt/" + "user",))
+    try:
+        guard.apply_config(defeating)
+    except guard.ConfigError:
+        pass
+    else:
+        guard.apply_config(guard.DEFAULT_CONFIG)
+        pytest.fail("the defeating config was accepted, so this test cannot measure the rollback")
+
+    assert good.allow_literals == guard.ALLOW_LITERALS, (
+        "a REFUSED config left its allowances installed — the rollback in `apply_config` is gone, "
+        "and the next scan in this process runs under rules that were rejected")
+    assert good.path_exempt == guard.PATH_EXEMPT
+    guard.apply_config(guard.DEFAULT_CONFIG)
+
+
+@pytest.mark.parametrize(
+    "argv,expected",
+    [
+        pytest.param(["--config"], "needs a value", id="no-value"),
+        pytest.param(["--config", "--selftest"], "not another flag", id="value-is-a-flag"),
+        pytest.param(["--config="], "needs a path", id="empty-joined-form"),
+    ],
+)
+def test_the_config_flag_is_parsed_STRICTLY(tmp_path: Path, argv: list[str],
+                                            expected: str) -> None:
+    """Every `--config` spelling that cannot mean anything is a usage error, not a silent default.
+
+    ⛔ THE SILENT DEFAULT IS THE BUG THIS FILE'S PARSER EXISTS TO PREVENT: an argument the scanner
+    swallows leaves the caller believing their allowances were applied when the scan ran under
+    different rules entirely. `--repo` has all three of these checks; `--config` needed them too,
+    and none of them was exercised.
+    """
+    repo = _repo(tmp_path, f"argv_{abs(hash(tuple(argv)))}")
+    res = _run(repo, *argv)
+    assert res.returncode == 2, f"{argv} was accepted:\n{_out(res)}"
+    assert expected in _out(res), f"{argv}: expected {expected!r} in:\n{_out(res)}"
+
+
+def test_a_config_that_is_UNREADABLE_or_not_UTF8_stops_the_scan(tmp_path: Path) -> None:
+    """The two `load_config` failure branches, neither of which any test reached.
+
+    Both must exit 2 rather than degrading to "no config" — the same rule as a parse error, for
+    the same reason: a clean verdict looks identical either way.
+    """
+    # Not UTF-8: a lone continuation byte cannot start a sequence.
+    repo = _repo(tmp_path, "notutf8")
+    (repo / guard.CONFIG_FILENAME).write_bytes(b'{"allow_literals": [\x80]}')
+    _git(repo, "add", guard.CONFIG_FILENAME)
+    res = _run(repo)
+    assert res.returncode == 2, f"a non-UTF-8 config did not stop the scan:\n{_out(res)}"
+    assert "UTF-8" in _out(res), _out(res)
+
+    # Unreadable: a DIRECTORY at the config's path. `is_file()` is false, so discovery passes over
+    # it — but `--config` names it explicitly and must refuse rather than proceed.
+    other = _repo(tmp_path, "isadir")
+    (other / guard.CONFIG_FILENAME).mkdir()
+    res = _run(other, "--config", str(other / guard.CONFIG_FILENAME))
+    assert res.returncode == 2, f"a directory named as --config did not stop the scan:\n{_out(res)}"
+
+
+def test_a_justification_of_only_WHITESPACE_is_refused(tmp_path: Path) -> None:
+    """"`why` is required" has to mean a reason, not a space bar.
+
+    An entry whose justification is blank satisfies the letter of the format and none of its
+    purpose, and `not value.strip()` — the half that makes it mean something — was unmeasured.
+    """
+    repo = _repo(tmp_path, "blankwhy")
+    (repo / guard.CONFIG_FILENAME).write_text(
+        json.dumps({"allow_literals": [{"literal": "x", "why": "   \t  "}]}), encoding="utf-8")
+    _git(repo, "add", guard.CONFIG_FILENAME)
+    res = _run(repo)
+    assert res.returncode == 2, f"a whitespace-only justification was accepted:\n{_out(res)}"
+    assert "non-empty" in _out(res), _out(res)
+
 # =================================================================================================
 # 5. The package surface itself
 # =================================================================================================
@@ -818,12 +1009,37 @@ def test_the_guard_module_imports_without_dragging_in_anything_else() -> None:
     """The isolation contract, asked of the new module.
 
     `kw_common.leakguard` must not pull in `kw_common.alerting` — a consumer that only wants the
-    guard should not pay for `smtplib`, `ssl` and `urllib`. The engine is stdlib-only besides.
+    guard should not pay for `smtplib`, `ssl` and `urllib`.
+
+    ⛔ AND IT MUST BE STDLIB-ONLY, which naming two forbidden modules does not establish. This
+    test used to assert exactly that: no `kw_common.alerting`, no `smtplib`. It would have passed
+    unchanged if the engine had grown a third-party import — the contract this repository is built
+    on, unmeasured for its newest module. `README.md` cites `tests/test_isolation.py` as the
+    enforcement, and that file is written against `alerting.py` alone.
+
+    ⚠️ NOT A `sysconfig.get_paths()['stdlib']` PREFIX TEST, for the reason `test_isolation.py`
+    gives at length: C extension modules live in `lib-dynload` or are built in, and a prefix test
+    calls them foreign. What identifies a third-party import is a `site-packages` origin.
+
+    ⭐ MEASURED AS A DELTA, not as an absolute. The first version of this asserted that NO
+    third-party module was in `sys.modules` — and failed on `_virtualenv`, a shim the interpreter
+    loads from a `.pth` file before any user code runs. What the contract is about is what the
+    GUARD imports, so the baseline is taken first and subtracted, which also makes the test
+    independent of whatever the surrounding environment happens to preload.
     """
-    res = subprocess.run(
-        [sys.executable, "-c",
-         "import sys; import kw_common.leakguard; "
-         "assert 'kw_common.alerting' not in sys.modules, sorted(sys.modules); "
-         "assert 'smtplib' not in sys.modules, 'the guard pulled in smtplib'"],
-        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=300)
+    probe = (
+        "import sys\n"
+        "def third_party():\n"
+        "    return {n for n, m in list(sys.modules.items())\n"
+        "            if getattr(m, '__file__', None)\n"
+        "            and ('site-packages' in m.__file__ or 'dist-packages' in m.__file__)}\n"
+        "before = third_party()\n"
+        "import kw_common.leakguard\n"
+        "assert 'kw_common.alerting' not in sys.modules, sorted(sys.modules)\n"
+        "assert 'smtplib' not in sys.modules, 'the guard pulled in smtplib'\n"
+        "added = sorted(n for n in third_party() - before if not n.startswith('kw_common'))\n"
+        "assert not added, 'importing the guard added third-party package(s): %s' % added\n"
+    )
+    res = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True,
+                         encoding="utf-8", errors="replace", timeout=300)
     assert res.returncode == 0, f"{res.stdout}{res.stderr}"

@@ -16,6 +16,16 @@ include pyproject.toml
 include .leakguard.json
 recursive-include tests *.py
 
+# ⭐ THE WORKFLOWS, because two tests READ them. `test_the_CI_workflow_runs_BOTH_scans_FROM_THE_
+# INSTALLED_PACKAGE` and `test_the_required_status_check_names_are_recorded_in_the_workflow` open
+# `.github/workflows/ci.yml`, so an sdist without it ships a suite that ERRORS — which is the
+# third time this exact class has bitten (the conftest, then `.leakguard.json`, now this) and the
+# first time it was caught by unpacking the tarball and running the tests rather than by grepping
+# its file list. `README.md`'s "tests travel with the module" is false for an sdist consumer
+# otherwise, and the packaging job now runs the shipped suite instead of taking the claim on
+# trust.
+recursive-include .github/workflows *.yml
+
 # ⭐ `.leakguard.json` IS INCLUDED because it is an ARGUMENT for the tests, not decoration. This
 # repository's own config is the worked example the leak-guard suite reads, and an sdist whose
 # suite cannot find it ships tests that skip the one property the extraction exists to prove.

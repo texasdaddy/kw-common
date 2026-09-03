@@ -867,14 +867,16 @@ def apply_config(config: GuardConfig) -> None:
     corpus itself.
 
     ⚠️ WHAT THIS DOES NOT CATCH, stated because "cannot be bypassed" is the claim that never
-    survives a round. The corpus holds ONE sample per pattern, and a permitted span only
-    suppresses a hit it fully CONTAINS — so `"/mnt/user"` is refused (it contains the pool-path
-    corpus match) while `"192.168.1.1"` is accepted, because the RFC1918 corpus case is a
-    different address. A repository can therefore still allow individual real values one at a
-    time. That is not the hole this check exists to close: each such entry is an explicit line
-    with a written justification in a file in that repository, which is the visibility the old
-    hand-edited tail never had. What is closed is the single wide literal that silently turns a
-    whole pattern off across a tree.
+    survives a round. The corpus is FINITE — 32 content samples across 8 labels, 9 paths and 8
+    messages, a handful each rather than the "one per pattern" an earlier version of this
+    paragraph asserted — and a permitted span only suppresses a hit it fully CONTAINS. So
+    `"/mnt/user"` is refused (it contains the pool-path corpus match) while `"192.168.1.1"` is
+    accepted, because no corpus case uses that address. A repository can therefore still allow
+    individual real values one at a time. That is not the hole this check exists to close: each
+    such entry is an explicit line with a written justification in a TRACKED file in that
+    repository, which is the visibility the old hand-edited tail never had. What is closed is the
+    single wide literal — or the single wide path exemption — that silently turns a whole pattern
+    off across a tree.
     """
     global ALLOW_LITERALS, PATH_EXEMPT, _PATH_EXEMPT_RX
     previous = (ALLOW_LITERALS, PATH_EXEMPT, _PATH_EXEMPT_RX)

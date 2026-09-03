@@ -188,7 +188,7 @@ jobs:
           sdist="$(ls dist/*.tar.gz)"
           echo "inspecting ${sdist}"
           names="$(tar tzf "$sdist")"
-          for required in '/tests/conftest.py' '/.leakguard.json'; do
+          for required in '/tests/conftest.py' '/.leakguard.json' '/.github/workflows/ci.yml'; do
             echo "$names" | grep -q "${required}\$" || {
               echo "::error::the sdist has no ${required} — its suite ships without something it"
               echo "::error::depends on. Check MANIFEST.in."
@@ -202,6 +202,28 @@ jobs:
             exit 1
           fi
           echo "sdist contents are as intended"
+      # ⭐⭐ RUN THE SHIPPED SUITE, rather than grepping the tarball's file list for the things we
+      # currently remember it needs. The list above has been wrong THREE times — the conftest, then
+      # `.leakguard.json`, then `.github/workflows/ci.yml` — and each time the file list looked
+      # fine. Unpacking the sdist and running its tests is the check that cannot be out of date,
+      # because it asks the question `README.md` actually promises: do the tests travel?
+      - name: The sdist's own test suite passes
+        run: |
+          set -eu
+          sdist="$(ls dist/*.tar.gz)"
+          rm -rf /tmp/sdist && mkdir -p /tmp/sdist
+          tar xzf "$sdist" -C /tmp/sdist
+          unpacked="$(ls -d /tmp/sdist/*/)"
+          python -m venv /tmp/sdisttest
+          /tmp/sdisttest/bin/python -m pip install --upgrade pip
+          /tmp/sdisttest/bin/python -m pip install "$unpacked"
+          /tmp/sdisttest/bin/python -m pip install "pytest==9.1.1" "pytest-timeout==2.4.0"
+          cd "$unpacked"
+          # ⚠️ A git identity is injected per-call by the suite itself, but the tests that build
+          # scratch repositories need `git` to exist and `init.defaultBranch` not to warn into an
+          # assertion. The runner has git; this only pins the branch name.
+          git config --global init.defaultBranch main
+          /tmp/sdisttest/bin/python -u -m pytest
       - name: Install the wheel into a clean environment and import it
         # A throwaway venv, and `--no-index` so nothing can be silently satisfied from PyPI: this
         # asserts the library needs no third-party package at install time either.
