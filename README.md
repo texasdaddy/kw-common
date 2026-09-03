@@ -16,13 +16,13 @@ no port, no alignment audit, and no "which copy is the good one" question to ans
 Consumers install from git at an **exact tag** — never a branch:
 
 ```
-pip install git+https://github.com/texasdaddy/kw-common@v1.0.1
+pip install git+https://github.com/texasdaddy/kw-common@v1.1.0
 ```
 
 In a `requirements.in` / `requirements.txt`:
 
 ```
-kw-common @ git+https://github.com/texasdaddy/kw-common@v1.0.1
+kw-common @ git+https://github.com/texasdaddy/kw-common@v1.1.0
 ```
 
 ⛔ **Never pin a branch.** `@main` makes every rebuild of every consumer a silent, unreviewed
@@ -37,6 +37,7 @@ the release notes name every consumer that needs a code change.
 | Module | What it is |
 | --- | --- |
 | `kw_common.alerting` | The `notify(severity, title, message)` contract: fan-out to email + ntfy, edge-trigger vs. escalating de-duplication, and a small retrievable JSONL error log. |
+| `kw_common.leakguard` | The internal-information leak guard: shape-based scans of the tracked tree, the index, and the commits a push publishes — plus the `kw-leak-guard` command. |
 
 Modules are **independently importable**. `import kw_common` pulls in nothing; take what you need:
 
@@ -101,7 +102,7 @@ shared library, and saying so is a better outcome than bending the rule.
 ```
 src/kw_common/          the library
 tests/                  the suite, run on 3.10 and 3.12
-scripts/                the leak guard (see below)
+.leakguard.json         THIS repository's own leak-guard allowances (see below)
 .github/workflows/      ci.yml (PR + main) and release.yml (v* tags)
 ```
 
@@ -124,25 +125,83 @@ The tag and `kw_common.__version__` must agree; the release workflow refuses the
 do not. `src/kw_common/__init__.py` is the single source of the version — `pyproject.toml` reads
 it dynamically.
 
-## This repository is PUBLIC
+## The leak guard
 
-Internal-information hygiene is therefore load-bearing, and the guard runs from day one:
+`kw_common.leakguard` is the fleet's internal-information guard. It used to be a file that seven
+repositories each kept a copy of — with one of its test suites in five of them — so a fix made in
+one reached none of the others, and four separate engine improvements had to be re-ported by hand.
+It is a module here for the same reason everything else is: a consumer pins a version.
+
+Installing the package puts `kw-leak-guard` on the path:
 
 ```
-python scripts/check_no_internal_info.py --selftest   # prove the patterns still bite
-python scripts/check_no_internal_info.py              # scan the tracked tree
-python scripts/check_no_internal_info.py --staged     # scan what a commit would record
+kw-leak-guard --selftest   # prove the shipped patterns still bite (reads no repository)
+kw-leak-guard              # scan the tracked tree
+kw-leak-guard --staged     # scan what a commit would record
+kw-leak-guard --range origin/main..HEAD    # scan what a push would publish
 ```
 
-CI runs the self-test, the tree scan, **and** a commit-range scan — two different questions. The
-tree scan asks "is it here now" and reads tracked files only; the range scan reads what each
-commit *added*, so it also catches a value that was committed and then deleted, which stays
-permanently readable at the commit that added it.
+`python -m kw_common.leakguard` does the same thing and is equally supported.
 
-`scripts/check_no_internal_info.py` is a **verbatim copy** of the canonical guard from
-`texasdaddy/unraid-templates` (`main`, commit `eecad1a`). It is not edited here — a local fix
-would make it a fork, and a forked guard is exactly the drift this library exists to end. Improve
-it upstream and re-copy the whole file.
+CI runs the self-test, the tree scan **and** a commit-range scan — different questions. The tree
+scan asks "is it here now" and reads tracked files only; the range scan reads what each commit
+*added*, so it also catches a value that was committed and then deleted, which stays permanently
+readable at the commit that added it.
+
+### Configuring it — from YOUR repository, never by editing the install
+
+A repository declares its own allowances in **`.leakguard.json`** at its root (or a path given
+with `--config`). Nothing in the installed package is edited, so `pip install --upgrade` cannot
+revert your rules and your rules cannot hold back an upgrade.
+
+```json
+{
+  "_note": "a key prefixed with `_` is a comment - the only spelling this scanner ignores",
+  "allow_literals": [
+    {"literal": "github.com/<owner>", "why": "functional: this repository's own clone URL"}
+  ],
+  "path_exempt": [
+    {"pattern": "private lan domain", "path_regex": "^tests/fixtures/",
+     "why": "synthetic hosts, needed to prove the pattern still bites"}
+  ]
+}
+```
+
+* **`allow_literals`** suppresses a hit that falls *inside* an exact literal. It never deletes
+  text and never skips a line, so a permitted token cannot grant amnesty to a real leak sharing
+  the line with it.
+* **`path_exempt`** excuses **one named pattern** on **one path regex**. It is never a whole-file
+  skip: `pattern` must name a pattern the engine actually has, or the config is refused.
+* **`why` is required on every entry.** "Keep each one justified" is enforced rather than
+  requested.
+
+Four properties are deliberate and worth knowing before you write one:
+
+1. **No config means nothing is allowed.** A missing, misnamed or uncommitted file can only ever
+   make the scan *stricter*.
+2. **A config this scanner cannot understand STOPS the scan** (exit 2) — it never degrades to "no
+   config". An unknown key, a missing `why`, a regex that will not compile, a `--config` path that
+   does not exist: all errors. A silently ignored rule is worse than no rule, because a clean
+   verdict looks identical either way.
+3. **A config that would gut the guard is refused.** Applying your allowances must not stop any of
+   the engine's own deny cases being caught. Without that check, `{"literal": "192.168."}` would
+   turn a whole pattern off across your tree while CI stayed green. What it does *not* catch is
+   written down beside it in the code: the corpus holds one sample per pattern, so single real
+   values can still be allowed one explicit, justified line at a time.
+4. **The guard skips at most one file — its own source — and only when it is genuinely inside the
+   repository being scanned.** An installed guard lives in `site-packages`, which is not inside
+   your repository, so it exempts *nothing* there. (Earlier versions fell back to a hardcoded
+   `scripts/check_no_internal_info.py`, which silently exempted whatever a repository happened to
+   keep at that path — the path every repository in this fleet vendored its copy at.)
+
+This repository's own `.leakguard.json` is the worked example, and the test suite reads the real
+file rather than a fixture so that a broken config here fails a test here.
+
+### This repository is PUBLIC
+
+Internal-information hygiene is load-bearing, and it binds this module more than any other: the
+engine ships **inside the wheel**, so anything written in it is published to everyone who installs
+the library. It names no private repository, and a test enforces that.
 
 Placeholders in code, tests, comments and documentation come from the guard's own `_MUST_PASS`
 corpus — the list of shapes it is pinned to *allow*: `example.com` and `*.example` for hosts, the
