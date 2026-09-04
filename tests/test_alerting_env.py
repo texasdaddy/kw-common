@@ -972,6 +972,10 @@ def test_the_marker_records_the_config_that_was_CHECKED_not_the_one_on_disk_afte
 
     assert validate_boot(settings, "prod", marker_dir,
                          alerter=RewritesDuringTheSend()) is True  # type: ignore[arg-type]
+    # ⚠️ THE STAND-IN HAS TO HAVE RUN. Without this the two assertions below would hold on a file
+    # nothing ever rewrote — the test would pass while proving nothing, which is the vacuous-setup
+    # shape rather than a defect in the code. Its sibling above carries the same guard.
+    assert config.read_bytes() == broken, "the alerter never ran, so no race was created"
     recorded = marker.read_text(encoding="utf-8").strip()
     assert recorded == "sha256:" + hashlib.sha256(good).hexdigest(), (
         "the marker records the file as it stands AFTER validation, so a config rewritten during "
@@ -1026,6 +1030,31 @@ def test_the_digest_is_taken_BEFORE_the_file_is_parsed_so_the_window_fails_SAFE(
     monkeypatch.setattr(alerting_env, "read_config", real_read_config)
     assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
     assert len(channels["ntfy"].calls) == 1
+
+
+@pytest.mark.parametrize("digest", ["", "deadbeef", "md5:0123456789abcdef"])
+def test_a_digest_that_is_not_a_sha256_LINE_writes_no_marker_and_says_so(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture, digest: str) -> None:
+    """⛔ THE CALLER OWNS THE FORMAT NOW, so the format is checked rather than trusted.
+
+    While `_write_marker` computed the digest itself the `sha256:` prefix was guaranteed. As a
+    parameter it is not, and a bare hex digest would be written happily and then match NOTHING on
+    every subsequent boot — re-validating and re-announcing forever, silently. That is the failure
+    the deleted `_outrank` existed to prevent, reachable again through a signature change.
+
+    `""` is the reachable case rather than a hypothetical: `_config_digest` answers it when the
+    shared mount flaps between the digest and the parse, one statement apart.
+    """
+    from kw_common.alerting_env import _write_marker
+
+    marker = tmp_path / "app" / marker_name("prod")
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        _write_marker(marker, digest)
+
+    assert not marker.exists(), (
+        f"a marker was written for {digest!r}, which `_marker_matches` can never match — every "
+        f"boot from now on re-validates and re-announces")
+    assert "no usable digest" in caplog.text, "it happened silently"
 
 
 def test_an_alert_that_never_left_does_not_mark_the_boot_validated(tmp_path: Path) -> None:

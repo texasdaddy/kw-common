@@ -16,14 +16,24 @@
 #   git config core.hooksPath .githooks && git config kw.privateGuard "<absolute path to the guard>"
 #
 # WHAT `kw.privateGuard` MUST POINT AT -- the contract, because guessing it wrong is silent in one
-# direction and deafening in the other. The guard is a program this hook runs as:
+# direction and deafening in the other.
 #
-#     <guard> --repo <path> --public-repo [--range "<rev-range>"]
+#   STOP: It is a PYTHON SCRIPT, not "a program". The invocations below are `$PY "${GUARD}" ...`,
+#     where `$PY` is whichever of python3 / python / py -3 answers. Point this at a shell script or
+#     a compiled binary and it is handed to the interpreter, exits non-zero, and every push is
+#     refused with a leak accusation. The only check made on the path is that it is a file.
+#
+#     <python> <guard> --repo <path> --public-repo [--range "<rev-range>"]
 #
 #   * exit 0 means clean, any non-zero means "do not push" (a finding, or a scan it could not
 #     perform). It must print its own findings.
+#   * with no `--range` it scans the repository's TRACKED files as they stand in the WORKING TREE.
+#     That is what the wheel and the sdist are built from, and the comment on that call says so --
+#     so it is a requirement here rather than an observation about whichever guard is installed.
 #   * `--range` receives ONE argument that may contain SPACES -- `<sha> --not --remotes=<remote>`.
-#     A guard that cannot take a multi-token revision range there will refuse every push.
+#     A guard that cannot take a multi-token revision range there refuses every push of a ref the
+#     remote does NOT already have (a new branch or tag); an ordinary update passes a plain
+#     `A..B`, so the failure is intermittent by shape rather than immediate.
 #   * it must not read standard input. This hook redirects stdin away from it for safety, but a
 #     guard that consumes stdin is not usable as a pre-push check anywhere.
 #   STOP: It is NOT this package's own `kw-leak-guard`, which has no `--public-repo` and would
@@ -100,7 +110,14 @@ REFS="$(cat)"
 # Is anything actually being PUBLISHED, or is this push only deletions?
 UPDATES=""
 while read -r _l_ref l_sha _r_ref _r_sha; do
-    [ -n "${l_sha:-}" ] || continue
+    [ -n "${_l_ref:-}" ] || continue      # a blank line: the heredoc's own, when REFS is empty
+    if [ -z "${l_sha:-}" ]; then
+        # A line this does not understand. git always sends four fields, so this is unreachable
+        # through a real push -- and the answer to "I cannot tell whether this publishes" is that
+        # it does. Treating it as a deletion would skip the tree scan on an input we misread.
+        UPDATES="yes"
+        continue
+    fi
     case "${l_sha}" in
         *[!0]*) UPDATES="yes" ;;    # a real sha: something is being published
         *) ;;                       # all zeros: that ref is being deleted
@@ -110,14 +127,14 @@ ${REFS}
 REFLIST
 
 # ---- 1. the TREE, which is what the wheel and the sdist are built from.
-# TRACKED files as they stand in the working tree, so an uncommitted edit to a tracked file counts
-# and a brand-new untracked file does not (`git ls-files` is what the guard walks). That is
-# deliberate: an artifact is built from the working tree, and the message says which scan found
-# what, so a worktree-only finding is legible rather than mysterious.
+# The guard is required to scan TRACKED files as they stand in the working tree (see the contract
+# above), so an uncommitted edit to a tracked file counts and a brand-new untracked file does not.
+# That is deliberate: an artifact is built from the working tree, and the message says which scan
+# found what, so a worktree-only finding is legible rather than mysterious.
 if [ -n "${UPDATES}" ] || [ -z "${REFS}" ]; then
     # shellcheck disable=SC2086  # PY may be "py -3"; the split is the point.
     $PY "${GUARD}" --repo "${REPO}" --public-repo < /dev/null \
-        || fail "the working TREE carries internal information (above). This is what the wheel and the sdist are built from."
+        || fail "the guard refused the working TREE. Either a tracked file carries internal information, or the guard could not scan the tree -- its own output above says which. The tree is what the wheel and the sdist are built from, so this blocks a push even when no commit adds the value."
 fi
 
 # ---- 2. the COMMITS this push would actually publish.
@@ -137,8 +154,10 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
     case "${remote_sha}" in
         *[!0]*) RANGE="${remote_sha}..${local_sha}" ;;
         # No counterpart on the remote. With a named remote, exclude only what that remote already
-        # has; with none (the hook run by hand, or a push straight at a URL) exclude nothing and
-        # scan the whole reachable history -- slower, and strictly MORE than is needed.
+        # has; with none -- the hook run by hand, which is the only way `$1` is absent -- exclude
+        # nothing and scan the whole reachable history, slower and strictly MORE than is needed.
+        # (A push straight at a URL still fills `$1`, with the URL; `--remotes=<url>` then matches
+        # no ref and excludes nothing, which lands in the same place. Measured.)
         *) if [ -n "${REMOTE}" ]; then
                RANGE="${local_sha} --not --remotes=${REMOTE}"
            else

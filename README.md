@@ -344,12 +344,16 @@ Install it once per clone:
 git config core.hooksPath .githooks && git config kw.privateGuard "<absolute path to the project-side guard>"
 ```
 
-It scans the working tree (what the wheel and the sdist are built from) and the commits each ref
-would publish, and it **refuses the push** on any finding — including when `kw.privateGuard` is
-unset, because a guard that is silently not running looks exactly like a pass.
+It scans the tracked working tree (what the wheel and the sdist are built from) and the commits
+each ref would publish, and it **refuses the push** on any finding — including when
+`kw.privateGuard` is unset, because a guard that is silently not running looks exactly like a
+pass. The one exception is a push that only DELETES refs: it publishes nothing, so the tree scan
+is skipped and it goes through even when the worktree still holds the value you are cleaning up.
 
-⚠️ **Declared bound.** A hook is a local convention. Nothing in this repository, and nothing in CI,
-can assert that it ran on somebody's machine — CI must not have the list either.
+⚠️ **Declared bounds.** A hook is a local convention. Nothing in this repository, and nothing in
+CI, can assert that it ran on somebody's machine — CI must not have the list either. And
+`core.hooksPath .githooks` is a RELATIVE path, resolved inside the working tree, so a checkout
+that predates the hook has none and git says nothing: see issue #17, and the hook's own header.
 `tests/test_leak_guard_hook.py` drives the real hook against a real `git push` and asserts whether
 the remote ref moved; that is what can be checked here, and it says so rather than implying more.
 

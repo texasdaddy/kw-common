@@ -179,7 +179,8 @@ jobs:
       #     release later.
       #   * `.githooks/pre-push` must be PRESENT — `tests/test_leak_guard_hook.py` COPIES it and
       #     drives it against a real `git push`, so an sdist without it ships a suite that errors
-      #     on collection. That is the FOURTH occurrence of this exact class.
+      #     on collection. (The running count of this class lives in `MANIFEST.in`, in one place,
+      #     because three copies of it disagreed.)
       #   * `scripts/` must be ABSENT — it no longer exists, and this keeps a re-vendored copy
       #     of the guard from quietly reappearing beside the packaged one. ⚠️ Exclusion is NOT
       #     what keeps private service names out of published artifacts, and reading it that way

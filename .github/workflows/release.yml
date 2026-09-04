@@ -275,9 +275,9 @@ jobs:
               raise SystemExit(1)
           print("py.typed is in the wheel")
           PY
-      # ⭐⭐ AND RUN IT, which is the check the list above cannot be. That list has been wrong three
-      # times — the conftest, `.leakguard.json`, then `.github/workflows/ci.yml` — and looked
-      # complete every time. Unpacking the tarball and running its tests asks the question
+      # ⭐⭐ AND RUN IT, which is the check the list above cannot be. That list has been wrong every
+      # time it was extended, and looked complete every time (the running count and the roll-call
+      # live in `MANIFEST.in`). Unpacking the tarball and running its tests asks the question
       # `README.md` actually promises: do the tests travel? Duplicated from `ci.yml` deliberately,
       # per this file's header: a tag can point at a commit that never went through a PR.
       - name: The sdist's own test suite passes

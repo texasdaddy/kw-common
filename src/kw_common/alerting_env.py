@@ -584,7 +584,9 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
         return False
 
     _check_layout(config, shared_root)
-    # ⭐⭐ THE DIGEST IS TAKEN HERE, BEFORE ANYTHING IS CHECKED, AND CARRIED TO THE MARKER.
+    # ⭐⭐ THE DIGEST IS TAKEN HERE — BEFORE ANYTHING READS THE FILE'S CONTENTS — AND CARRIED TO
+    # THE MARKER. (`_check_layout` above it only stats directories, so it cannot see a rewrite;
+    # what must not get in front of this line is `read_config` and everything after it.)
     #
     # Taking it at WRITE time instead was a defect with #15's own outcome. `_announce` is an SMTP
     # round-trip plus an HTTP POST, so the gap between validating and marking is SECONDS of wall
@@ -821,20 +823,26 @@ def _write_marker(marker: Path, digest: str) -> None:
     hashed the file at this moment — after the checks and after an SMTP round-trip — so a config
     rewritten during that window was recorded as validated although nothing had looked at it, and
     no later boot re-checked. That reproduced #15's outcome through a narrower door. What is
-    recorded must be what was CHECKED; `validate_boot` takes it before it checks anything.
+    recorded must be what was CHECKED; `validate_boot` takes it before anything reads the file.
+
+    ⚠️ AND THE CALLER NOW OWNS THE FORMAT, which the old signature guaranteed by computing it. A
+    digest without the `sha256:` prefix would be written happily and then match nothing forever —
+    a marker that re-validates and re-announces on EVERY boot, silently, which is precisely the
+    failure the deleted `_outrank` existed to prevent. So it is checked here rather than trusted.
 
     ⚠️ A FAILURE HERE IS NOT A BOOT FAILURE. The configuration IS valid — that has already been
     established and announced. An unwritable `CONFIG_PATH` costs one redundant validation and one
     duplicate alert per boot, which is noise; refusing to start over it would turn a
     missing-read-write-volume into an outage of the service itself.
     """
-    if not digest:
-        # The config could not be digested at the top of `validate_boot`, yet the checks below it
-        # passed — so the file became readable in between. Writing a marker with nothing in it
-        # would be a marker that never matches: harmless, but silent. Saying so costs one line.
-        log.warning("alerting: no digest was taken for %s, so no validation marker was recorded — "
-                    "the configuration is valid and was announced, but the next boot will "
-                    "validate again.", marker)
+    if not digest.startswith("sha256:"):
+        # Empty means the CONFIG could not be read when the digest was taken, one statement before
+        # `read_config` read it successfully — a flap on the shared mount. Anything else means a
+        # caller passed a shape this file does not write. Both end the same way: no marker, one
+        # more validation on the next boot, and a line saying so rather than silence.
+        log.warning("alerting: no usable digest for the configuration file (%r), so no validation "
+                    "marker was written to %s — the configuration is valid and was announced, but "
+                    "the next boot will validate and announce again.", digest, marker)
         return
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)

@@ -566,6 +566,13 @@ def test_a_guard_that_reads_STDIN_cannot_swallow_the_ref_list(tmp_path: Path) ->
     landed with the leaking ref unexamined. The hook now reads the list in full before running
     anything AND redirects each guard's stdin to /dev/null, so neither half depends on the
     goodwill of a program that lives outside this repository.
+
+    ⚠️ TWO REFS, AND THE LEAKING ONE IS SECOND. With a single ref this passes on the buffering
+    alone, because by the time any guard runs there is nothing left on the hook's stdin to eat —
+    so a one-ref version of this test is satisfied by half the defence and says nothing about the
+    other half. INSIDE the loop the guard inherits the HEREDOC as its stdin, so a greedy guard
+    there consumes the remaining ref lines and every later ref goes unscanned. Measured: with the
+    `< /dev/null` removed from the range call, this exact scenario published the leaking ref.
     """
     work, remote, log = _scratch(tmp_path)
     guard = tmp_path / "stubguard.py"
@@ -573,19 +580,56 @@ def test_a_guard_that_reads_STDIN_cannot_swallow_the_ref_list(tmp_path: Path) ->
                      encoding="utf-8")
     assert _git(work, "push", "origin", "main").returncode == 0
 
-    assert _git(work, "checkout", "-b", "greedy").returncode == 0
+    assert _git(work, "checkout", "-b", "aaa").returncode == 0
+    (work / "a.md").write_text("clean\n", encoding="utf-8")
+    assert _git(work, "add", "a.md").returncode == 0
+    assert _git(work, "commit", "-m", "a").returncode == 0
+
+    assert _git(work, "checkout", "-b", "greedy", "main").returncode == 0
     (work / "g.md").write_text(f"{SENTINEL}\n", encoding="utf-8")
     assert _git(work, "add", "g.md").returncode == 0
     assert _git(work, "commit", "-m", "leak").returncode == 0
-    assert _git(work, "checkout", "main").returncode == 0
+    assert _git(work, "checkout", "aaa").returncode == 0
+    assert not (work / "g.md").exists(), "the worktree still holds it, so the TREE scan would do"
     log.write_text("", encoding="utf-8")
 
-    res = _git(work, "push", "origin", "greedy")
+    res = _git(work, "push", "origin", "aaa", "greedy")
     assert res.returncode != 0, (
         f"a guard that read stdin swallowed the ref list and the commit scan did not run:\n"
         f"{res.stdout}\n{res.stderr}")
     assert _remote_head(remote, "refs/heads/greedy") is None
-    assert "--range" in log.read_text(encoding="utf-8"), "the commit scan never ran"
+    ranges = [ln for ln in log.read_text(encoding="utf-8").splitlines() if "--range" in ln]
+    assert len(ranges) >= 2, (
+        f"the commit scan ran {len(ranges)} time(s) for a two-ref push, so a greedy guard ate the "
+        f"rest of the list:\n{ranges}")
+
+
+@needs_sh
+@pytest.mark.timeout(300)
+def test_the_hook_run_BY_HAND_with_no_refs_still_scans_the_tree(tmp_path: Path) -> None:
+    """The arm that exists for "how anybody tests one", asserted rather than assumed.
+
+    Invoked outside a push there is no ref list at all, and the hook has no way to know whether
+    anything would be published. The answer to that is to scan — the alternative is a hook that
+    silently does nothing the one time somebody runs it to see what it does. `$1` is absent too,
+    which is why `${1:-}` is written that way.
+    """
+    work, _remote, log = _scratch(tmp_path)
+    hook = work / ".githooks" / "pre-push"
+
+    (work / "README.md").write_text(f"{SENTINEL}\n", encoding="utf-8")
+    res = subprocess.run(["sh", str(hook)], cwd=work, input="", capture_output=True, text=True,
+                         encoding="utf-8", errors="replace", timeout=120, check=False)
+    assert res.returncode != 0, (
+        f"a hand-run over a leaking tree exited 0:\n{res.stdout}{res.stderr}")
+    assert "REFUSED" in res.stderr, res.stderr
+    assert log.read_text(encoding="utf-8").strip(), "no scan ran at all"
+
+    (work / "README.md").write_text("clean\n", encoding="utf-8")
+    res = subprocess.run(["sh", str(hook)], cwd=work, input="", capture_output=True, text=True,
+                         encoding="utf-8", errors="replace", timeout=120, check=False)
+    assert res.returncode == 0, (
+        f"a hand-run over a clean tree was refused:\n{res.stdout}{res.stderr}")
 
 
 @needs_sh
