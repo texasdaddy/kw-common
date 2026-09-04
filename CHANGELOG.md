@@ -5,7 +5,9 @@ All notable changes to this project are documented here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 A breaking change to a name in a module's `__all__` is a MAJOR bump, and its entry names every
-consumer repository that needs a code change.
+exported symbol that changed. ⛔ It does NOT name the consumers that need a code change: this
+repository is public, and honouring that older promise would publish the fleet's inventory at
+exactly the moment the release notes are read most widely.
 
 ## [1.3.0] - 2026-09-03
 
@@ -37,10 +39,14 @@ A check that shipped inside the thing it was checking, and a marker that recorde
   ⚠️ **Declared bound, stated rather than implied:** a hook is a local convention. Nothing here and
   nothing in CI can assert that it ran on somebody's machine, because CI must not have the list
   either. `tests/test_leak_guard_hook.py` drives the real hook against a real `git push` to a real
-  bare remote and asserts whether the REMOTE REF MOVED — refused for a leaking commit, a leaking
-  worktree and an unconfigured guard; allowed for a clean push and a branch deletion; and passing
-  `--not --remotes` for a brand-new branch, which would otherwise scan zero commits at exactly the
-  moment a leak is most likely.
+  bare remote and asserts whether the REMOTE REF MOVED — refused for a leaking commit, for a
+  value a LATER COMMIT REMOVED (the worktree is clean, so only the commit scan can see it), for a
+  leaking worktree, for the second ref of a two-ref push, and for an unconfigured guard; allowed
+  for a clean push, and for a branch deletion even when the worktree carries a finding, since a
+  deletion publishes nothing and refusing it blocks the cleanup itself. A brand-new branch is
+  scanned with `--not --remotes=<the remote being pushed to>` — bare `--remotes` spans EVERY
+  remote, so a branch already fetched from a private one had its whole history excluded and
+  published unread.
 
 ### Changed
 
@@ -77,10 +83,12 @@ A check that shipped inside the thing it was checking, and a marker that recorde
 
 ### Notes for adopters
 
-- **Upgrading costs exactly one re-validation, silently.** A marker written by 1.2.0 is empty, so
-  it matches no digest; the first boot after the upgrade validates, sends one confirmation, and
-  rewrites the marker. No operator step, and no way to get a stale "validated" verdict across the
-  upgrade — which is the direction that matters.
+- **Upgrading costs exactly one re-validation — and one alert per service.** A marker written by
+  1.2.0 is empty, so it matches no digest; the first boot after the upgrade validates, SENDS ONE
+  CONFIRMATION, and rewrites the marker. No operator step is needed, and there is no way to carry
+  a stale "validated" verdict across the upgrade, which is the direction that matters — but a
+  fleet-wide upgrade produces one email and one push per service, so expect the traffic rather
+  than wondering what caused it.
 - **`touch` is no longer the remedy after a restore, and is no longer needed.** To force a
   re-check without editing the file, delete `CONFIG_PATH/.alerting-validated-<env>`.
 - **The public surface is unchanged.** Nothing was added to or removed from any module's
@@ -180,6 +188,8 @@ knowledge lives in a **sibling module** instead.
 - **The marker is a TIMESTAMP comparison, and that is its limit.** A config file restored at an
   older mtime (`rsync -a`, `cp -p`, `tar -x`, a volume restore) leaves the marker still newer, so
   that change is not re-validated. `touch` the file after a restore.
+  ⛔ **SUPERSEDED IN 1.3.0** — the marker records the config's sha256 and the `touch` remedy is
+  neither needed nor sufficient. Kept because it is what 1.2.0 did; do not act on it.
 - ⚠️ **`CONFIG_PATH` is not the config file.** `load_alert_settings`'s first parameter is called
   `config_path` and is the alerting.env FILE; the `CONFIG_PATH` variable is the app's own
   read-write DIRECTORY, where the marker goes. The validation function spells that one
@@ -255,7 +265,9 @@ the 4,200 lines of engine tests that moved here with the code.
 - **The private sibling repositories are no longer named anywhere in the engine.** `MANIFEST.in`
   had kept the guard out of the sdist for exactly that reason; the module now ships inside the
   **wheel**, so exclusion is no longer available as the fix. Provenance comments cite
-  `consumer#NN`, and a test enforces the absence.
+  `consumer#NN`.
+  ⛔ **SUPERSEDED IN 1.3.0** — "a test enforces the absence" was true of one file and stopped
+  being true at all: that test is deleted and `.githooks/pre-push` holds the line now.
 - **A `.leakguard.json` that is not tracked by git is refused.** An ignored config governed every
   local scan while being invisible to review, which is the opposite of the property that justifies
   injecting the allowances at all.

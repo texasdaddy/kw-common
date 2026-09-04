@@ -40,6 +40,7 @@ commits — is pinned by what the hook actually passed.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -54,6 +55,16 @@ SENTINEL = "PLANTED-PRIVATE-NAME"
 
 # A stand-in for the project-side guard. Same command line, same exit codes: 0 clean, 1 finding.
 # It also APPENDS its argv to a log the tests read, which is how the range form is asserted.
+#
+# ⭐ IT HONOURS `--public-repo` RATHER THAN IGNORING IT, and that is not decoration. The real
+# guard's private-name class is OFF unless that flag is passed — a sibling's own name is ordinary
+# content in its own private repository — so a hook that dropped the flag would run a scan that
+# structurally cannot see the thing it exists to catch, and report clean. A stub that treats the
+# flag as noise turns every assertion about it into a wiring assertion; this one makes dropping it
+# change the OUTCOME.
+#
+# ⛔ AND IT READS NO STDIN, which is a requirement the hook's own header states. A guard that read
+# stdin would consume git's ref list and the commit scan would silently not run.
 STUB_GUARD = '''\
 import subprocess, sys
 from pathlib import Path
@@ -67,6 +78,10 @@ def value(flag):
 repo = value("--repo")
 rng = value("--range")
 sentinel = "SENTINEL_PLACEHOLDER"
+
+if "--public-repo" not in argv:
+    print("stub: the private-name class is OFF without --public-repo")
+    sys.exit(0)
 
 if rng is None:
     out = subprocess.run(["git", "ls-files", "-z"], cwd=repo, capture_output=True, check=True)
@@ -131,12 +146,17 @@ def _scratch(tmp_path: Path, *, configure_guard: bool = True) -> tuple[Path, Pat
     guard = tmp_path / "stubguard.py"
     guard.write_text(STUB_GUARD.replace("SENTINEL_PLACEHOLDER", SENTINEL), encoding="utf-8")
 
-    hooks = tmp_path / "hooks"
+    # ⭐ THE INSTALL FORM THE DOCUMENTS PRESCRIBE, not a convenient one. The README and the hook's
+    # own header say `git config core.hooksPath .githooks` — a RELATIVE path, resolved inside the
+    # working tree — so that is what these tests drive. An earlier version pointed `core.hooksPath`
+    # at an absolute directory outside the repository, which is a different install with different
+    # properties, and testing it would have proved nothing about the one an operator runs.
+    hooks = work / ".githooks"
     hooks.mkdir()
     shutil.copyfile(HOOK, hooks / "pre-push")
     os.chmod(hooks / "pre-push", 0o755)  # noqa: S103 - a hook git will not run otherwise
 
-    assert _git(work, "config", "core.hooksPath", str(hooks)).returncode == 0
+    assert _git(work, "config", "core.hooksPath", ".githooks").returncode == 0
     if configure_guard:
         # ⚠️ The hook runs `python3`/`python`/`py -3`, not this interpreter. The stub is plain
         # stdlib so any of them runs it; what matters is that the PATH has one, which the probe
@@ -385,6 +405,191 @@ def test_deleting_a_remote_branch_is_not_scanned_as_if_it_added_something(tmp_pa
 
 @needs_sh
 @pytest.mark.timeout(300)
+def test_a_DELETION_is_allowed_even_when_the_worktree_carries_a_finding(tmp_path: Path) -> None:
+    """⭐ THE ONE FALSE-RED THAT BLOCKS THE REMEDY ITSELF.
+
+    You find a leak, you want the remote branch gone. The value is still sitting in your working
+    tree, because you have not finished cleaning up — and the tree scan, which ran unconditionally,
+    refused the deletion. A push that only deletes refs PUBLISHES NOTHING, so there is nothing for
+    the tree scan to be protecting, and refusing it is the shape that gets a hook switched off.
+
+    ⚠️ Asserted by the REMOTE, and by the guard log: the deletion must go through AND the tree scan
+    must not have run at all, or a later change could satisfy this test by refusing more quietly.
+    """
+    work, remote, log = _scratch(tmp_path)
+    assert _git(work, "push", "origin", "main").returncode == 0
+    assert _git(work, "checkout", "-b", "doomed").returncode == 0
+    assert _git(work, "push", "origin", "doomed").returncode == 0
+    assert _git(work, "checkout", "main").returncode == 0
+    log.write_text("", encoding="utf-8")
+
+    (work / "README.md").write_text(f"{SENTINEL}\n", encoding="utf-8")   # tracked, and leaking
+
+    res = _git(work, "push", "origin", "--delete", "doomed")
+    assert res.returncode == 0, (
+        f"a branch DELETE was refused because the worktree carries a finding — which is the "
+        f"cleanup gesture itself:\n{res.stdout}\n{res.stderr}")
+    assert _remote_head(remote, "refs/heads/doomed") is None
+    assert log.read_text(encoding="utf-8").strip() == "", (
+        "the guard ran on a push that publishes nothing")
+
+
+@needs_sh
+@pytest.mark.timeout(300)
+def test_a_leak_that_a_LATER_COMMIT_REMOVED_is_still_refused(tmp_path: Path) -> None:
+    """⭐⭐ THE CASE THE RANGE SCAN EXISTS FOR, AND THE ONLY ONE THAT PROVES IT RUNS.
+
+    Every other refusal test here leaves the value in the worktree, so the TREE scan alone produces
+    the refusal they measure — measured: deleting the hook's entire commit-scanning loop left them
+    all green. This one commits the value and then removes it in a second commit, so the worktree
+    is clean and only the range scan can see it.
+
+    That is not a contrived case: "I committed a secret, I deleted it in the next commit, it's
+    fine now" is the single most common wrong belief about git. Pushing publishes HISTORY, and the
+    value stays readable at the commit that added it forever.
+    """
+    work, remote, _log = _scratch(tmp_path)
+    assert _git(work, "push", "origin", "main").returncode == 0
+    before = _remote_head(remote)
+
+    (work / "notes.md").write_text(f"deploy to {SENTINEL}\n", encoding="utf-8")
+    assert _git(work, "add", "notes.md").returncode == 0
+    assert _git(work, "commit", "-m", "oops").returncode == 0
+    (work / "notes.md").write_text("deploy notes\n", encoding="utf-8")
+    assert _git(work, "add", "notes.md").returncode == 0
+    assert _git(work, "commit", "-m", "removed it again").returncode == 0
+    assert SENTINEL not in (work / "notes.md").read_text(encoding="utf-8")
+
+    res = _git(work, "push", "origin", "main")
+    assert res.returncode != 0, (
+        f"a value committed and then removed was not refused — the worktree is clean, so the tree "
+        f"scan cannot see it and only the commit scan can:\n{res.stdout}\n{res.stderr}")
+    assert _remote_head(remote) == before
+
+
+@needs_sh
+@pytest.mark.timeout(300)
+def test_EVERY_ref_in_a_multi_ref_push_is_scanned_not_just_the_first(tmp_path: Path) -> None:
+    """⭐ THE LOOP, EXERCISED PAST ONE ITERATION.
+
+    `git push origin a b` hands the hook two lines on stdin. A loop that stops after the first —
+    because something consumed the rest of stdin, because a `break` crept in, because the guard
+    itself read stdin — would scan `a`, report clean, and publish `b` unexamined. Nothing else in
+    this file pushes more than one ref, so nothing else could tell.
+
+    The leaking branch is deliberately the SECOND one, and the clean one is checked out, so the
+    worktree is clean and the tree scan cannot be what produces the refusal.
+    """
+    work, remote, log = _scratch(tmp_path)
+    assert _git(work, "push", "origin", "main").returncode == 0
+
+    assert _git(work, "checkout", "-b", "aaa").returncode == 0
+    (work / "a.md").write_text("clean\n", encoding="utf-8")
+    assert _git(work, "add", "a.md").returncode == 0
+    assert _git(work, "commit", "-m", "a").returncode == 0
+
+    assert _git(work, "checkout", "-b", "zzz", "main").returncode == 0
+    (work / "z.md").write_text(f"{SENTINEL}\n", encoding="utf-8")
+    assert _git(work, "add", "z.md").returncode == 0
+    assert _git(work, "commit", "-m", "z").returncode == 0
+    # Back to the clean branch: the worktree no longer holds the value.
+    assert _git(work, "checkout", "aaa").returncode == 0
+    assert not (work / "z.md").exists()
+    log.write_text("", encoding="utf-8")
+
+    res = _git(work, "push", "origin", "aaa", "zzz")
+    assert res.returncode != 0, (
+        f"a two-ref push was accepted although the SECOND ref leaks:\n{res.stdout}\n{res.stderr}")
+    assert _remote_head(remote, "refs/heads/zzz") is None, "the leaking ref reached the remote"
+    calls = [ln for ln in log.read_text(encoding="utf-8").splitlines() if "--range" in ln]
+    assert len(calls) >= 2, (
+        f"the commit scan ran {len(calls)} time(s) for a two-ref push, so at least one ref went "
+        f"unexamined:\n{calls}")
+
+
+@needs_sh
+@pytest.mark.timeout(300)
+def test_the_range_excludes_only_THIS_remotes_refs_not_every_remotes(tmp_path: Path) -> None:
+    """⛔ `--not --remotes` SPANS EVERY REMOTE, AND THAT IS A BYPASS.
+
+    A branch pushed to a private remote and then fetched back leaves `refs/remotes/<other>/<branch>`
+    reaching those commits. A brand-new branch on THIS remote is then scanned as
+    `<sha> --not --remotes`, every commit is excluded by the other remote's ref, the range is
+    EMPTY, and the guard reports clean on history it never read. Measured: a leaking branch landed
+    on the public remote, exit 0.
+
+    `--remotes=<remote>` scopes the exclusion to the remote actually being pushed to. git hands the
+    hook that remote's name as its first argument, which is where it comes from.
+    """
+    work, remote, log = _scratch(tmp_path)
+    other = tmp_path / "other.git"
+    other.mkdir()
+    assert _git(other, "init", "--bare").returncode == 0
+    assert _git(work, "remote", "add", "private", str(other)).returncode == 0
+
+    assert _git(work, "checkout", "-b", "secret").returncode == 0
+    (work / "s.md").write_text(f"{SENTINEL}\n", encoding="utf-8")
+    assert _git(work, "add", "s.md").returncode == 0
+    assert _git(work, "commit", "-m", "secret").returncode == 0
+    (work / "s.md").write_text("tidied\n", encoding="utf-8")
+    assert _git(work, "add", "s.md").returncode == 0
+    assert _git(work, "commit", "-m", "tidied").returncode == 0
+
+    # It reaches the PRIVATE remote (whose hook, in this fixture, is the same one — the push is
+    # forced through by pointing the guard away for that one call).
+    assert _git(work, "config", "--unset", "kw.privateGuard").returncode == 0
+    assert _git(work, "config", "core.hooksPath", "no-such-hooks").returncode == 0
+    assert _git(work, "push", "private", "secret").returncode == 0
+    assert _git(work, "fetch", "private").returncode == 0
+    assert _git(work, "config", "core.hooksPath", ".githooks").returncode == 0
+    guard = tmp_path / "stubguard.py"
+    assert _git(work, "config", "kw.privateGuard", str(guard)).returncode == 0
+    log.write_text("", encoding="utf-8")
+
+    res = _git(work, "push", "origin", "secret")
+    assert res.returncode != 0, (
+        f"a branch already fetched from another remote was published to this one unscanned — "
+        f"`--not --remotes` excluded every commit in it:\n{res.stdout}\n{res.stderr}")
+    assert _remote_head(remote, "refs/heads/secret") is None
+    calls = log.read_text(encoding="utf-8")
+    assert "--remotes=origin" in calls, (
+        f"the exclusion is not scoped to the remote being pushed to:\n{calls}")
+
+
+@needs_sh
+@pytest.mark.timeout(300)
+def test_a_guard_that_reads_STDIN_cannot_swallow_the_ref_list(tmp_path: Path) -> None:
+    """⛔ THE HOOK'S OWN STDIN IS THE REF LIST, and a child that reads it eats the rest.
+
+    Measured before the fix: a guard beginning `sys.stdin.read()` left the hook with ONE
+    invocation instead of three, the whole commit scan silently did not run, and a two-ref push
+    landed with the leaking ref unexamined. The hook now reads the list in full before running
+    anything AND redirects each guard's stdin to /dev/null, so neither half depends on the
+    goodwill of a program that lives outside this repository.
+    """
+    work, remote, log = _scratch(tmp_path)
+    guard = tmp_path / "stubguard.py"
+    guard.write_text("import sys\nsys.stdin.read()\n" + guard.read_text(encoding="utf-8"),
+                     encoding="utf-8")
+    assert _git(work, "push", "origin", "main").returncode == 0
+
+    assert _git(work, "checkout", "-b", "greedy").returncode == 0
+    (work / "g.md").write_text(f"{SENTINEL}\n", encoding="utf-8")
+    assert _git(work, "add", "g.md").returncode == 0
+    assert _git(work, "commit", "-m", "leak").returncode == 0
+    assert _git(work, "checkout", "main").returncode == 0
+    log.write_text("", encoding="utf-8")
+
+    res = _git(work, "push", "origin", "greedy")
+    assert res.returncode != 0, (
+        f"a guard that read stdin swallowed the ref list and the commit scan did not run:\n"
+        f"{res.stdout}\n{res.stderr}")
+    assert _remote_head(remote, "refs/heads/greedy") is None
+    assert "--range" in log.read_text(encoding="utf-8"), "the commit scan never ran"
+
+
+@needs_sh
+@pytest.mark.timeout(300)
 def test_the_hook_passes_public_repo_on_BOTH_scans(tmp_path: Path) -> None:
     """The flag is what turns the private-name class on. Without it on BOTH invocations the hook
     runs a scan that cannot see the thing it exists to catch, and reports clean."""
@@ -406,46 +611,172 @@ def test_everything_the_package_ships_is_a_TRACKED_file() -> None:
     """⭐ #16(a) ASKED IN-REPO, WITHOUT THE LIST.
 
     The guard the hook runs scans `git ls-files`. That covers every published file only while
-    every published file is TRACKED — an untracked file that setuptools picks up anyway (anything
-    under `src/`, since `packages.find` walks the directory rather than the index) would be inside
-    the wheel and invisible to the scan. This asks that question of the package directory and of
-    every path `MANIFEST.in` names, which together are what the wheel and the sdist carry.
+    every published file is TRACKED — a file setuptools packages anyway, from the FILESYSTEM
+    rather than from the index, would be inside an artifact and invisible to the scan.
 
-    ⚠️ It does NOT build the artifacts. Building needs the network for build dependencies and
-    takes seconds; CI builds both and runs the shipped suite against them. The property this
-    pins is the one that would make the whole hook mechanism blind, and it is cheap.
+    ⭐⭐ `recursive-include` IS THE HALF THAT MATTERS, and the first version of this test skipped
+    it. `include` names one path each and there are a handful; `recursive-include` GLOBS A
+    DIRECTORY,
+    and `recursive-include tests *.py` is the exact directive that put seventeen private service
+    names into every published sdist while one test looked at one module. A scratch file dropped in
+    `tests/` or `docs/` is picked up by the glob, ships, and is not in `git ls-files` — so the
+    guard never reads it. Checking only the `include` lines would have left the measured hole open
+    and looked like coverage.
+
+    ⚠️ It does NOT build the artifacts. Building needs the network for build dependencies and takes
+    seconds; CI builds both and runs the shipped suite against them. The property this pins is the
+    one that would make the whole hook mechanism blind, and it is cheap.
     """
     listed = subprocess.run(["git", "ls-files", "-z"], cwd=REPO_ROOT, capture_output=True,
                             timeout=120, check=True)
     tracked = {p for p in listed.stdout.decode("utf-8").split("\0") if p}
     assert tracked, "git ls-files returned nothing — this test would pass vacuously"
 
+    def is_build_output(path: Path) -> bool:
+        # `.egg-info/` is metadata setuptools regenerates on every build and `.gitignore` excludes;
+        # `__pycache__` and `.pyc` likewise. None is in an artifact, so demanding they be tracked
+        # would redden a correct tree — which is how a check gets switched off.
+        return (path.suffix == ".pyc"
+                or any(p == "__pycache__" or p.endswith(".egg-info") for p in path.parts))
+
     untracked: list[str] = []
+    checked = 0
+    # The package directory: `packages.find` discovers the package here and setuptools takes its
+    # `.py` files plus whatever `package-data` names, all read off the filesystem.
     for path in sorted((REPO_ROOT / "src").rglob("*")):
-        # BUILD OUTPUT IS NOT SHIPPED SOURCE. `.egg-info/` is metadata setuptools regenerates on
-        # every build and `.gitignore` excludes; `__pycache__` likewise. Neither is in the wheel,
-        # so demanding they be tracked would redden a correct tree — which is how a check gets
-        # switched off. Everything else under `src/` IS in the wheel, because `packages.find`
-        # walks the directory rather than the index.
-        if not path.is_file() or path.suffix == ".pyc":
+        if not path.is_file() or is_build_output(path):
             continue
-        if any(part == "__pycache__" or part.endswith(".egg-info") for part in path.parts):
-            continue
+        checked += 1
         rel = path.relative_to(REPO_ROOT).as_posix()
         if rel not in tracked:
             untracked.append(rel)
 
     manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
     named = 0
+    globbed = 0
     for line in manifest.splitlines():
         parts = line.split()
-        if not parts or parts[0] != "include":
+        if not parts:
             continue
-        for rel in parts[1:]:
-            named += 1
-            if rel not in tracked:
-                untracked.append(rel)
+        if parts[0] == "include":
+            for rel in parts[1:]:
+                named += 1
+                checked += 1
+                if rel not in tracked:
+                    untracked.append(rel)
+        elif parts[0] == "recursive-include" and len(parts) >= 3:
+            globbed += 1
+            base = REPO_ROOT / parts[1]
+            for pattern in parts[2:]:
+                for path in sorted(base.rglob(pattern)):
+                    if not path.is_file() or is_build_output(path):
+                        continue
+                    checked += 1
+                    rel = path.relative_to(REPO_ROOT).as_posix()
+                    if rel not in tracked:
+                        untracked.append(rel)
     assert named >= 4, f"MANIFEST.in no longer names files with `include` ({named} found)"
-    assert untracked == [], (
+    assert globbed >= 3, (
+        f"MANIFEST.in has {globbed} `recursive-include` directive(s) — this test is no longer "
+        f"looking at the mechanism that actually shipped the names")
+    assert checked >= 20, f"only {checked} shipped path(s) examined; this proves nothing"
+    assert sorted(set(untracked)) == [], (
         f"these files ship but are not tracked, so the guard's tree scan never reads them: "
-        f"{untracked}")
+        f"{sorted(set(untracked))}")
+
+
+# =================================================================================================
+# 4. the two workflows, which keep diverging
+# =================================================================================================
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+RELEASE_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "release.yml"
+
+# The packaging assertions that must exist on BOTH paths, as (a fragment of the step's `name:`,
+# what it is for). Matched on the name because the two copies differ in wording elsewhere.
+_PACKAGING_STEPS = (
+    ("sdist carries its fixtures", "what the tarball must and must not contain"),
+    ("sdist's own test suite passes", "the check the file list cannot be"),
+    ("py.typed", "PEP 561's marker, in the artifact rather than in the tree"),
+)
+
+
+def test_the_PUBLISHING_workflow_carries_every_packaging_assertion_the_PR_workflow_does() -> None:
+    """⭐⭐ THE MISS THAT KEEPS HAPPENING, MADE INTO A TEST INSTEAD OF A COMMENT.
+
+    `release.yml` is self-contained on purpose — it does not call `ci.yml`, because a `v*` tag can
+    point at a commit that never went through a pull request, and that is precisely the case the
+    duplication exists for. The cost of that design is that every packaging check has to be added
+    TWICE, and twice now it was added once: `.githooks/pre-push` to one sdist list, then the
+    `py.typed` wheel assertion to one workflow. `release.yml` already carries a comment warning
+    about exactly this, and the comment did not stop the next occurrence — prose does not fail.
+
+    ⚠️ NAMES, NOT BODIES. Comparing the step scripts verbatim would fail on wording that is
+    legitimately different (the release job asserts the tag matches the version; the PR job does
+    not), and a test that fails for the wrong reason gets deleted. What must not diverge is WHICH
+    questions the publishing path asks.
+    """
+    ci = CI_WORKFLOW.read_text(encoding="utf-8")
+    rel = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+
+    def step_names(text: str) -> list[str]:
+        return [ln.split("- name:", 1)[1].strip()
+                for ln in text.splitlines() if ln.strip().startswith("- name:")]
+
+    ci_names, rel_names = step_names(ci), step_names(rel)
+    assert len(ci_names) >= 5 and len(rel_names) >= 5, (
+        f"step names are no longer being found ({len(ci_names)}, {len(rel_names)}) — this test "
+        f"would pass over anything")
+
+    missing = []
+    for fragment, why in _PACKAGING_STEPS:
+        in_ci = [n for n in ci_names if fragment.lower() in n.lower()]
+        in_rel = [n for n in rel_names if fragment.lower() in n.lower()]
+        assert in_ci, f"ci.yml no longer has a step about {fragment!r} ({why})"
+        if not in_rel:
+            missing.append(f"{fragment!r} ({why})")
+    assert missing == [], (
+        f"release.yml — the workflow that PUBLISHES — is missing the packaging assertion(s) "
+        f"{missing}. A tag cut on a commit that never went through a PR would publish an artifact "
+        f"nobody asked those questions of.")
+
+    # The sdist required-file lists are the other half, and they diverged the same way.
+    #
+    # ⚠️ `"; do"`, NOT `"do"`. Splitting on the bare word truncated the list at
+    # `/docs/alerting-setup.md` — the `do` inside `docs` — so the comparison silently ran on four
+    # of six entries and the vacuity guard below is what caught it.
+    def required_paths(text: str) -> set[str]:
+        body = text.split("for required in", 1)[1].split("; do", 1)[0]
+        return set(re.findall(r"'(/[^']+)'", body))
+
+    ci_required, rel_required = required_paths(ci), required_paths(rel)
+    assert len(ci_required) >= 5, f"the sdist required-file list is no longer parsed: {ci_required}"
+    assert ci_required == rel_required, (
+        f"the two sdist checks require different files. Only in ci.yml: "
+        f"{sorted(ci_required - rel_required)}; only in release.yml: "
+        f"{sorted(rel_required - ci_required)}")
+
+
+def test_the_py_typed_marker_exists_and_is_declared_as_package_data() -> None:
+    """⛔ WITHOUT IT A CONSUMER'S MYPY IGNORES EVERY ANNOTATION IN THIS PACKAGE, SILENTLY.
+
+    Nothing in the suite mentioned `py.typed` at all: deleting it left every test green, and the
+    only thing that would have noticed was a CI step which, at the time, existed on one of the two
+    workflows. `mypy` here reads the SOURCE, so this repository's own type-checking proves nothing
+    about what an installed copy exposes.
+
+    ⚠️ WHAT THIS CAN AND CANNOT SAY. It asks that the file exists and that the packaging metadata
+    declares it — the two things a source tree can answer. Whether the marker actually reaches the
+    built wheel is a question about an artifact, and both workflows now ask it of the zip.
+    """
+    marker = REPO_ROOT / "src" / "kw_common" / "py.typed"
+    assert marker.is_file(), (
+        "src/kw_common/py.typed is missing. PEP 561 makes it the switch that tells a consumer's "
+        "type checker the annotations in this package may be used; without it they are ignored.")
+    assert marker.read_bytes() == b"", "PEP 561's marker is an EMPTY file"
+
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    declared = ("[tool.setuptools.package-data]" in pyproject
+                and 'kw_common = ["py.typed"]' in pyproject)
+    assert declared, "pyproject.toml no longer declares py.typed as package data"
+    assert "include src/kw_common/py.typed" in (REPO_ROOT / "MANIFEST.in").read_text(
+        encoding="utf-8"), "MANIFEST.in no longer carries py.typed into the sdist"

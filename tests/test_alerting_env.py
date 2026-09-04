@@ -897,6 +897,137 @@ def test_a_marker_that_records_no_usable_digest_validates_again(
     assert len(channels["ntfy"].calls) == 1
 
 
+def test_a_marker_recording_a_TRUNCATED_digest_does_not_count_as_a_match(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐ THE WHOLE 64 CHARACTERS, NOT A PREFIX OF THEM.
+
+    A mutation comparing `sha256:` plus the first eight hex characters survived the entire suite,
+    because no test ever presented a marker that agrees with the config for part of the digest and
+    disagrees after it. A prefix comparison is not a hash comparison — it is a 32-bit one — and the
+    cost of getting it wrong is the failure this mechanism exists to remove: a config nobody
+    checked, recorded as checked.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    real = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    # Agrees for 8 hex characters, then does not. `f` -> `0` unless it already is, so this is
+    # guaranteed to differ from the real digest whatever the fixture hashes to.
+    tail = real[8:]
+    wrong = ("f" if tail == "0" * len(tail) else "0") * len(tail)
+    marker.write_text(f"sha256:{real[:8]}{wrong}\n", encoding="utf-8")
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert len(channels["ntfy"].calls) == 1
+
+
+def test_an_UNREADABLE_config_with_a_BLANK_marker_still_refuses_to_boot(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⛔ THE ONE CASE WHERE BOTH GUARDS IN `_marker_matches` HAVE TO HOLD AT ONCE.
+
+    `_config_digest` answers `""` for a config it cannot read, and a blank marker strips to `""`.
+    Remove BOTH the `sha256:` prefix check and the `bool(current)` conjunct and `"" == ""` becomes
+    a match — an unreadable config, skipped, on a service that would have refused. It is reachable:
+    a marker left by 1.2.0 is blank, and a shared mount that failed to attach makes the config
+    unreadable, so the two arrive together on exactly the boot that matters.
+    Each guard alone covers it, which is why removing either one survives — and why nothing
+    noticed that removing both does not.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker.write_bytes(b"")                      # a 1.2.0-era marker
+    Path(settings.config_file).unlink()          # the shared mount is not there
+
+    with pytest.raises(AlertEnvError):
+        validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings))
+    assert silence(channels) == []
+
+
+def test_the_marker_records_the_config_that_was_CHECKED_not_the_one_on_disk_afterwards(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐⭐ #15's OWN OUTCOME, THROUGH A NARROWER DOOR — and the reason the digest is a parameter.
+
+    `_announce` is an SMTP round-trip plus an HTTP POST, so the gap between "these bytes check out"
+    and "record what checked out" is seconds of wall clock, and the file it spans is the
+    FLEET-SHARED one that a config push rewrites while services restart. Hashing the file at the
+    END of that window records a file nobody looked at as validated — and then no later boot
+    re-checks it, because the marker matches what is on disk. Measured: the marker equalled the
+    digest of a config with `NTFY_URL_PROD` removed, and the next boot skipped.
+
+    The alerter here stands in for anything that takes time. It is a SPY on the ordering, not a
+    contrived race: any writer touching the shared file during a restart produces it.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    config = Path(settings.config_file)
+    # ⚠️ BYTES, not `read_text`. The digest is over the raw bytes, and `read_text` applies
+    # universal newlines — so a text round-trip produces a different digest on any file with CRLF
+    # in it and this assertion would fail for a reason that has nothing to do with the race.
+    good = config.read_bytes()
+    broken = good.replace(b"NTFY_URL_PROD=", b"# removed NTFY_URL_PROD=")
+    assert broken != good, "the fixture no longer carries the key this test removes"
+
+    class RewritesDuringTheSend:
+        def notify(self, *args: object, **kwargs: object) -> dict[str, str]:
+            config.write_bytes(broken)
+            return {}
+
+    assert validate_boot(settings, "prod", marker_dir,
+                         alerter=RewritesDuringTheSend()) is True  # type: ignore[arg-type]
+    recorded = marker.read_text(encoding="utf-8").strip()
+    assert recorded == "sha256:" + hashlib.sha256(good).hexdigest(), (
+        "the marker records the file as it stands AFTER validation, so a config rewritten during "
+        "the announce is recorded as validated although nothing checked it")
+    assert recorded != "sha256:" + hashlib.sha256(broken).hexdigest()
+
+    # ...and therefore the next boot must NOT skip: the file on disk is not the file that passed.
+    reset(channels)
+    with pytest.raises(AlertEnvError):
+        validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings))
+    assert silence(channels) == []
+
+
+def test_the_digest_is_taken_BEFORE_the_file_is_parsed_so_the_window_fails_SAFE(
+        tmp_path: Path, channels: dict[str, Spy], monkeypatch: pytest.MonkeyPatch) -> None:
+    """⭐ THE REMAINING WINDOW, AND WHICH WAY IT LEANS.
+
+    Hashing and parsing are two reads of the same file, so a writer can land between them. There
+    is no way to make that atomic without changing `read_config`'s signature, and the docstring
+    says so rather than claiming otherwise — but the ORDER decides which way the window fails.
+
+      digest, then parse: the file that was VALIDATED is newer than the file that was RECORDED, so
+        the next boot sees a mismatch and re-validates. Wasteful; safe.
+      parse, then digest: the file that was RECORDED is the one nobody checked, and the next boot
+        MATCHES it and skips. That is the whole defect, one statement further along.
+
+    Swapping the two lines survived every other test in this suite, because nothing else writes to
+    the config between them. This does, through `read_config` itself.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    config = Path(settings.config_file)
+    original = config.read_bytes()
+    rewritten = original + b"\n# a config push landed mid-boot\n"
+
+    real_read_config = alerting_env.read_config
+
+    def rewrite_then_read(path: object) -> dict[str, str]:
+        config.write_bytes(rewritten)
+        return real_read_config(path)
+
+    monkeypatch.setattr(alerting_env, "read_config", rewrite_then_read)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert config.read_bytes() == rewritten, "the stand-in did not actually rewrite the file"
+
+    recorded = marker.read_text(encoding="utf-8").strip()
+    assert recorded == "sha256:" + hashlib.sha256(original).hexdigest(), (
+        "the digest is taken AFTER the parse, so a file written in between is recorded as "
+        "validated — and the next boot skips it")
+
+    # ...and therefore the next boot re-validates rather than trusting the marker.
+    reset(channels)
+    monkeypatch.setattr(alerting_env, "read_config", real_read_config)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert len(channels["ntfy"].calls) == 1
+
+
 def test_an_alert_that_never_left_does_not_mark_the_boot_validated(tmp_path: Path) -> None:
     """⭐⭐ THE ORDER, WHICH THE SUCCESS PATH CANNOT DISTINGUISH.
 

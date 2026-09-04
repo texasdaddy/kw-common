@@ -30,7 +30,10 @@ upgrade — the failure this library was created to remove, arriving from the ot
 Bumping a consumer is a deliberate pull request in that consumer's repository.
 
 Releases follow semver. A breaking change to a name in a module's `__all__` is a MAJOR bump, and
-the release notes name every consumer that needs a code change.
+its release notes name every exported symbol that changed, so a consumer can tell in one read
+whether it is affected. ⛔ They do NOT name the consumers: this repository is public, and an
+inventory of who installs the library is the operator's estate rather than the library's
+documentation.
 
 ## What is in it
 

@@ -111,8 +111,8 @@ jobs:
           kw-leak-guard --range "$range"
 
   test:
-    # ⭐ 3.10 AND 3.12, BOTH REQUIRED. `requires-python = ">=3.10"` is a promise to six consuming
-    # repositories, and the 3.10/3.12 split has reddened fleet CI twice — a library that claims
+    # ⭐ 3.10 AND 3.12, BOTH REQUIRED. `requires-python = ">=3.10"` is a promise to every consuming
+    # repository, and the 3.10/3.12 split has reddened fleet CI twice — a library that claims
     # 3.10 and is only ever run on 3.12 is claiming something nobody measured. The floor is not
     # cosmetic here: `datetime.fromisoformat` learned `Z` in 3.11, and this library writes `Z`
     # into its own records.
@@ -166,8 +166,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip build
           python -m build
-      # ⭐ THE SDIST IS AN ARTIFACT TOO, and until this step nothing looked inside it. Three
-      # properties, each of which has already been wrong once:
+      # ⭐ THE SDIST IS AN ARTIFACT TOO, and until this step nothing looked inside it. The
+      # properties below have each been wrong at least once; `MANIFEST.in` keeps the running count
+      # of the class in one place rather than repeating it here, where it went stale:
       #   * `tests/conftest.py` must be PRESENT — setuptools' default sdist takes `tests/test*.py`
       #     and not `conftest.py`, so the released tarball shipped tests without the autouse
       #     fixtures they depend on, including the one that makes "no test reaches the network"
@@ -210,10 +211,10 @@ jobs:
           fi
           echo "sdist contents are as intended"
       # ⭐⭐ RUN THE SHIPPED SUITE, rather than grepping the tarball's file list for the things we
-      # currently remember it needs. The list above has been wrong THREE times — the conftest, then
-      # `.leakguard.json`, then `.github/workflows/ci.yml` — and each time the file list looked
-      # fine. Unpacking the sdist and running its tests is the check that cannot be out of date,
-      # because it asks the question `README.md` actually promises: do the tests travel?
+      # currently remember it needs. That list has been wrong every time it was extended, and it
+      # looked complete every time (the count and the roll-call live in `MANIFEST.in`). Unpacking
+      # the sdist and running its tests is the check that cannot be out of date, because it asks
+      # the question `README.md` actually promises: do the tests travel?
       - name: The sdist's own test suite passes
         run: |
           set -eu

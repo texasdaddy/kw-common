@@ -463,9 +463,10 @@ def marker_name(deploy_env: str) -> str:
 
     ⭐⭐ PER ENVIRONMENT, AND THAT IS A FIX RATHER THAN A FLOURISH. With ONE marker for every
     environment, promoting a service dev -> prod — a routine operation that does not touch the
-    fleet-shared file — left the marker still newer than the config, so validation NEVER RAN in the
+    fleet-shared file — left the marker already saying "validated", so validation NEVER RAN in the
     new environment. `NTFY_URL_PROD` was never checked; the service came up with an empty topic
-    URL and did not refuse. Measured exactly that way.
+    URL and did not refuse. Measured exactly that way, against the mtime rule this predates the
+    digest of; the digest does not fix it, because a promotion does not change the file either.
 
     The environment is what the check is ABOUT — `required_keys` differs per environment and so
     does the topic — so "this configuration has been validated" is not a fact about the file alone.
@@ -511,7 +512,9 @@ def _marker_matches(marker: Path, config: Path) -> bool:
       * the one-second window it left — a config edited in the second AFTER a boot was dated no
         later than the marker and got skipped — closes too. Any edit changes the digest.
       * a marker written by 1.2.0 is EMPTY, so it matches nothing and the first boot after the
-        upgrade validates once and rewrites it. That is the correct migration and it is silent.
+        upgrade validates once, ANNOUNCES ONCE, and rewrites it. That is the correct migration and
+        it needs no operator step — but it is not silent, and an operator upgrading a fleet should
+        expect one confirmation per service rather than none.
 
     Anything unreadable, absent, empty or malformed answers False: the safe reading of "I cannot
     establish that this file was validated" is to validate it.
@@ -581,6 +584,20 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
         return False
 
     _check_layout(config, shared_root)
+    # ⭐⭐ THE DIGEST IS TAKEN HERE, BEFORE ANYTHING IS CHECKED, AND CARRIED TO THE MARKER.
+    #
+    # Taking it at WRITE time instead was a defect with #15's own outcome. `_announce` is an SMTP
+    # round-trip plus an HTTP POST, so the gap between validating and marking is SECONDS of wall
+    # clock — and the file it spans is the FLEET-SHARED one, which a config push rewrites while
+    # services restart. Recording the bytes on disk at the end of that window records a file
+    # nobody checked as validated, and then no later boot re-checks it: a broken configuration
+    # boots clean and the service alerts nobody. Measured exactly that way.
+    #
+    # The remaining window is between this line and `read_config` below, two adjacent reads, and
+    # it fails in the SAFE direction: a file that changes in between is validated as its new
+    # contents and marked as its old ones, so the next boot re-validates. Stated rather than
+    # called atomic, because it is not.
+    digest = _config_digest(config)
     values = read_config(config)          # raises AlertEnvError, having named the reason
     _check_required(values, env, config)
     _check_usable(settings, config)
@@ -594,7 +611,7 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
         # would send one either, because the marker suppresses them, so the proof was lost until
         # somebody edited the file. The next boot after `configure()` validates and announces.
         return True
-    _write_marker(marker, config)
+    _write_marker(marker, digest)
     return True
 
 
@@ -789,8 +806,8 @@ def _announce(settings: AlertSettings, env: str, values: dict[str, str], config:
     return True
 
 
-def _write_marker(marker: Path, config: Path) -> None:
-    """Record the validated config's digest in the app's own read-write directory.
+def _write_marker(marker: Path, digest: str) -> None:
+    """Record the digest of the config that was VALIDATED, in the app's own read-write directory.
 
     ⭐ ONE LINE, `sha256:<hex>`, AND NOTHING ELSE. The marker used to be empty and its whole
     meaning lived in its modification time; it now carries the answer itself, so nothing about the
@@ -800,23 +817,24 @@ def _write_marker(marker: Path, config: Path) -> None:
     could never be strictly newer, and every boot re-validated and re-alerted forever. Measured
     green on NTFS and red on both Linux jobs at the same commit. A digest has no such failure mode.
 
-    The digest is taken HERE rather than passed in, so the recorded value is the file as it stands
-    at the moment it is recorded. A config rewritten during validation therefore does not match on
-    the next boot, which re-validates — the safe direction.
+    ⛔ THE DIGEST IS A PARAMETER, NOT RE-READ HERE, AND THAT IS THE WHOLE POINT. An earlier version
+    hashed the file at this moment — after the checks and after an SMTP round-trip — so a config
+    rewritten during that window was recorded as validated although nothing had looked at it, and
+    no later boot re-checked. That reproduced #15's outcome through a narrower door. What is
+    recorded must be what was CHECKED; `validate_boot` takes it before it checks anything.
 
     ⚠️ A FAILURE HERE IS NOT A BOOT FAILURE. The configuration IS valid — that has already been
     established and announced. An unwritable `CONFIG_PATH` costs one redundant validation and one
     duplicate alert per boot, which is noise; refusing to start over it would turn a
     missing-read-write-volume into an outage of the service itself.
     """
-    digest = _config_digest(config)
     if not digest:
-        # Unreadable HERE, having been read successfully moments ago: the file changed or went
-        # away mid-validation. Writing a marker with no digest in it would be a marker that never
-        # matches, which is harmless but silent; saying so costs one line.
-        log.warning("alerting: could not digest %s to record the validation marker — the "
-                    "configuration is valid and was announced, but the next boot will validate "
-                    "again.", config)
+        # The config could not be digested at the top of `validate_boot`, yet the checks below it
+        # passed — so the file became readable in between. Writing a marker with nothing in it
+        # would be a marker that never matches: harmless, but silent. Saying so costs one line.
+        log.warning("alerting: no digest was taken for %s, so no validation marker was recorded — "
+                    "the configuration is valid and was announced, but the next boot will "
+                    "validate again.", marker)
         return
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)

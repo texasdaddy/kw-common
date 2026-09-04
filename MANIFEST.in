@@ -14,10 +14,11 @@ include README.md
 include CHANGELOG.md
 include pyproject.toml
 include .leakguard.json
-# PEP 561's marker. `package-data` in `pyproject.toml` puts it in the WHEEL; this puts it in the
-# sdist, and a `pip install <sdist>` builds a wheel from that — so leaving this line out makes the
-# annotations usable for a wheel consumer and invisible for a tarball one, which is worse than
-# either answer on its own.
+# PEP 561's marker, named here as well as in `pyproject.toml`'s `package-data`. ⭐ Measured: at
+# setuptools 68 EITHER mechanism alone carries it into both artifacts, and at 84 it is an implicit
+# data file that needs neither. They are floor insurance rather than one-per-artifact, which is
+# what the comment here used to claim; the check that actually holds the line is the assertion
+# both workflows make against the built wheel.
 include src/kw_common/py.typed
 recursive-include tests *.py
 
@@ -26,7 +27,8 @@ recursive-include tests *.py
 # against the required-key manifest, and reads `docs/alerting-setup.md` and checks that it names
 # the three variables, pipes nothing into a shell, and fetches the tag this package actually is.
 # An sdist without them ships a suite that ERRORS — the same failure as the missing conftest, one
-# release later, and this is the FOURTH time this class has come up.
+# release later. (The running count of this class is kept in ONE place, on the hook's entry
+# below; two counters disagreeing is how the last one got to be wrong.)
 #
 # They are also the two files an operator most wants out of a tarball: the template is what gets
 # copied to the shared root, and the document is what says where.
@@ -44,9 +46,13 @@ recursive-include docs *.md
 recursive-include .github/workflows *.yml
 
 # ⭐ THE PRE-PUSH HOOK, because `tests/test_leak_guard_hook.py` COPIES IT and drives it against a
-# real `git push`. An sdist without it ships a suite that errors on collection — the same class as
-# the missing conftest, the missing `.leakguard.json` and the missing workflow before it, which is
-# now four times. It is also the file an sdist consumer would actually want: the check itself.
+# real `git push`. An sdist without it ships a suite that errors on collection.
+#
+# ⚠️ THE RUNNING COUNT OF THIS CLASS, kept here and nowhere else so the two copies cannot drift:
+# the missing conftest, `.leakguard.json`, `.github/workflows/ci.yml`, the setup-contract pair,
+# and now the hook. FIVE times a file the SUITE depends on was left out of the tarball. That is
+# why `ci.yml` and `release.yml` both unpack the sdist and RUN it rather than grepping its file
+# list. It is also the file an sdist consumer would actually want: the check itself.
 recursive-include .githooks *
 
 # ⭐ `.leakguard.json` IS INCLUDED because it is an ARGUMENT for the tests, not decoration. This
@@ -65,6 +71,6 @@ recursive-include .githooks *
 # put SEVENTEEN private service names into every published sdist, in four files, while the one
 # test that asked the question looked at a single module. Keeping a file OUT of the tarball
 # protects that file and nothing else. What keeps the names out now is `.githooks/pre-push`,
-# running a guard that holds the list and is committed to no repository at all — and
-# `recursive-include .githooks *` below is what makes the hook travel with the source, so an
+# running a guard that holds the list and is committed to no repository at all — and the
+# `recursive-include .githooks *` above is what makes the hook travel with the source, so an
 # sdist consumer gets the check rather than a reference to one.
