@@ -54,6 +54,24 @@ version = { attr = "kw_common.__version__" }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# ⭐ PEP 561. Without `py.typed` INSIDE the installed package, a consumer's mypy treats
+# `kw_common` as untyped and silently ignores every annotation in it — `disallow_untyped_defs`
+# below runs over this repository's own source and proves nothing at all for anybody who installs
+# it. The annotations were already written; the marker that says they may be used was not.
+#
+# ⚠️ THE MARKER IS DATA, NOT CODE — `packages.find` walks for `__init__.py` and takes `.py` files.
+# This line is what names it explicitly.
+#
+# ⭐ MEASURED, because the obvious statement of why it is here turned out to be false. At
+# setuptools 84 `py.typed` is an IMPLICIT data file and lands in both artifacts with neither this
+# line nor `MANIFEST.in`'s; at the declared floor of 68 it lands with EITHER of them (this key, or
+# the MANIFEST line via `include-package-data`, which defaults true for a pyproject project) and
+# with NEITHER it is absent from both. So both lines are FLOOR INSURANCE and either alone would
+# do today — which is a reason to keep them and not a reason to believe a story about them. What
+# actually holds the line is the assertion both workflows make against the built wheel.
+[tool.setuptools.package-data]
+kw_common = ["py.typed"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"

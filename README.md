@@ -1,12 +1,12 @@
 # kw-common
 
-Shared, **stdlib-only** building blocks for a small fleet of Python services.
+Shared, **stdlib-only** building blocks for Python services.
 
 This library exists to end code duplication that was previously handled by copying files between
-repositories. That copying was measured, and it was not hypothetical: one guard script lived in
-**seven** repositories and one of its tests in **five**, each drifting independently, and one
-service's copy of the alerting module had forked outright. A copy that drifts is not one
-implementation with six deployments — it is six implementations, of which at most one is current.
+repositories. That copying was not hypothetical: one guard script and one of its test suites had
+been copied into repository after repository, each copy drifting independently, and one service's
+copy of the alerting module had forked outright. A copy that drifts is not one implementation
+deployed several times — it is several implementations, of which at most one is current.
 
 **Identity here is enforced by construction.** A consumer pins a version and installs it; there is
 no port, no alignment audit, and no "which copy is the good one" question to answer later.
@@ -16,13 +16,13 @@ no port, no alignment audit, and no "which copy is the good one" question to ans
 Consumers install from git at an **exact tag** — never a branch:
 
 ```
-pip install git+https://github.com/texasdaddy/kw-common@v1.2.0
+pip install git+https://github.com/texasdaddy/kw-common@v1.3.0
 ```
 
 In a `requirements.in` / `requirements.txt`:
 
 ```
-kw-common @ git+https://github.com/texasdaddy/kw-common@v1.2.0
+kw-common @ git+https://github.com/texasdaddy/kw-common@v1.3.0
 ```
 
 ⛔ **Never pin a branch.** `@main` makes every rebuild of every consumer a silent, unreviewed
@@ -30,7 +30,10 @@ upgrade — the failure this library was created to remove, arriving from the ot
 Bumping a consumer is a deliberate pull request in that consumer's repository.
 
 Releases follow semver. A breaking change to a name in a module's `__all__` is a MAJOR bump, and
-the release notes name every consumer that needs a code change.
+its release notes name every exported symbol that changed, so a consumer can tell in one read
+whether it is affected. ⛔ They do NOT name the consumers: this repository is public, and an
+inventory of who installs the library is the operator's estate rather than the library's
+documentation.
 
 ## What is in it
 
@@ -132,16 +135,20 @@ channel is one the library can actually SEND on. That last one matters more than
 asked only "is there a value" would pass it, announce that the configuration checks out, and leave
 the channel dead. It asks `alerting`'s own readiness functions rather than re-deriving the answer.
 
-On success it sends **one** confirmation alert and writes an empty marker into `CONFIG_PATH`, and
-later boots skip while that marker is newer than the config file. The marker is **per
+On success it sends **one** confirmation alert and writes a marker into `CONFIG_PATH` recording the
+config file's **sha256**; later boots skip while that digest still matches. The marker is **per
 environment**: with one marker for all of them, promoting a service from dev to prod — which does
 not touch the shared file — skipped validation entirely and the service came up with no topic at
 all. **On failure it logs and raises and does not attempt to alert** — it cannot report a broken
 alerting channel through that channel — and with no `Alerter` installed it validates but withholds
 the marker, so the confirmation is not lost to a boot that could not send it.
 
-⚠️ The marker is compared by TIMESTAMP, so a config file restored at an older mtime (`rsync -a`,
-`cp -p`, a volume restore) is not re-validated. Stated rather than implied; `touch` after a restore.
+⭐ **Contents decide, not timestamps.** The marker used to be empty and the comparison used to be
+"is the marker newer than the config" — and `rsync -a`, `cp -p`, `tar -x` and volume restores all
+preserve mtime, so a config restored at an older timestamp was never re-checked: a broken file
+booted clean and the service came up alerting nobody. A digest answers that whatever the clock
+says, in both directions — a restore with different bytes re-validates, an identical one does not.
+Upgrading from a version that wrote an empty marker costs exactly one re-validation, silently.
 
 📄 **Setup — the folder structure, the template and per-OS commands: [`docs/alerting-setup.md`](docs/alerting-setup.md).**
 A consumer README carries a short prerequisite block and a **link** to that page, never a copy; a
@@ -186,11 +193,12 @@ shared library, and saying so is a better outcome than bending the rule.
 ## Repository layout
 
 ```
-src/kw_common/          the library
+src/kw_common/          the library (py.typed — the annotations are usable by a consumer's mypy)
 tests/                  the suite, run on 3.10 and 3.12
 docs/                   alerting-setup.md — the ONE setup page consumers point at
 alerting.env.template   the annotated shared alerting config, for an operator to fill in
 .leakguard.json         THIS repository's own leak-guard allowances (see below)
+.githooks/pre-push      refuses a push that would publish internal information (see below)
 .github/workflows/      ci.yml (PR + main) and release.yml (v* tags)
 ```
 
@@ -215,10 +223,10 @@ it dynamically.
 
 ## The leak guard
 
-`kw_common.leakguard` is the fleet's internal-information guard. It used to be a file that seven
-repositories each kept a copy of — with one of its test suites in five of them — so a fix made in
-one reached none of the others, and four separate engine improvements had to be re-ported by hand.
-It is a module here for the same reason everything else is: a consumer pins a version.
+`kw_common.leakguard` is the fleet's internal-information guard. It used to be a file each
+repository kept its own copy of — with one of its test suites copied alongside it — so a fix made
+in one reached none of the others, and four separate engine improvements had to be re-ported by
+hand. It is a module here for the same reason everything else is: a consumer pins a version.
 
 Installing the package puts `kw-leak-guard` on the path:
 
@@ -322,11 +330,47 @@ data.
 This repository's own `.leakguard.json` is the worked example, and the test suite reads the real
 file rather than a fixture so that a broken config here fails a test here.
 
+### Before you push — the pre-push hook
+
+The shape-based guard above cannot answer one question: a **name** has no shape to match. The list
+of names that must not appear in this repository cannot live in this repository either, because it
+would then be published by the very artifacts it exists to keep clean — that was measured, not
+theorised. So the list lives in a guard that is committed to no repository at all, and
+`.githooks/pre-push` is what runs it, at the moment publication actually happens.
+
+Install it once per clone:
+
+```
+git config core.hooksPath .githooks && git config kw.privateGuard "<absolute path to the project-side guard>"
+```
+
+It scans the tracked working tree (what the wheel and the sdist are built from) and the commits
+each ref would publish, and it **refuses the push** on any finding — and refuses outright when
+`kw.privateGuard` is unset or does not name a file, because a guard that is silently not running
+looks exactly like a pass.
+
+Two pushes are not scanned against the working tree, because they **publish nothing**: one that
+only DELETES refs, and one git reports as `Everything up-to-date` (it runs the hook with an empty
+ref list). Both go through even when the worktree still holds the value you are cleaning up —
+which is the point, since refusing them blocks the cleanup itself. Anything either push *does*
+publish is still scanned commit by commit.
+
+⚠️ The unconfigured-guard refusal comes FIRST, before the ref list is read, so it applies to those
+two as well: on a fresh clone with `core.hooksPath` set and no `kw.privateGuard`, even a deletion
+is refused — and the message names the config key rather than your tree.
+
+⚠️ **Declared bounds.** A hook is a local convention. Nothing in this repository, and nothing in
+CI, can assert that it ran on somebody's machine — CI must not have the list either. And
+`core.hooksPath .githooks` is a RELATIVE path, resolved inside the working tree, so a checkout
+that predates the hook has none and git says nothing: see issue #17, and the hook's own header.
+`tests/test_leak_guard_hook.py` drives the real hook against a real `git push` and asserts whether
+the remote ref moved; that is what can be checked here, and it says so rather than implying more.
+
 ### This repository is PUBLIC
 
 Internal-information hygiene is load-bearing, and it binds this module more than any other: the
 engine ships **inside the wheel**, so anything written in it is published to everyone who installs
-the library. It names no private repository, and a test enforces that.
+the library.
 
 Placeholders in code, tests, comments and documentation come from the guard's own `_MUST_PASS`
 corpus — the list of shapes it is pinned to *allow*: `example.com` and `*.example` for hosts, the

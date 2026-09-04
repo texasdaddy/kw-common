@@ -6,19 +6,30 @@ WHY THIS FILE EXISTS
     `main@046fc7e` (`_sessions/unraid-templates/AUDIT.md`, 2026-08-29), and every one of them
     exited 0 on content that a push would have published permanently:
 
-      keystone#20  A PATH was read by nothing. A tracked `<rfc1918-addr>.conf`, or a
+    ⚠️ HOW THE PROVENANCE IS CITED, AND WHY IT READS ODDLY. `consumer#NN` is an issue in a PRIVATE
+    consumer of this library, named in the project audit note above and deliberately not here:
+    this file ships inside the sdist attached to every public release, so the fleet's inventory of
+    service names would ship with it. It is the SAME spelling `src/kw_common/leakguard.py` uses,
+    for the same issues — a second pseudonym for one referent would leave a reader unable to tell
+    two issues from one, in the repository whose whole reason for pseudonymising is that guessing
+    wrong about which repository an issue lives in is what leaks the estate. `unraid-templates#NN`
+    is spelled out because that repository is public. A bare `#NN` below is this repository's own.
+
+      consumer#20   A PATH was read by nothing. A tracked `<rfc1918-addr>.conf`, or a
                    `docs/<host>.lan/` directory, with perfectly clean file CONTENT, passed both
                    scans. A filename is rendered on every GitHub file listing and lands in every
                    clone. (The `<host>.lan-runbook/` spelling is NOT caught and never was — the
                    `.lan` bound rejects a following hyphen. It is pinned as a stated limit by
                    `test_the_path_scan_INHERITS_the_patterns_LIMITS_and_says_so`, which is where
                    the claim and the behaviour are kept in agreement.)
-      #39/keystone#21  The range scan read a commit's IDENTITY (`%an%ae%cn%ce`) and its DIFF, and
-                   nothing else. A leak written into a commit MESSAGE — or into an annotated tag's
-                   name, tagger or message — was published and reported clean.
-      #33/keystone#23  The pre-commit layer read the WORKTREE. `git add` a leak, tidy the worktree
-                   without re-staging, and the hook exits 0 while the commit records the leak.
-      keystone#22  `SKIP_SUFFIXES` was trusted outright, so an ASCII runbook named `.pdf` was read
+      unraid-templates#39 / consumer#21  The range scan read a commit's IDENTITY
+                   (`%an%ae%cn%ce`) and its DIFF, and nothing else. A leak written into a commit
+                   MESSAGE — or into an annotated tag's name, tagger or message — was published
+                   and reported clean.
+      unraid-templates#33 / consumer#23  The pre-commit layer read the WORKTREE. `git add` a leak,
+                   tidy the worktree without re-staging, and the hook exits 0 while the commit
+                   records the leak.
+      consumer#22   `SKIP_SUFFIXES` was trusted outright, so an ASCII runbook named `.pdf` was read
                    by neither scan; and a run that scanned ZERO files printed the same cheerful
                    "no internal info found" a real clean run prints.
 
@@ -176,7 +187,7 @@ def _out(res: subprocess.CompletedProcess) -> str:
 
 
 # ===========================================================================================
-# keystone#20 — a leak in a PATH
+# consumer#20 — a leak in a PATH
 # ===========================================================================================
 
 
@@ -346,7 +357,7 @@ def test_an_ordinary_or_allow_listed_path_is_not_a_finding(rel: str) -> None:
 
 
 def test_a_leak_in_a_FILENAME_reds_the_TREE_scan(tmp_path: Path) -> None:
-    """⭐ keystone#20, the measured repro. CONTENT clean, NAME not.
+    """⭐ consumer#20, the measured repro. CONTENT clean, NAME not.
 
     Measured at `main@046fc7e`: exit 0, `no internal info found (3 tracked text files scanned)`.
     """
@@ -477,7 +488,7 @@ def test_DELETING_a_badly_named_path_is_not_reported(tmp_path: Path) -> None:
 
 
 # ===========================================================================================
-# #39 / keystone#21 — a leak in a commit MESSAGE or a TAG
+# unraid-templates#39 / consumer#21 — a leak in a commit MESSAGE or a TAG
 # ===========================================================================================
 
 
@@ -848,7 +859,7 @@ def test_the_message_scan_reads_the_REAL_commit_not_a_restatement(tmp_path: Path
 
 
 # ===========================================================================================
-# #33 / keystone#23 — the INDEX, not the worktree
+# unraid-templates#33 / consumer#23 — the INDEX, not the worktree
 # ===========================================================================================
 
 
@@ -1005,7 +1016,7 @@ def test_the_staged_scan_passes_a_clean_index(tmp_path: Path) -> None:
 
 
 # ===========================================================================================
-# keystone#22 — the suffix is a hint, and a scan that read nothing is not clean
+# consumer#22 — the suffix is a hint, and a scan that read nothing is not clean
 # ===========================================================================================
 
 
@@ -1019,7 +1030,7 @@ def test_looks_binary_asks_the_BYTES(tmp_path: Path) -> None:
 
 
 def test_an_ASCII_leak_in_a_pdf_NAMED_file_reds_the_TREE_scan(tmp_path: Path) -> None:
-    """⭐ keystone#22, the measured repro. Renaming a text file must not defeat the guard.
+    """⭐ consumer#22, the measured repro. Renaming a text file must not defeat the guard.
 
     Measured at `main@046fc7e`: exit 0, `no internal info found (1 tracked text files scanned)`.
     """
@@ -1091,7 +1102,7 @@ def test_a_NUL_bearing_blob_at_a_SKIPPED_suffix_is_still_skipped(tmp_path: Path)
 
 
 def test_a_run_that_scanned_ZERO_files_is_an_ERROR_not_a_pass(tmp_path: Path) -> None:
-    """⭐ keystone#22, second half. A scan that opened no file cannot clear a tree.
+    """⭐ consumer#22, second half. A scan that opened no file cannot clear a tree.
 
     Measured at `main@046fc7e`: `no internal info found (0 tracked text files scanned)`, exit 0 —
     a cheerful pass in the same words a real one uses. The count was printed all along; nothing
@@ -1145,7 +1156,7 @@ def test_an_unstaged_rm_of_a_BINARY_ASSET_does_not_red(tmp_path: Path) -> None:
     SKIP_SUFFIXES" and `.png` already is one. The staged blob now goes through the same
     bytes-decide rule as the worktree read, so one answer covers both sources.
 
-    The `.pdf`-of-text half is asserted too: the fix must not re-open keystone#22 through the
+    The `.pdf`-of-text half is asserted too: the fix must not re-open consumer#22 through the
     staged-blob door.
     """
     repo = tmp_path / "rm_asset"

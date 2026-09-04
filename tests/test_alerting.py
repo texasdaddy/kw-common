@@ -2240,9 +2240,8 @@ def _direct_to_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.usefixtures("_direct_to_loopback")
 def test_post_ntfy_refuses_to_follow_a_redirect() -> None:
     """⭐⭐ ISSUE #4. `urlopen` re-issues a redirected request WITH THE HEADERS INTACT, so a `302`
-    from the topic host delivers the alert `Title` — `[ERROR] <service>: <title>`, the most
-    identifying part of the message — to a host the operator never configured, over any scheme
-    the redirect names.
+    from the topic host delivers the alert `Title` — `[SEV] <title>`, the most identifying part of
+    the message — to a host the operator never configured, over any scheme the redirect names.
 
     The assertion is on the TARGET, not on the exception: what matters is that the second server
     received nothing at all.
@@ -2467,7 +2466,7 @@ def test_everything_in_dunder_all_exists() -> None:
 
 
 def test_the_extracted_surface_is_exported() -> None:
-    """The symbols this library was created to stop six repos from copying.
+    """The symbols this library was created to stop repositories from copying.
 
     This list is deliberately hardcoded — it is the CONTRACT, so it must be written down
     independently of `__all__` rather than read from it. A test that read `__all__` here would

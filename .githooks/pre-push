@@ -1,0 +1,200 @@
+#!/bin/sh
+# Refuse a push that would publish internal information.
+#
+# WHY THIS EXISTS (#10, #16)
+#   CI catches a leak AFTER the push, and a push to a public remote is permanent: the value stays
+#   readable at the commit that added it, in every clone, and the only repair is a history
+#   rewrite. The push is the moment publication happens, so the push is where the check belongs.
+#
+#   The shape-based guard that ships inside this package (`kw-leak-guard`) cannot answer the other
+#   half. A bare service name has no shape to match, and the list of names that must not appear
+#   here cannot live in this repository -- it would be published by the very artifact it exists to
+#   keep clean, which is what #16 measured. So the list lives in a project-side guard that is
+#   committed nowhere, and this hook runs THAT.
+#
+# INSTALL (per clone, once):
+#   git config core.hooksPath .githooks && git config kw.privateGuard "<absolute path to the guard>"
+#
+# WHAT `kw.privateGuard` MUST POINT AT -- the contract, because guessing it wrong is silent in one
+# direction and deafening in the other.
+#
+#   STOP: It is a PYTHON SCRIPT, not "a program". The invocations below are `$PY "${GUARD}" ...`,
+#     where `$PY` is whichever of python3 / python / py -3 answers. Point this at a shell script or
+#     a compiled binary and it is handed to the interpreter, which fails -- so every push that
+#     runs it is refused, with the interpreter's own error printed above the refusal. (The two
+#     that publish nothing never invoke it, so those still go through.) The only check made on
+#     the path is that it is a file.
+#
+#     <python> <guard> --repo <path> --public-repo [--range "<rev-range>"]
+#
+#   * exit 0 means clean, any non-zero means "do not push" (a finding, or a scan it could not
+#     perform). It must print its own findings.
+#   * with no `--range` it scans the repository's TRACKED files as they stand in the WORKING TREE.
+#     That is what the wheel and the sdist are built from, and the comment on that call says so --
+#     so it is a requirement here rather than an observation about whichever guard is installed.
+#   * `--range` receives ONE argument that may contain SPACES -- `<sha> --not --remotes=<remote>`.
+#     A guard that cannot take a multi-token revision range there refuses every push of a ref the
+#     remote does NOT already have (a new branch or tag); an ordinary update passes a plain
+#     `A..B`, so the failure is intermittent by shape rather than immediate.
+#   * it must not read standard input. This hook redirects stdin away from it for safety, but a
+#     guard that consumes stdin is not usable as a pre-push check anywhere.
+#   STOP: It is NOT this package's own `kw-leak-guard`, which has no `--public-repo` and would
+#     therefore refuse every push forever. `kw-leak-guard` covers SHAPES; this covers NAMES.
+#
+# DECLARED BOUNDS, stated rather than implied -- a hook is a local convention:
+#   * Nothing in this repository can assert that it ran on anyone else's machine, and CI cannot
+#     re-check it, because CI must not have the list either. `tests/test_leak_guard_hook.py`
+#     asserts what the hook DOES when it runs; it cannot assert that it ran.
+#   * `core.hooksPath .githooks` is RELATIVE, so git resolves it inside the working tree. Check out
+#     a branch, tag or worktree from before this file existed and there is no hook and no warning
+#     -- measured. A hooks directory OUTSIDE the worktree does not have that property; the
+#     fleet-wide install is the place to fix it, not this file. Filed.
+#   * `--not --remotes=<remote>` is scoped to the remote being pushed to, so a commit already
+#     fetched from THAT remote is excluded and one fetched from a different remote is not. If the
+#     push target is a bare URL rather than a named remote the pattern matches nothing, which
+#     scans MORE than necessary -- the safe direction.
+
+set -u
+
+fail() {
+    echo "" >&2
+    echo "pre-push REFUSED: $1" >&2
+    echo "" >&2
+    exit 1
+}
+
+# git passes the remote's NAME as $1 and its URL as $2. `${1:-}` because `set -u` would otherwise
+# abort on a hook invoked by hand with no arguments, which is how anybody tests one.
+REMOTE="${1:-}"
+
+GUARD="$(git config --get kw.privateGuard 2>/dev/null || true)"
+if [ -z "${GUARD}" ]; then
+    echo "" >&2
+    echo "pre-push REFUSED: this clone has no private-name guard configured." >&2
+    echo "" >&2
+    echo "  git config kw.privateGuard \"<absolute path to the guard>\"" >&2
+    echo "" >&2
+    echo "See the contract at the top of this file for what that program must accept." >&2
+    echo "It is not optional and this hook has no skip. A guard that is silently not running" >&2
+    echo "is worse than one that was never installed, because its absence looks exactly like" >&2
+    echo "a pass -- and this repository is PUBLIC." >&2
+    exit 1
+fi
+[ -f "${GUARD}" ] || fail "kw.privateGuard points at ${GUARD}, which is not a file."
+
+# The interpreter probe is `python3 -c ""`, NEVER `command -v python3`. On Windows `command -v`
+# finds the Microsoft Store App Execution Alias stub, which then refuses to run -- so every push
+# aborts with "Python was not found" and no mention of the guard at all.
+if python3 -c "" 2>/dev/null; then
+    PY="python3"
+elif python -c "" 2>/dev/null; then
+    PY="python"
+elif py -3 -c "" 2>/dev/null; then
+    PY="py -3"
+else
+    fail "no working Python interpreter found (tried python3, python, py -3)."
+fi
+
+REPO="$(git rev-parse --show-toplevel)"
+
+# * READ THE WHOLE REF LIST FIRST, BEFORE RUNNING ANYTHING.
+#
+# git feeds `<local ref> <local sha> <remote ref> <remote sha>` on stdin, one line per ref. Two
+# things depend on having all of it up front:
+#   * a guard that reads stdin would otherwise EAT that list, and the commit scan would silently
+#     not run -- measured: one scan instead of three, and a leaking branch landed. Every guard
+#     invocation below also gets `< /dev/null`, so this cannot happen even to a guard that tries.
+#   * a push that publishes NOTHING -- only deletions, or one git reports "Everything up-to-date"
+#     -- must not be refused for what is sitting in the local worktree. Refusing it blocks the
+#     exact gesture an operator makes after finding a leak. Knowing that requires seeing every ref
+#     before the first scan.
+#
+# !! RUN BY HAND FROM A TERMINAL, THIS WAITS FOR EOF. That is `cat` doing its job, not a hang;
+# `sh .githooks/pre-push < /dev/null` is the invocation that returns.
+REFS="$(cat)"
+
+# Two questions, one pass: is anything being PUBLISHED, and did any line parse at all?
+UPDATES=""
+PARSED=""
+while read -r _l_ref l_sha _r_ref _r_sha; do
+    [ -n "${_l_ref:-}" ] || continue      # no fields: the heredoc's own blank line, or whitespace
+    PARSED="yes"
+    if [ -z "${l_sha:-}" ]; then
+        # A line this does not understand. git always sends four fields, so this is unreachable
+        # through a real push -- and the answer to "I cannot tell whether this publishes" is that
+        # it does. Treating it as a deletion would skip the tree scan on an input we misread.
+        UPDATES="yes"
+        continue
+    fi
+    case "${l_sha}" in
+        *[!0]*) UPDATES="yes" ;;    # a real sha: something is being published
+        *) ;;                       # all zeros: that ref is being deleted
+    esac
+done <<REFLIST
+${REFS}
+REFLIST
+
+# ---- 1. the TREE, which is what the wheel and the sdist are built from.
+# The guard is required to scan TRACKED files as they stand in the working tree (see the contract
+# above), so an uncommitted edit to a tracked file counts and a brand-new untracked file does not.
+# That is deliberate: an artifact is built from the working tree, and the message says which scan
+# found what, so a worktree-only finding is legible rather than mysterious.
+#
+# * WHEN IT RUNS, in the three cases that are not "this push publishes something":
+#   * git sends an EMPTY ref list for a push it reports as "Everything up-to-date", WITH the
+#     remote name in $1 -- measured. That publishes nothing, so it is not scanned. Scanning it was
+#     a false red on the same gesture the deletion case exists for: mid-cleanup of a leak, any
+#     push that turns out to be a no-op was refused with a message about the working tree.
+#   * no ref list AND no $1 is the hook run by hand. Nothing says what it would publish, so it
+#     scans -- that is the invocation somebody uses to see what this does.
+#   * a ref list that yielded no fields at all is input this cannot read, and the answer to that
+#     is to scan. Unreachable through git; the arm is here so the fail-closed claim is true.
+SCAN_TREE=""
+if [ -n "${UPDATES}" ]; then
+    SCAN_TREE="yes"
+elif [ -z "${PARSED}" ] && [ -z "${REMOTE}" ]; then
+    SCAN_TREE="yes"
+elif [ -z "${PARSED}" ] && [ -n "${REFS}" ]; then
+    SCAN_TREE="yes"
+fi
+if [ -n "${SCAN_TREE}" ]; then
+    # shellcheck disable=SC2086  # PY may be "py -3"; the split is the point.
+    $PY "${GUARD}" --repo "${REPO}" --public-repo < /dev/null \
+        || fail "the guard refused the working TREE. Either a tracked file carries internal information, or the guard could not scan the tree -- its own output above says which. The tree is what the wheel and the sdist are built from, so this blocks a push even when no commit adds the value."
+fi
+
+# ---- 2. the COMMITS this push would actually publish.
+# One scan per ref. A brand-new branch has no counterpart on the remote to diff against, and
+# diffing against nothing would scan ZERO commits and report clean -- the most likely moment for a
+# leak, not the least. `--not --remotes=<remote>` is what makes that case scan the new history.
+#
+# !! A HEREDOC, NOT `echo "${REFS}" | while`. A pipeline runs its right-hand side in a SUBSHELL, so
+# `fail`'s `exit 1` would end the subshell and the hook would carry on to `exit 0` -- a refusal
+# that lets the push through, which is the one failure mode this file cannot have.
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ -n "${local_sha:-}" ] || continue
+    case "${local_sha}" in
+        *[!0]*) ;;          # a real sha
+        *) continue ;;      # all zeros: this ref is being DELETED, so it publishes nothing
+    esac
+    case "${remote_sha}" in
+        *[!0]*) RANGE="${remote_sha}..${local_sha}" ;;
+        # No counterpart on the remote. With a named remote, exclude only what that remote already
+        # has; with none -- the hook run by hand, which is the only way `$1` is absent -- exclude
+        # nothing and scan the whole reachable history, slower and strictly MORE than is needed.
+        # (A push straight at a URL still fills `$1`, with the URL; `--remotes=<url>` then matches
+        # no ref and excludes nothing, which lands in the same place. Measured.)
+        *) if [ -n "${REMOTE}" ]; then
+               RANGE="${local_sha} --not --remotes=${REMOTE}"
+           else
+               RANGE="${local_sha}"
+           fi ;;
+    esac
+    # shellcheck disable=SC2086
+    $PY "${GUARD}" --repo "${REPO}" --public-repo --range "${RANGE}" < /dev/null \
+        || fail "the guard refused ${RANGE}. Either a commit in it ADDS internal information, or the guard could not scan it -- its own output above says which. Pushing publishes HISTORY, so a value removed in a later commit stays readable at the commit that added it: rewrite those commits rather than appending a deletion."
+done <<REFLIST
+${REFS}
+REFLIST
+
+exit 0

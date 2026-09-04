@@ -111,8 +111,8 @@ jobs:
           kw-leak-guard --range "$range"
 
   test:
-    # ⭐ 3.10 AND 3.12, BOTH REQUIRED. `requires-python = ">=3.10"` is a promise to six consuming
-    # repositories, and the 3.10/3.12 split has reddened fleet CI twice — a library that claims
+    # ⭐ 3.10 AND 3.12, BOTH REQUIRED. `requires-python = ">=3.10"` is a promise to every consuming
+    # repository, and the 3.10/3.12 split has reddened fleet CI twice — a library that claims
     # 3.10 and is only ever run on 3.12 is claiming something nobody measured. The floor is not
     # cosmetic here: `datetime.fromisoformat` learned `Z` in 3.11, and this library writes `Z`
     # into its own records.
@@ -166,8 +166,9 @@ jobs:
         run: |
           python -m pip install --upgrade pip build
           python -m build
-      # ⭐ THE SDIST IS AN ARTIFACT TOO, and until this step nothing looked inside it. Three
-      # properties, each of which has already been wrong once:
+      # ⭐ THE SDIST IS AN ARTIFACT TOO, and until this step nothing looked inside it. The
+      # properties below have each been wrong at least once; `MANIFEST.in` keeps the running count
+      # of the class in one place rather than repeating it here, where it went stale:
       #   * `tests/conftest.py` must be PRESENT — setuptools' default sdist takes `tests/test*.py`
       #     and not `conftest.py`, so the released tarball shipped tests without the autouse
       #     fixtures they depend on, including the one that makes "no test reaches the network"
@@ -176,12 +177,18 @@ jobs:
       #     decoration, and a tarball without it ships tests that cannot exercise the injected
       #     configuration this release exists to add. The same failure as the conftest, one
       #     release later.
+      #   * `.githooks/pre-push` must be PRESENT — `tests/test_leak_guard_hook.py` COPIES it and
+      #     drives it against a real `git push`, so an sdist without it ships a suite that errors
+      #     on collection. (The running count of this class lives in `MANIFEST.in`, in one place,
+      #     because three copies of it disagreed.)
       #   * `scripts/` must be ABSENT — it no longer exists, and this keeps a re-vendored copy
-      #     of the guard from quietly reappearing beside the packaged one. Note that exclusion is
-      #     no longer the mechanism that keeps repository names out of published artifacts: the
-      #     guard now ships INSIDE the wheel. `tests/test_leak_guard_extraction.py` holds that
-      #     line, and this check only keeps a second copy from arriving.
-      # All three are one line of `MANIFEST.in` away from regressing, with nothing else watching.
+      #     of the guard from quietly reappearing beside the packaged one. ⚠️ Exclusion is NOT
+      #     what keeps private service names out of published artifacts, and reading it that way
+      #     is what #16 measured going wrong: `recursive-include tests *.py` put seventeen of
+      #     them into published sdists while the one test that asked looked at one module. The
+      #     check that holds that line is `.githooks/pre-push`, running a guard CI deliberately
+      #     does not have — `tests/test_leak_guard_hook.py` states what is and is not asserted.
+      # Every one of them is one line of `MANIFEST.in` away from regressing, nothing else watching.
       - name: The sdist carries its fixtures and nothing it should not
         run: |
           set -eu
@@ -189,7 +196,8 @@ jobs:
           echo "inspecting ${sdist}"
           names="$(tar tzf "$sdist")"
           for required in '/tests/conftest.py' '/.leakguard.json' '/.github/workflows/ci.yml' \
-                          '/alerting.env.template' '/docs/alerting-setup.md'; do
+                          '/alerting.env.template' '/docs/alerting-setup.md' \
+                          '/.githooks/pre-push'; do
             echo "$names" | grep -q "${required}\$" || {
               echo "::error::the sdist has no ${required} — its suite ships without something it"
               echo "::error::depends on. Check MANIFEST.in."
@@ -204,10 +212,10 @@ jobs:
           fi
           echo "sdist contents are as intended"
       # ⭐⭐ RUN THE SHIPPED SUITE, rather than grepping the tarball's file list for the things we
-      # currently remember it needs. The list above has been wrong THREE times — the conftest, then
-      # `.leakguard.json`, then `.github/workflows/ci.yml` — and each time the file list looked
-      # fine. Unpacking the sdist and running its tests is the check that cannot be out of date,
-      # because it asks the question `README.md` actually promises: do the tests travel?
+      # currently remember it needs. That list has been wrong every time it was extended, and it
+      # looked complete every time (the count and the roll-call live in `MANIFEST.in`). Unpacking
+      # the sdist and running its tests is the check that cannot be out of date, because it asks
+      # the question `README.md` actually promises: do the tests travel?
       - name: The sdist's own test suite passes
         run: |
           set -eu
@@ -225,6 +233,26 @@ jobs:
           # assertion. The runner has git; this only pins the branch name.
           git config --global init.defaultBranch main
           /tmp/sdisttest/bin/python -u -m pytest
+      # ⭐ ASKED OF THE BUILT WHEEL, NOT OF THE SOURCE TREE. `py.typed` is DATA: `packages.find`
+      # does not carry it, so the file can be committed, read as done, and be absent from the
+      # artifact — and nothing inside this repository would notice, because mypy here reads the
+      # source directly. A consumer's mypy reads the INSTALLED package, and without this file it
+      # ignores every annotation in it silently. That is the whole failure mode, so the assertion
+      # is on the zip.
+      - name: The wheel carries PEP 561's py.typed marker
+        run: |
+          set -eu
+          wheel="$(ls dist/*.whl)"
+          python - "$wheel" <<'PY'
+          import sys, zipfile
+          names = zipfile.ZipFile(sys.argv[1]).namelist()
+          if "kw_common/py.typed" not in names:
+              print("::error::the wheel has no kw_common/py.typed, so a consumer's mypy will")
+              print("::error::ignore every annotation in this package. Check "
+                    "[tool.setuptools.package-data] in pyproject.toml.")
+              raise SystemExit(1)
+          print("py.typed is in the wheel")
+          PY
       - name: Install the wheel into a clean environment and import it
         # A throwaway venv, and `--no-index` so nothing can be silently satisfied from PyPI: this
         # asserts the library needs no third-party package at install time either.
