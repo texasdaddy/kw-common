@@ -1587,6 +1587,50 @@ def test_EVERY_transform_mapping_this_package_publishes_is_checked_against_the_c
         "separator.")
 
 
+def test_every_document_that_describes_the_MARKER_describes_the_mechanism_the_code_USES(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐ THE SAME SHAPE AS THE TRANSFORM TEST ABOVE, AIMED AT THE OTHER CLAIM (#15).
+
+    The marker's mechanism is stated in four shipped files, and it just CHANGED — from an empty
+    file compared by modification time to a recorded digest. A document that still describes the
+    old one sends an operator to the wrong remedy: `touch` the config after a restore was the
+    advice, and under the old mechanism it was the ONLY thing that worked. Correcting three of the
+    four files and missing the fourth is this repository's recurring miss, so the question is asked
+    of every file rather than of the one that was edited.
+
+    ⚠️ Prose is not tested here, and this does not pretend to. It pins the one machine-checkable
+    fact — that what the code WRITES is what the documents SAY it writes — by producing a real
+    marker and requiring every document that discusses one to name that mechanism.
+    """
+    import re as _re
+
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    written = marker.read_text(encoding="utf-8").strip()
+    assert _re.fullmatch(r"sha256:[0-9a-f]{64}", written), (
+        f"the marker's content is {written!r}, which is not the `sha256:<hex>` line every "
+        f"document below tells a reader to expect")
+    assert marker.name == f"{MARKER_NAME}-prod", (
+        f"the marker is written as {marker.name!r}; the documents name "
+        f"`{MARKER_NAME}-<env>`")
+
+    sources = {
+        "docs/alerting-setup.md": SETUP_DOC.read_text(encoding="utf-8"),
+        "CHANGELOG.md": (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8"),
+        "README.md": (REPO_ROOT / "README.md").read_text(encoding="utf-8"),
+        "src/kw_common/alerting_env.py": MODULE_PATH.read_text(encoding="utf-8"),
+    }
+    describing = {name: text for name, text in sources.items()
+                  if "marker" in text.lower()}
+    assert len(describing) == len(sources), (
+        f"only {sorted(describing)} still discuss the marker — this test would pass over the rest")
+    for name, text in describing.items():
+        assert "sha256" in text.lower(), (
+            f"{name} describes the boot marker without naming the mechanism the code actually "
+            f"uses. It was a timestamp comparison until 1.3.0, and a document still saying so "
+            f"tells an operator to `touch` a file that no longer needs touching.")
+
+
 # ============================================================ the package's own boundaries
 def test_importing_alerting_env_does_not_drag_in_the_leak_guard() -> None:
     """Contract rule 5: modules are independently importable. `alerting_env` needs `alerting` —

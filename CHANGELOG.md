@@ -7,6 +7,83 @@ All notable changes to this project are documented here. The format follows
 A breaking change to a name in a module's `__all__` is a MAJOR bump, and its entry names every
 consumer repository that needs a code change.
 
+## [1.3.0] - 2026-09-03
+
+A check that shipped inside the thing it was checking, and a marker that recorded the wrong fact.
+
+### Security
+
+- **The private-name check no longer publishes the list it enforces (#16).** It asked ONE file —
+  the guard's own source — while everything else the wheel and the sdist carry went unchecked, and
+  it carried the forbidden names as a plain tuple in a test file that `MANIFEST.in` puts inside
+  every published tarball. Both halves were wrong, and the second made the first unfixable in
+  place: widening the test's reach while the list stayed would have made the disclosure worse, and
+  hashing or splitting the list in-repo is the same disclosure with extra steps.
+
+  Measured before the change: **seventeen occurrences across four shipped test files**, none of
+  which any check could see. The list moved OUT of this repository, into a guard that is committed
+  to no repository at all.
+
+- **`.githooks/pre-push` (#10).** The check moved to the moment publication happens. CI catches a
+  leak *after* the push, and a push to a public remote is permanent — the value stays readable at
+  the commit that added it, in every clone, and the repair is a history rewrite. The hook scans
+  the working tree (what the artifacts are built from) and the commits each ref would publish, and
+  **fails CLOSED when it is not configured**, because a guard that is silently not running looks
+  exactly like a pass. Install: `git config core.hooksPath .githooks` plus one config key naming
+  the guard, so no operator path is written into this repository.
+
+  ⚠️ **Declared bound, stated rather than implied:** a hook is a local convention. Nothing here and
+  nothing in CI can assert that it ran on somebody's machine, because CI must not have the list
+  either. `tests/test_leak_guard_hook.py` drives the real hook against a real `git push` to a real
+  bare remote and asserts whether the REMOTE REF MOVED — refused for a leaking commit, a leaking
+  worktree and an unconfigured guard; allowed for a clean push and a branch deletion; and passing
+  `--not --remotes` for a brand-new branch, which would otherwise scan zero commits at exactly the
+  moment a leak is most likely.
+
+### Changed
+
+- **The boot marker records the config's sha256 instead of relying on its own timestamp (#15).**
+  `rsync -a`, `cp -p`, `tar -x` and volume restores all PRESERVE mtime, so a config restored at an
+  older timestamp left the marker still newer: a file nobody had checked booted clean, announced
+  nothing, and the service came up alerting no one. A timestamp cannot answer "did the contents
+  change"; a digest can, whatever the clock says.
+
+  Contents decide in both directions — a restore with different bytes re-validates, an identical
+  restore does not, so a routine backup restore does not page anybody. The digest is over the RAW
+  BYTES, so a silent re-encode (the cp1252 file this module refuses at boot) re-validates too.
+
+  Two things go away with the old mechanism. The coarse-filesystem defect: on a one-second
+  granularity filesystem the config and the marker landed on the same second, the marker could
+  never be strictly newer, and every boot re-validated and re-alerted forever — `_outrank`, which
+  existed only to break that tie, is deleted rather than kept. And the one-second window it left,
+  where a config edited in the second after a boot was skipped.
+
+- **`py.typed`** — PEP 561's marker, so a consumer's mypy actually reads the annotations this
+  package already carried. Asserted against the BUILT WHEEL rather than the source tree: it is
+  data, `packages.find` does not carry it, so it could be committed, read as done, and be absent
+  from the artifact with nothing in this repository noticing.
+
+- **Consumer counts are out of the prose.** How many services a library is installed on is the
+  operator's estate, not the library's documentation, and this repository is public.
+
+### Fixed
+
+- **`_RefuseRedirects` described the ntfy `Title` as `[ERROR] <service>: <title>`.** It is
+  `[SEV] <title>`; the service name has never been in that header. On a shared topic
+  `AlertSettings.title_prefix` puts `[<env>][<service>] ` at the front of the TITLE, which is a
+  property of the topic rather than of the header — the docstring conflated the two.
+
+### Notes for adopters
+
+- **Upgrading costs exactly one re-validation, silently.** A marker written by 1.2.0 is empty, so
+  it matches no digest; the first boot after the upgrade validates, sends one confirmation, and
+  rewrites the marker. No operator step, and no way to get a stale "validated" verdict across the
+  upgrade — which is the direction that matters.
+- **`touch` is no longer the remedy after a restore, and is no longer needed.** To force a
+  re-check without editing the file, delete `CONFIG_PATH/.alerting-validated-<env>`.
+- **The public surface is unchanged.** Nothing was added to or removed from any module's
+  `__all__`; the digest helper is deliberately private.
+
 ## [1.2.0] - 2026-09-03
 
 The alerting **convention** becomes a function signature. The ops-alerting standard has specified
@@ -114,9 +191,9 @@ topic or a config file with operator alerting.
 
 ## [1.1.0] - 2026-09-02
 
-The leak guard becomes a module. It was a **file that seven repositories each kept a copy of**,
-with one of its test suites in **five** of them — so a fix made in one reached none of the others,
-and four separate engine improvements had to be re-ported by hand after being made once upstream.
+The leak guard becomes a module. It was a **file each repository kept its own copy of**, with one
+of its test suites copied alongside it — so a fix made in one reached none of the others, and four
+separate engine improvements had to be re-ported by hand after being made once upstream.
 A copy cannot be pinned. This release ends that the same way the alerting module did: a consumer
 installs a version.
 
@@ -283,7 +360,7 @@ Keep them beside your hooks; each removal site here says what it asserted.
 The three inherited security defects found during the v1.0.0 extraction and filed rather than
 silently changed (#2, #3, #4), fixed before the first consumer adopts. All three are byte-identical
 to the reference implementation, so they are live in it today; adopting this release is what
-removes them rather than carrying them forward into six copies.
+removes them rather than carrying them forward into one copy per consumer.
 
 ### Security
 
@@ -455,7 +532,8 @@ every service runs the same code instead of a copy that drifts.
   default" — `Alerter.read_errors()` passes the settings' value, so the reader and the roller
   cannot disagree. Calling the function directly with `backups=None` raises; see issue #5.
 
-[1.0.1]: https://github.com/texasdaddy/kw-common/releases/tag/v1.0.1
-[1.0.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.0.0
+[1.3.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.3.0
 [1.2.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.2.0
 [1.1.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.1.0
+[1.0.1]: https://github.com/texasdaddy/kw-common/releases/tag/v1.0.1
+[1.0.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.0.0

@@ -61,14 +61,14 @@ and downloads the template beside it; neither runs anything it downloaded.
 
 ```powershell
 New-Item -ItemType Directory -Force -Path .\configs
-Invoke-WebRequest -Uri https://raw.githubusercontent.com/texasdaddy/kw-common/v1.2.0/alerting.env.template -OutFile .\configs\alerting.env
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/texasdaddy/kw-common/v1.3.0/alerting.env.template -OutFile .\configs\alerting.env
 ```
 
 ### macOS and Linux
 
 ```sh
 mkdir -p ./configs
-curl -fLo ./configs/alerting.env https://raw.githubusercontent.com/texasdaddy/kw-common/v1.2.0/alerting.env.template
+curl -fLo ./configs/alerting.env https://raw.githubusercontent.com/texasdaddy/kw-common/v1.3.0/alerting.env.template
 ```
 
 `-f` makes `curl` fail on an HTTP error rather than writing the error page into your config file —
@@ -159,10 +159,13 @@ either is unset. `validate_boot_from_env` additionally reads `CONFIG_PATH` and c
   `SMTP_USER` to stand in for it** all refuse here rather than failing silently on the first real
   alert. (With `SMTP_USER` set explicitly, a display-name `EMAIL_FROM` is perfectly fine.)
 
-Then it sends **one** confirmation alert and writes an empty marker into `CONFIG_PATH`. Later boots
-skip the check while that marker is newer than the config file, so editing the file is what makes
-the next boot re-validate. The marker is **per environment**, so promoting a service from `dev` to
-`prod` re-validates even though the shared file did not change.
+Then it sends **one** confirmation alert and writes a marker into `CONFIG_PATH` recording the
+config file's **sha256** — one line, `sha256:<hex>`. Later boots skip the check while that digest
+still matches, so any edit to the file is what makes the next boot re-validate. The marker is
+**per environment**, so promoting a service from `dev` to `prod` re-validates even though the
+shared file did not change.
+
+To force a re-check without editing the file, delete the marker: `CONFIG_PATH/.alerting-validated-<env>`.
 
 `state_file` and `error_log` are the app's own paths under its own volume, not fleet settings, so
 they are not in the shared file and the loader has nothing to say about them — hence the
@@ -187,6 +190,13 @@ the proof the channel works: a channel that never fires is indistinguishable fro
 If it does not arrive, the process log says which of the two channels was skipped and why; nothing
 is silent.
 
-⚠️ One limit worth knowing: the marker is compared by **timestamp**. A config file restored at an
-older timestamp — `rsync -a`, `cp -p`, `tar -x`, a volume restore, all of which preserve mtime —
-leaves the marker still newer, so that change is not re-validated. `touch` the file after a restore.
+⭐ **A restore is re-checked.** The marker used to be empty and the comparison used to be by
+timestamp, so a config restored at an older mtime — `rsync -a`, `cp -p`, `tar -x`, a volume
+restore, all of which preserve it — left the marker still newer and the restored file was never
+checked. Since the marker records the file's digest, a restore with different contents
+re-validates whatever the timestamps say, and a restore of identical contents correctly does not.
+
+⚠️ What it still cannot see is a change **outside** the file: the ntfy endpoint going away, the
+app password being revoked at the provider, DNS moving. Boot validation answers "is this
+configuration well-formed and sendable-looking", never "is the far end still there" — that is what
+the periodic self-test is for.

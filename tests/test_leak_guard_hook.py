@@ -42,7 +42,6 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -198,7 +197,8 @@ def test_the_hook_is_pure_ASCII_with_LF_endings_and_a_sh_shebang() -> None:
     """
     raw = HOOK.read_bytes()
     assert raw.startswith(b"#!/bin/sh\n"), "the hook does not start with a POSIX sh shebang"
-    assert b"\r\n" not in raw, "the hook has CRLF line endings; `#!/bin/sh\\r` is not an interpreter"
+    assert b"\r\n" not in raw, (
+        "the hook has CRLF line endings; `#!/bin/sh\\r` is not an interpreter")
     assert all(byte < 128 for byte in raw), "the hook is not pure ASCII"
 
 

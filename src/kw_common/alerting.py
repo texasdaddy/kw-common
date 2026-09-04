@@ -1310,8 +1310,11 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
 
     ⭐ A PUBLISH ENDPOINT HAS NO BUSINESS REDIRECTING, and following one hands the alert to a host
     the operator never configured. `urlopen` re-issues the request AT THE NEW LOCATION WITH THE
-    HEADERS INTACT — including `Title`, which is `[ERROR] <service>: <title>` and is where an
-    operator puts the identifying half of the message. The target need not share the original
+    HEADERS INTACT — including `Title`, which is `[SEV] <title>` and is where an operator puts the
+    identifying half of the message. (`_post_ntfy` builds it from the severity's own prefix and
+    the title it was handed. The SERVICE NAME has never been in it; on a shared topic
+    `AlertSettings.title_prefix` puts `[<env>][<service>] ` at the front of the title itself, which
+    is a property of the topic rather than of this header.) The target need not share the original
     host or even the scheme, so an `https` topic can be handed to a cleartext one by a single
     `302` from a compromised or merely misconfigured endpoint. `ntfy_ready()` validates the URL
     the OPERATOR chose; it has nothing to say about where that server then points.
