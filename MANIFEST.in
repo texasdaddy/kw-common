@@ -39,9 +39,9 @@ recursive-include docs *.md
 # INSTALLED_PACKAGE` and `test_the_required_status_check_names_are_recorded_in_the_workflow` open
 # `.github/workflows/ci.yml`, so an sdist without it ships a suite that ERRORS — and this was the
 # first occurrence of the class caught by unpacking the tarball and running the tests rather than
-# by grepping its file list. (Running count: below, once.) `README.md`'s "tests travel with the module" is false for an sdist consumer
-# otherwise, and the packaging job now runs the shipped suite instead of taking the claim on
-# trust.
+# by grepping its file list. (Running count: below, once.) `README.md`'s "tests travel with the
+# module" is false for an sdist consumer otherwise, and the packaging job now runs the shipped
+# suite instead of taking the claim on trust.
 recursive-include .github/workflows *.yml
 
 # ⭐ THE PRE-PUSH HOOK, because `tests/test_leak_guard_hook.py` COPIES IT and drives it against a

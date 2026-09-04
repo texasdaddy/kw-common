@@ -20,8 +20,9 @@
 #
 #   STOP: It is a PYTHON SCRIPT, not "a program". The invocations below are `$PY "${GUARD}" ...`,
 #     where `$PY` is whichever of python3 / python / py -3 answers. Point this at a shell script or
-#     a compiled binary and it is handed to the interpreter, exits non-zero, and every push is
-#     refused with a leak accusation. The only check made on the path is that it is a file.
+#     a compiled binary and it is handed to the interpreter, which fails -- so every push is
+#     refused, with the interpreter's own error printed above the refusal. The only check made on
+#     the path is that it is a file.
 #
 #     <python> <guard> --repo <path> --public-repo [--range "<rev-range>"]
 #
@@ -102,15 +103,21 @@ REPO="$(git rev-parse --show-toplevel)"
 #   * a guard that reads stdin would otherwise EAT that list, and the commit scan would silently
 #     not run -- measured: one scan instead of three, and a leaking branch landed. Every guard
 #     invocation below also gets `< /dev/null`, so this cannot happen even to a guard that tries.
-#   * a push that only DELETES refs publishes nothing, so it must not be refused for what is
-#     sitting in the local worktree -- and refusing it blocks the exact gesture an operator makes
-#     after finding a leak. Knowing that requires seeing every ref before the first scan.
+#   * a push that publishes NOTHING -- only deletions, or one git reports "Everything up-to-date"
+#     -- must not be refused for what is sitting in the local worktree. Refusing it blocks the
+#     exact gesture an operator makes after finding a leak. Knowing that requires seeing every ref
+#     before the first scan.
+#
+# !! RUN BY HAND FROM A TERMINAL, THIS WAITS FOR EOF. That is `cat` doing its job, not a hang;
+# `sh .githooks/pre-push < /dev/null` is the invocation that returns.
 REFS="$(cat)"
 
-# Is anything actually being PUBLISHED, or is this push only deletions?
+# Two questions, one pass: is anything being PUBLISHED, and did any line parse at all?
 UPDATES=""
+PARSED=""
 while read -r _l_ref l_sha _r_ref _r_sha; do
-    [ -n "${_l_ref:-}" ] || continue      # a blank line: the heredoc's own, when REFS is empty
+    [ -n "${_l_ref:-}" ] || continue      # no fields: the heredoc's own blank line, or whitespace
+    PARSED="yes"
     if [ -z "${l_sha:-}" ]; then
         # A line this does not understand. git always sends four fields, so this is unreachable
         # through a real push -- and the answer to "I cannot tell whether this publishes" is that
@@ -131,7 +138,25 @@ REFLIST
 # above), so an uncommitted edit to a tracked file counts and a brand-new untracked file does not.
 # That is deliberate: an artifact is built from the working tree, and the message says which scan
 # found what, so a worktree-only finding is legible rather than mysterious.
-if [ -n "${UPDATES}" ] || [ -z "${REFS}" ]; then
+#
+# * WHEN IT RUNS, in the three cases that are not "this push publishes something":
+#   * git sends an EMPTY ref list for a push it reports as "Everything up-to-date", WITH the
+#     remote name in $1 -- measured. That publishes nothing, so it is not scanned. Scanning it was
+#     a false red on the same gesture the deletion case exists for: mid-cleanup of a leak, any
+#     push that turns out to be a no-op was refused with a message about the working tree.
+#   * no ref list AND no $1 is the hook run by hand. Nothing says what it would publish, so it
+#     scans -- that is the invocation somebody uses to see what this does.
+#   * a ref list that yielded no fields at all is input this cannot read, and the answer to that
+#     is to scan. Unreachable through git; the arm is here so the fail-closed claim is true.
+SCAN_TREE=""
+if [ -n "${UPDATES}" ]; then
+    SCAN_TREE="yes"
+elif [ -z "${PARSED}" ] && [ -z "${REMOTE}" ]; then
+    SCAN_TREE="yes"
+elif [ -z "${PARSED}" ] && [ -n "${REFS}" ]; then
+    SCAN_TREE="yes"
+fi
+if [ -n "${SCAN_TREE}" ]; then
     # shellcheck disable=SC2086  # PY may be "py -3"; the split is the point.
     $PY "${GUARD}" --repo "${REPO}" --public-repo < /dev/null \
         || fail "the guard refused the working TREE. Either a tracked file carries internal information, or the guard could not scan the tree -- its own output above says which. The tree is what the wheel and the sdist are built from, so this blocks a push even when no commit adds the value."

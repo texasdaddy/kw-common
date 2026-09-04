@@ -584,9 +584,10 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
         return False
 
     _check_layout(config, shared_root)
-    # ⭐⭐ THE DIGEST IS TAKEN HERE — BEFORE ANYTHING READS THE FILE'S CONTENTS — AND CARRIED TO
-    # THE MARKER. (`_check_layout` above it only stats directories, so it cannot see a rewrite;
-    # what must not get in front of this line is `read_config` and everything after it.)
+    # ⭐⭐ THE DIGEST IS TAKEN HERE AND CARRIED TO THE MARKER — before anything whose RESULT is
+    # used to validate has read the file. Precisely: `_marker_matches` above already read it, to
+    # answer whether to skip at all, and `_check_layout` only stats directories; what must not get
+    # in front of this line is `read_config` and everything after it.
     #
     # Taking it at WRITE time instead was a defect with #15's own outcome. `_announce` is an SMTP
     # round-trip plus an HTTP POST, so the gap between validating and marking is SECONDS of wall
@@ -840,9 +841,10 @@ def _write_marker(marker: Path, digest: str) -> None:
         # `read_config` read it successfully — a flap on the shared mount. Anything else means a
         # caller passed a shape this file does not write. Both end the same way: no marker, one
         # more validation on the next boot, and a line saying so rather than silence.
-        log.warning("alerting: no usable digest for the configuration file (%r), so no validation "
+        log.warning("alerting: the digest taken for this boot is unusable (%r), so no validation "
                     "marker was written to %s — the configuration is valid and was announced, but "
-                    "the next boot will validate and announce again.", digest, marker)
+                    "the next boot will validate and announce again. An empty digest means the "
+                    "shared config could not be read at the moment it was hashed.", digest, marker)
         return
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)

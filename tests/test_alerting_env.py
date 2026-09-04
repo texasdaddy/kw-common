@@ -974,7 +974,7 @@ def test_the_marker_records_the_config_that_was_CHECKED_not_the_one_on_disk_afte
                          alerter=RewritesDuringTheSend()) is True  # type: ignore[arg-type]
     # ⚠️ THE STAND-IN HAS TO HAVE RUN. Without this the two assertions below would hold on a file
     # nothing ever rewrote — the test would pass while proving nothing, which is the vacuous-setup
-    # shape rather than a defect in the code. Its sibling above carries the same guard.
+    # shape rather than a defect in the code. Its sibling below carries the same guard.
     assert config.read_bytes() == broken, "the alerter never ran, so no race was created"
     recorded = marker.read_text(encoding="utf-8").strip()
     assert recorded == "sha256:" + hashlib.sha256(good).hexdigest(), (
@@ -1054,7 +1054,12 @@ def test_a_digest_that_is_not_a_sha256_LINE_writes_no_marker_and_says_so(
     assert not marker.exists(), (
         f"a marker was written for {digest!r}, which `_marker_matches` can never match — every "
         f"boot from now on re-validates and re-announces")
-    assert "no usable digest" in caplog.text, "it happened silently"
+    # ⚠️ ASSERTED ON WHAT THE MESSAGE MUST CARRY, not on a phrase. A warning that says something
+    # went wrong without naming the file it did not write, or what it was handed, sends the reader
+    # to `CONFIG_PATH` to look for a marker that was never the problem.
+    assert caplog.text.strip(), "it happened silently"
+    assert str(marker) in caplog.text, "the warning does not say which marker was not written"
+    assert repr(digest) in caplog.text, "the warning does not say what it was handed"
 
 
 def test_an_alert_that_never_left_does_not_mark_the_boot_validated(tmp_path: Path) -> None:

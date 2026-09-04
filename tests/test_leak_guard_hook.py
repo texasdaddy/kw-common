@@ -606,6 +606,63 @@ def test_a_guard_that_reads_STDIN_cannot_swallow_the_ref_list(tmp_path: Path) ->
 
 @needs_sh
 @pytest.mark.timeout(300)
+def test_an_UP_TO_DATE_push_is_not_refused_for_what_is_in_the_worktree(tmp_path: Path) -> None:
+    """⭐ THE OTHER PUSH THAT PUBLISHES NOTHING, and it is the one nobody thinks of.
+
+    git runs `pre-push` for a push it then reports as "Everything up-to-date" — with the remote
+    name in `$1` and an EMPTY ref list on stdin. Measured. Under a tree scan that ran whenever the
+    ref list was empty, that push was refused for a value sitting in the local worktree: the
+    operator is mid-cleanup, types `git push` out of habit, and is told their tree leaks by a
+    push that would have moved nothing. Same false-red class as refusing a deletion, and the same
+    remedy — an empty list WITH a remote means there is nothing to publish.
+
+    ⚠️ Asserted by the guard log as well as the exit code. "It was not refused" is also true of a
+    hook that stopped running at all, and the previous test in this file is what would catch that.
+    """
+    work, remote, log = _scratch(tmp_path)
+    assert _git(work, "push", "origin", "main").returncode == 0
+    head = _remote_head(remote)
+    log.write_text("", encoding="utf-8")
+
+    (work / "README.md").write_text(f"{SENTINEL}\n", encoding="utf-8")   # tracked, and leaking
+    res = _git(work, "push", "origin", "main")
+    assert res.returncode == 0, (
+        f"a push with nothing to publish was refused for the WORKTREE:\n{res.stdout}\n{res.stderr}")
+    assert "up-to-date" in (res.stdout + res.stderr).lower(), (
+        f"this push was not the no-op the test needs it to be:\n{res.stdout}\n{res.stderr}")
+    assert _remote_head(remote) == head
+    assert log.read_text(encoding="utf-8").strip() == "", (
+        "the guard ran on a push that publishes nothing")
+
+
+@needs_sh
+@pytest.mark.timeout(300)
+def test_a_ref_list_the_hook_cannot_PARSE_still_scans_the_tree(tmp_path: Path) -> None:
+    """⛔ FAIL CLOSED ON INPUT IT CANNOT READ, which is the half the two arms above do not cover.
+
+    "Empty ref list with a remote" means nothing is being published. A ref list that is NOT empty
+    but yields no fields — whitespace, or a shape git does not send today — means the opposite:
+    something arrived and this could not read it. Skipping the scan there would turn a misread
+    into a silent all-clear, and it is the difference between the two conditions rather than
+    either one alone, so it needs its own case.
+
+    Unreachable through `git push`, which always sends four fields; driven directly.
+    """
+    work, _remote, log = _scratch(tmp_path)
+    hook = work / ".githooks" / "pre-push"
+    (work / "README.md").write_text(f"{SENTINEL}\n", encoding="utf-8")
+
+    res = subprocess.run(["sh", str(hook), "origin", str(work)], cwd=work, input="   \n",
+                         capture_output=True, text=True, encoding="utf-8", errors="replace",
+                         timeout=120, check=False)
+    assert res.returncode != 0, (
+        f"a ref list this cannot parse was treated as 'nothing to publish':\n"
+        f"{res.stdout}{res.stderr}")
+    assert log.read_text(encoding="utf-8").strip(), "no scan ran at all"
+
+
+@needs_sh
+@pytest.mark.timeout(300)
 def test_the_hook_run_BY_HAND_with_no_refs_still_scans_the_tree(tmp_path: Path) -> None:
     """The arm that exists for "how anybody tests one", asserted rather than assumed.
 
