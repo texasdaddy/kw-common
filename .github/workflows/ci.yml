@@ -176,12 +176,17 @@ jobs:
       #     decoration, and a tarball without it ships tests that cannot exercise the injected
       #     configuration this release exists to add. The same failure as the conftest, one
       #     release later.
+      #   * `.githooks/pre-push` must be PRESENT — `tests/test_leak_guard_hook.py` COPIES it and
+      #     drives it against a real `git push`, so an sdist without it ships a suite that errors
+      #     on collection. That is the FOURTH occurrence of this exact class.
       #   * `scripts/` must be ABSENT — it no longer exists, and this keeps a re-vendored copy
-      #     of the guard from quietly reappearing beside the packaged one. Note that exclusion is
-      #     no longer the mechanism that keeps repository names out of published artifacts: the
-      #     guard now ships INSIDE the wheel. `tests/test_leak_guard_extraction.py` holds that
-      #     line, and this check only keeps a second copy from arriving.
-      # All three are one line of `MANIFEST.in` away from regressing, with nothing else watching.
+      #     of the guard from quietly reappearing beside the packaged one. ⚠️ Exclusion is NOT
+      #     what keeps private service names out of published artifacts, and reading it that way
+      #     is what #16 measured going wrong: `recursive-include tests *.py` put seventeen of
+      #     them into published sdists while the one test that asked looked at one module. The
+      #     check that holds that line is `.githooks/pre-push`, running a guard CI deliberately
+      #     does not have — `tests/test_leak_guard_hook.py` states what is and is not asserted.
+      # Every one of them is one line of `MANIFEST.in` away from regressing, nothing else watching.
       - name: The sdist carries its fixtures and nothing it should not
         run: |
           set -eu
@@ -189,7 +194,8 @@ jobs:
           echo "inspecting ${sdist}"
           names="$(tar tzf "$sdist")"
           for required in '/tests/conftest.py' '/.leakguard.json' '/.github/workflows/ci.yml' \
-                          '/alerting.env.template' '/docs/alerting-setup.md'; do
+                          '/alerting.env.template' '/docs/alerting-setup.md' \
+                          '/.githooks/pre-push'; do
             echo "$names" | grep -q "${required}\$" || {
               echo "::error::the sdist has no ${required} — its suite ships without something it"
               echo "::error::depends on. Check MANIFEST.in."
@@ -225,6 +231,26 @@ jobs:
           # assertion. The runner has git; this only pins the branch name.
           git config --global init.defaultBranch main
           /tmp/sdisttest/bin/python -u -m pytest
+      # ⭐ ASKED OF THE BUILT WHEEL, NOT OF THE SOURCE TREE. `py.typed` is DATA: `packages.find`
+      # does not carry it, so the file can be committed, read as done, and be absent from the
+      # artifact — and nothing inside this repository would notice, because mypy here reads the
+      # source directly. A consumer's mypy reads the INSTALLED package, and without this file it
+      # ignores every annotation in it silently. That is the whole failure mode, so the assertion
+      # is on the zip.
+      - name: The wheel carries PEP 561's py.typed marker
+        run: |
+          set -eu
+          wheel="$(ls dist/*.whl)"
+          python - "$wheel" <<'PY'
+          import sys, zipfile
+          names = zipfile.ZipFile(sys.argv[1]).namelist()
+          if "kw_common/py.typed" not in names:
+              print("::error::the wheel has no kw_common/py.typed, so a consumer's mypy will")
+              print("::error::ignore every annotation in this package. Check "
+                    "[tool.setuptools.package-data] in pyproject.toml.")
+              raise SystemExit(1)
+          print("py.typed is in the wheel")
+          PY
       - name: Install the wheel into a clean environment and import it
         # A throwaway venv, and `--no-index` so nothing can be silently satisfied from PyPI: this
         # asserts the library needs no third-party package at install time either.

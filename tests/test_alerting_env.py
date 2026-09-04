@@ -22,6 +22,7 @@ fail, and each of them is the one that matters:
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import logging
 import os
@@ -141,6 +142,18 @@ def drop(root: Path, *keys: str) -> Path:
 def silence(channels: dict[str, Spy]) -> list[str]:
     """Every title either channel was asked to send. Empty is the assertion most tests here want."""
     return [title for spy in channels.values() for _, _, title, _ in spy.calls]
+
+
+def reset(channels: dict[str, Spy]) -> None:
+    """Forget what has been sent so far — EVERY channel, which is the point.
+
+    ⚠️ Clearing only `channels["ntfy"]` and then asserting `silence(channels) == []` is a test that
+    can never pass, because the email spy still holds the first boot's confirmation. It reads as a
+    production failure ("a refusal alerted anyway") when it is nothing of the sort, so the reset
+    is a named helper rather than two lines a test can get half right.
+    """
+    for spy in channels.values():
+        spy.calls.clear()
 
 
 # ====================================================================== acceptance 1: it is pure
@@ -521,7 +534,10 @@ def test_a_non_string_prefix_is_refused_by_the_constructor() -> None:
     ("feed-poller", "NTFY_URL_FEED_POLLER"),
     ("backup-agent", "NTFY_URL_BACKUP_AGENT"),
     ("report-mailer", "NTFY_URL_REPORT_MAILER"),
-    ("the.desk", "NTFY_URL_THE_DESK"),
+    # A DOT separator, which is a different character class from the hyphens above and is the
+    # spelling the transform used to be asked about with a real consumer's name. Invented here:
+    # this file ships in the sdist, so a real one would publish the fleet's inventory (#16).
+    ("edge.relay", "NTFY_URL_EDGE_RELAY"),
     ("  spaced  name ", "NTFY_URL_SPACED_NAME"),
 ])
 def test_the_service_key_transform_has_exactly_one_answer(service: str, key: str) -> None:
@@ -715,14 +731,20 @@ def _validated(tmp_path: Path, service: str = "feed-poller",
     return settings, marker_dir, marker_dir / marker_name(env)
 
 
-def test_a_good_config_writes_the_marker_and_alerts_exactly_once(
+def test_a_good_config_records_ITS_DIGEST_in_the_marker_and_alerts_exactly_once(
         tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐ THE MARKER CARRIES THE ANSWER NOW, not just its own modification time (#15).
+
+    Computed here from the config's BYTES rather than read back from the module, so the assertion
+    fails if the recorded value stops being the digest of the file that was validated.
+    """
     settings, marker_dir, marker = _validated(tmp_path)
     alerter = Alerter(settings)
 
     assert validate_boot(settings, "prod", marker_dir, alerter=alerter) is True
     assert marker.is_file()
-    assert marker.read_bytes() == b""
+    expected = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
+    assert marker.read_text(encoding="utf-8").strip() == f"sha256:{expected}"
     assert len(channels["ntfy"].calls) == 1
     assert channels["ntfy"].calls[0][1] is alerting.SEVERITIES[OK]
 
@@ -732,44 +754,147 @@ def test_a_second_boot_with_an_unchanged_config_alerts_nobody(
     settings, marker_dir, _marker = _validated(tmp_path)
     alerter = Alerter(settings)
     assert validate_boot(settings, "prod", marker_dir, alerter=alerter) is True
-    channels["ntfy"].calls.clear()
-    channels["email"].calls.clear()
+    reset(channels)
 
     assert validate_boot(settings, "prod", marker_dir, alerter=alerter) is False
     assert silence(channels) == []
 
 
-def test_touching_the_config_makes_the_next_boot_validate_again(
+def test_editing_the_config_makes_the_next_boot_validate_again(
         tmp_path: Path, channels: dict[str, Spy]) -> None:
-    settings, marker_dir, marker = _validated(tmp_path)
+    """No timestamp arithmetic any more: a different file is a different digest, full stop."""
+    settings, marker_dir, _marker = _validated(tmp_path)
     alerter = Alerter(settings)
     validate_boot(settings, "prod", marker_dir, alerter=alerter)
-    channels["ntfy"].calls.clear()
+    reset(channels)
 
     config = Path(settings.config_file)
-    # A real edit, and its timestamp moved forward far enough that a coarse filesystem clock
-    # cannot make this test depend on how fast the machine is.
     config.write_text(config.read_text(encoding="utf-8") + "\n# edited\n", encoding="utf-8")
-    marker_mtime = marker.stat().st_mtime
-    os.utime(config, (marker_mtime + 10, marker_mtime + 10))
 
     assert validate_boot(settings, "prod", marker_dir, alerter=alerter) is True
     assert len(channels["ntfy"].calls) == 1
 
 
-def test_a_marker_exactly_as_old_as_the_config_validates_again(
+def test_a_config_RESTORED_at_an_OLDER_timestamp_is_STILL_validated(
         tmp_path: Path, channels: dict[str, Spy]) -> None:
-    """⭐ STRICTLY NEWER. Filesystem timestamp granularity is a whole second on some filesystems,
-    so "the config was edited in the same tick the marker was written" is a real ordering — and
-    the safe reading of it is to re-check. Skipping is an optimisation; validating is the point.
+    """⭐⭐ #15, THE MEASURED REPRO, AND THE REASON THE MECHANISM CHANGED.
+
+    `rsync -a`, `cp -p`, `tar -x` and a Docker volume restore all PRESERVE mtime. Under the old
+    empty-marker-plus-timestamp rule the marker stayed newer than the restored file, so a config
+    that had never been checked booted clean, announced nothing, and the service came up alerting
+    nobody. The restored file here is BROKEN — a required key is gone — so the correct outcome is
+    not merely "validate again" but "refuse".
     """
     settings, marker_dir, marker = _validated(tmp_path)
-    validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings))
-    stamp = marker.stat().st_mtime
-    os.utime(Path(settings.config_file), (stamp, stamp))
-    channels["ntfy"].calls.clear()
+    alerter = Alerter(settings)
+    assert validate_boot(settings, "prod", marker_dir, alerter=alerter) is True
+    reset(channels)
+
+    config = Path(settings.config_file)
+    good = config.read_text(encoding="utf-8")
+    assert "EMAIL_TO=" in good, "the fixture no longer carries the key this test removes"
+    config.write_text("\n".join(ln for ln in good.splitlines()
+                                if not ln.startswith("EMAIL_TO=")) + "\n", encoding="utf-8")
+    older = marker.stat().st_mtime - 3600
+    os.utime(config, (older, older))
+    assert config.stat().st_mtime < marker.stat().st_mtime, "the restore is not actually older"
+
+    with pytest.raises(AlertEnvError) as exc:
+        validate_boot(settings, "prod", marker_dir, alerter=alerter)
+    assert "EMAIL_TO" in str(exc.value)
+    assert silence(channels) == [], "a failed validation must not alert through the channel"
+
+
+def test_a_config_restored_with_IDENTICAL_contents_does_NOT_re_validate(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """The other half, and the reason a digest beats `(mtime, size, inode)`.
+
+    An archive tool that restores the SAME bytes has changed nothing, so re-validating would mean
+    a duplicate confirmation alert after every backup restore — noise that trains an operator to
+    ignore the one message this whole mechanism exists to send. Contents decide; metadata does
+    not, in either direction.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    alerter = Alerter(settings)
+    assert validate_boot(settings, "prod", marker_dir, alerter=alerter) is True
+    reset(channels)
+
+    config = Path(settings.config_file)
+    raw = config.read_bytes()
+    config.unlink()
+    config.write_bytes(raw)                       # a restore: same bytes, new inode
+    older = marker.stat().st_mtime - 3600
+    os.utime(config, (older, older))
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=alerter) is False
+    assert silence(channels) == []
+
+
+def test_the_skip_does_not_depend_on_the_TIMESTAMPS_at_all(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐ THE OLD MECHANISM, ASSERTED GONE RATHER THAN ASSUMED GONE.
+
+    A marker dated an hour BEFORE the config it validated would have failed the old
+    "strictly newer" test outright. Under the digest rule it is simply correct, and this is what
+    would go red if a timestamp comparison were ever put back in front of the digest as an
+    "optimisation".
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    alerter = Alerter(settings)
+    assert validate_boot(settings, "prod", marker_dir, alerter=alerter) is True
+    reset(channels)
+
+    config = Path(settings.config_file)
+    older = config.stat().st_mtime - 3600
+    os.utime(marker, (older, older))
+    assert marker.stat().st_mtime < config.stat().st_mtime
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=alerter) is False
+    assert silence(channels) == []
+
+
+def test_a_RE_ENCODED_config_that_parses_identically_re_validates(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """The digest is over BYTES, not over the parsed keys, and that is deliberate.
+
+    A file rewritten with different line endings parses to the same mapping and is a different
+    file. Since this module refuses a cp1252 or UTF-16 config at boot, a silent re-encode is
+    exactly the change worth re-checking — and a digest over the parsed dictionary would miss it.
+    """
+    settings, marker_dir, _marker = _validated(tmp_path)
+    alerter = Alerter(settings)
+    assert validate_boot(settings, "prod", marker_dir, alerter=alerter) is True
+    reset(channels)
+
+    config = Path(settings.config_file)
+    config.write_bytes(config.read_bytes().replace(b"\n", b"\r\n"))
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=alerter) is True
+    assert len(channels["ntfy"].calls) == 1
+
+
+@pytest.mark.parametrize("content", [b"", b"\n", b"validated\n", b"sha256:\n",
+                                     b"sha256:not-the-digest\n", b"\xff\xfe\x00"])
+def test_a_marker_that_records_no_usable_digest_validates_again(
+        tmp_path: Path, channels: dict[str, Spy], content: bytes) -> None:
+    """⭐ THE UPGRADE PATH IS THE FIRST CASE IN THAT LIST, and it is why this is parametrized.
+
+    A marker written by 1.2.0 is EMPTY — the whole meaning used to be its modification time — so
+    after the upgrade it matches nothing, the first boot validates once, re-announces once, and
+    rewrites the marker with a digest. That is the correct migration and it needs no operator
+    step; the alternative (treating an empty marker as "validated") would carry the very defect
+    this change removes across the upgrade.
+
+    The rest are the ways a marker can be damaged: truncated, half-written, replaced by prose,
+    or binary. Every one of them means "I cannot establish that this file was validated", and the
+    answer to that is to validate it.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker.write_bytes(content)
 
     assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert len(channels["ntfy"].calls) == 1
 
 
 def test_an_alert_that_never_left_does_not_mark_the_boot_validated(tmp_path: Path) -> None:
@@ -811,58 +936,30 @@ def test_a_refusal_names_EVERY_missing_key_not_just_the_first(
     assert silence(channels) == []
 
 
-def test_the_marker_is_always_left_STRICTLY_newer_than_the_config(tmp_path: Path) -> None:
-    """⭐⭐ THE INVARIANT THE SKIP DEPENDS ON, ASSERTED DIRECTLY — because asserting the SKIP is
-    only as good as the filesystem the test happens to run on.
+def test_a_marker_and_a_config_written_in_the_SAME_TICK_still_skip_the_second_boot(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐⭐ THE COARSE-FILESYSTEM DEFECT, PINNED AS GONE RATHER THAN AS FIXED.
 
-    "Write the config, then write the marker" produces a strictly greater timestamp only where the
-    clock granularity is finer than the gap between the two writes. This assertion holds on any
-    filesystem, and it is the one that went RED on Linux while the second-boot test below was
-    green on Windows.
+    An ext4 built with 128-byte inodes has ONE-SECOND timestamps, which is what several CI
+    runners' scratch disks are. Under the old rule both writes landed on the same second, the
+    marker could never be strictly newer than the config, and every boot re-validated and re-sent
+    the confirmation alert — forever, until somebody edited the file. Measured green on Windows
+    (NTFS, 100 ns) and RED on both Linux jobs at the same commit, which is what a mechanism that
+    depends on clock granularity does.
+
+    The tie is created deliberately here. With a digest it simply does not matter, and this is the
+    test that would go red if any timestamp comparison came back.
     """
     settings, marker_dir, marker = _validated(tmp_path)
     assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
-    assert marker.stat().st_mtime > Path(settings.config_file).stat().st_mtime
-
-
-def test_a_marker_written_in_the_same_tick_as_the_config_is_still_dated_past_it(
-        tmp_path: Path) -> None:
-    """⭐ THE COARSE-FILESYSTEM CASE, REPRODUCED WITHOUT NEEDING A COARSE FILESYSTEM.
-
-    An ext4 built with 128-byte inodes has ONE-SECOND timestamps, which is what several CI
-    runners' scratch disks are. Both writes then land on the same second and the marker can never
-    outrank the config, so every boot re-validates and re-sends the confirmation alert — forever,
-    until somebody edits the file. Here the tie is created deliberately and the helper must break
-    it.
-    """
-    from kw_common.alerting_env import _outrank
-
-    config = write_shared(tmp_path)
-    marker = tmp_path / "app" / marker_name("prod")
-    marker.parent.mkdir(parents=True)
-    marker.write_bytes(b"")
+    config = Path(settings.config_file)
     stamp = config.stat().st_mtime
     os.utime(marker, (stamp, stamp))
     assert marker.stat().st_mtime == config.stat().st_mtime   # the tie really exists
+    reset(channels)
 
-    _outrank(marker, config)
-    assert marker.stat().st_mtime > config.stat().st_mtime
-
-
-def test_outranking_leaves_an_already_newer_marker_alone(tmp_path: Path) -> None:
-    """It establishes an order; it does not stamp the marker every boot. A marker that already
-    wins keeps its own time, so "when was this configuration last validated" stays true."""
-    from kw_common.alerting_env import _outrank
-
-    config = write_shared(tmp_path)
-    marker = tmp_path / "app" / marker_name("prod")
-    marker.parent.mkdir(parents=True)
-    marker.write_bytes(b"")
-    stamp = config.stat().st_mtime + 500
-    os.utime(marker, (stamp, stamp))
-
-    _outrank(marker, config)
-    assert marker.stat().st_mtime == stamp
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False
+    assert silence(channels) == []
 
 
 def test_the_marker_is_written_into_the_apps_own_directory_and_never_the_shared_root(
@@ -1015,7 +1112,10 @@ def test_an_unwritable_marker_directory_costs_a_warning_and_not_the_boot(
     def refuse(*args: object, **kwargs: object) -> None:
         raise OSError("read-only file system")
 
-    monkeypatch.setattr(Path, "write_bytes", refuse)
+    # ⚠️ `write_text`, because that is what records the digest. This patched `write_bytes` while
+    # the marker was empty, and when the marker gained content the patch silently stopped
+    # intercepting anything — the test then asserted a warning that was never going to be logged.
+    monkeypatch.setattr(Path, "write_text", refuse)
     with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
         assert validate_boot(settings, "prod", marker_dir,
                              alerter=Alerter(settings)) is True

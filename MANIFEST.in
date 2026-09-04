@@ -14,6 +14,11 @@ include README.md
 include CHANGELOG.md
 include pyproject.toml
 include .leakguard.json
+# PEP 561's marker. `package-data` in `pyproject.toml` puts it in the WHEEL; this puts it in the
+# sdist, and a `pip install <sdist>` builds a wheel from that — so leaving this line out makes the
+# annotations usable for a wheel consumer and invisible for a tarball one, which is worse than
+# either answer on its own.
+include src/kw_common/py.typed
 recursive-include tests *.py
 
 # ⭐ THE SETUP CONTRACT'S TWO FILES, and they are ARGUMENTS for the suite exactly as
@@ -38,6 +43,12 @@ recursive-include docs *.md
 # trust.
 recursive-include .github/workflows *.yml
 
+# ⭐ THE PRE-PUSH HOOK, because `tests/test_leak_guard_hook.py` COPIES IT and drives it against a
+# real `git push`. An sdist without it ships a suite that errors on collection — the same class as
+# the missing conftest, the missing `.leakguard.json` and the missing workflow before it, which is
+# now four times. It is also the file an sdist consumer would actually want: the check itself.
+recursive-include .githooks *
+
 # ⭐ `.leakguard.json` IS INCLUDED because it is an ARGUMENT for the tests, not decoration. This
 # repository's own config is the worked example the leak-guard suite reads, and an sdist whose
 # suite cannot find it ships tests that skip the one property the extraction exists to prove.
@@ -48,5 +59,12 @@ recursive-include .github/workflows *.yml
 # its docstring enumerated the fleet's other repositories by name, which would have put that
 # inventory inside every tarball attached to every public Release. The guard is now
 # `src/kw_common/leakguard.py` — INSIDE the wheel, published to everyone who installs the
-# library — so exclusion is no longer available as the fix. The names were removed from the file
-# instead, and `test_the_shipped_guard_names_no_private_repository` is what keeps them out.
+# library — so exclusion is no longer available as the fix.
+#
+# ⭐ AND EXCLUSION WAS NEVER THE REAL ANSWER, WHICH #16 MEASURED: `recursive-include tests *.py`
+# put SEVENTEEN private service names into every published sdist, in four files, while the one
+# test that asked the question looked at a single module. Keeping a file OUT of the tarball
+# protects that file and nothing else. What keeps the names out now is `.githooks/pre-push`,
+# running a guard that holds the list and is committed to no repository at all — and
+# `recursive-include .githooks *` below is what makes the hook travel with the source, so an
+# sdist consumer gets the check rather than a reference to one.

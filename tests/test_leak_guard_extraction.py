@@ -1011,26 +1011,17 @@ def test_a_justification_of_only_WHITESPACE_is_refused(tmp_path: Path) -> None:
 # =================================================================================================
 
 
-def test_the_shipped_guard_names_no_private_repository() -> None:
-    """⛔ THE MODULE IS INSIDE THE WHEEL, so its comments are published to everyone who installs.
-
-    While the guard was vendored, `MANIFEST.in` kept it out of the sdist for exactly this reason —
-    its docstring enumerated the fleet's private repositories by name. Exclusion is no longer
-    available as the fix: the engine ships in the package now. The names were removed instead, and
-    this is what keeps them out. Provenance is cited as `consumer#NN`, which finds the discussion
-    from inside the fleet and discloses no inventory outside it.
-
-    ⚠️ THE PUBLIC NAMES ARE DELIBERATELY NOT LISTED HERE. `kw-common` and `unraid-templates` are
-    public repositories and naming them costs nothing; a test that banned every repository name
-    would fail on the docstring sentence that exists to say which ones are public.
-    """
-    src = _SCRIPT.read_text(encoding="utf-8")
-    private = ("tape", "keystone", "cef-tracker", "reauth-bot", "gambit", "the-desk")
-    named = [name for name in private
-             if any(name in line.lower() for line in src.splitlines())]
-    assert not named, (
-        f"the packaged guard names private repositories {named} — this file is published in the "
-        f"wheel to anyone who installs the library")
+# ⛔ `test_the_shipped_guard_names_no_private_repository` USED TO BE HERE, AND IT IS NOT COMING
+# BACK IN THIS SHAPE (#16). It asked ONE file — the guard's own source — while everything else the
+# wheel and the sdist carry went unchecked, and it carried the list of forbidden names as a plain
+# tuple in a file `MANIFEST.in` puts inside every published tarball. So the inventory it existed
+# to keep out of published artifacts was itself published, and widening its reach while the list
+# stayed would have made that worse rather than better.
+#
+# The list moved OUT of this repository, into a guard that is committed nowhere, and the check
+# moved to `.githooks/pre-push`. What can still be asserted here is asserted in
+# `tests/test_leak_guard_hook.py`, which drives that hook against a real `git push` — including
+# the honest statement of what it CANNOT assert, since CI must not have the list either.
 
 
 def test_the_console_entry_point_is_declared_and_points_at_the_no_argument_callable() -> None:

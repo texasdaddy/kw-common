@@ -1,0 +1,87 @@
+#!/bin/sh
+# Refuse a push that would publish internal information.
+#
+# WHY THIS EXISTS (#10, #16)
+#   CI catches a leak AFTER the push, and a push to a public remote is permanent: the value stays
+#   readable at the commit that added it, in every clone, and the only repair is a history
+#   rewrite. The push is the moment publication happens, so the push is where the check belongs.
+#
+#   The shape-based guard that ships inside this package (`kw-leak-guard`) cannot answer the other
+#   half. A bare service name has no shape to match, and the list of names that must not appear
+#   here cannot live in this repository -- it would be published by the very artifact it exists to
+#   keep clean, which is what #16 measured. So the list lives in a project-side guard that is
+#   committed nowhere, and this hook runs THAT.
+#
+# INSTALL (per clone, once):
+#   git config core.hooksPath .githooks && git config kw.privateGuard "<absolute path to the project-side guard>"
+#
+# DECLARED BOUND, stated rather than implied: a hook is a local convention. Nothing in this
+# repository can assert that it ran on anyone else's machine, and CI cannot re-check it, because
+# CI must not have the list either. `tests/test_leak_guard_hook.py` asserts what the hook DOES
+# when it runs; it cannot assert that it ran.
+
+set -u
+
+fail() {
+    echo "" >&2
+    echo "pre-push REFUSED: $1" >&2
+    echo "" >&2
+    exit 1
+}
+
+GUARD="$(git config --get kw.privateGuard 2>/dev/null || true)"
+if [ -z "${GUARD}" ]; then
+    echo "" >&2
+    echo "pre-push REFUSED: this clone has no private-name guard configured." >&2
+    echo "" >&2
+    echo "  git config kw.privateGuard \"<absolute path to the project-side guard>\"" >&2
+    echo "" >&2
+    echo "It is not optional and there is no skip. A guard that is silently not running is" >&2
+    echo "worse than one that was never installed, because its absence looks exactly like a" >&2
+    echo "pass -- and this repository is PUBLIC." >&2
+    exit 1
+fi
+[ -f "${GUARD}" ] || fail "kw.privateGuard points at ${GUARD}, which is not a file."
+
+# The interpreter probe is `python3 -c ""`, NEVER `command -v python3`. On Windows `command -v`
+# finds the Microsoft Store App Execution Alias stub, which then refuses to run -- so every push
+# aborts with "Python was not found" and no mention of the guard at all.
+if python3 -c "" 2>/dev/null; then
+    PY="python3"
+elif python -c "" 2>/dev/null; then
+    PY="python"
+elif py -3 -c "" 2>/dev/null; then
+    PY="py -3"
+else
+    fail "no working Python interpreter found (tried python3, python, py -3)."
+fi
+
+REPO="$(git rev-parse --show-toplevel)"
+
+# ---- 1. the TREE, which is what the wheel and the sdist are built from.
+# It reads the WORKTREE, so an uncommitted edit counts too. That is deliberate: an artifact is
+# built from the working tree, and the message below says which scan found what so a worktree-only
+# finding is legible rather than mysterious.
+# shellcheck disable=SC2086  # PY may be "py -3"; the split is the point.
+$PY "${GUARD}" --repo "${REPO}" --public-repo \
+    || fail "the working TREE carries internal information (above). This is what the wheel and the sdist are built from."
+
+# ---- 2. the COMMITS this push would actually publish.
+# One scan per ref. A brand-new branch has no remote counterpart to diff against, and diffing
+# against nothing would scan ZERO commits and report clean -- which is the most likely moment for
+# a leak, not the least. `--not --remotes` is what makes that case scan the new history instead.
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    case "${local_sha}" in
+        *[!0]*) ;;          # a real sha
+        *) continue ;;      # all zeros: this ref is being DELETED, so it publishes nothing
+    esac
+    case "${remote_sha}" in
+        *[!0]*) RANGE="${remote_sha}..${local_sha}" ;;
+        *) RANGE="${local_sha} --not --remotes" ;;
+    esac
+    # shellcheck disable=SC2086
+    $PY "${GUARD}" --repo "${REPO}" --public-repo --range "${RANGE}" \
+        || fail "a commit in ${RANGE} ADDS internal information (above). Pushing publishes history: rewrite those commits before pushing."
+done
+
+exit 0

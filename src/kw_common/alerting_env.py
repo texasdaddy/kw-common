@@ -35,7 +35,7 @@ machines this file has never seen.
 variable                mode       purpose
 ======================  =========  =================================================
 ``SHARED_ROOT``         read-only  carries ``configs/alerting.env`` and nothing else
-``CONFIG_PATH``         read-write the app's OWN directory; holds the boot marker
+``CONFIG_PATH``         read-write the app's OWN directory; holds the validation marker
 ``DEPLOY_ENV``          --         ``prod`` or ``dev``, case-insensitive
 ======================  =========  =================================================
 
@@ -74,6 +74,7 @@ raises on purpose.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -143,8 +144,16 @@ DEPLOY_ENV_VAR = "DEPLOY_ENV"
 CONFIG_RELPATH = "configs/alerting.env"
 
 # Written into the app's own read-write `CONFIG_PATH`, NEVER into the read-only shared root. A
-# dotfile so it does not clutter a directory an operator looks at, and empty because the only
-# thing it carries is its modification time.
+# dotfile so it does not clutter a directory an operator looks at.
+#
+# ⭐ THE ACTUAL FILENAME IS `.alerting-validated-<env>` — see `marker_name`. One marker for all
+# environments was measured wrong: a dev→prod promotion does not touch the fleet-shared file, so
+# the single marker still said "validated" and the prod topic was never checked.
+#
+# ⭐ ITS CONTENT IS ONE LINE, `sha256:<hex>`, being the digest of the config file that was
+# validated. It used to be EMPTY, with the whole meaning carried by its modification time — and a
+# timestamp cannot answer "did the contents change", so a config restored by `rsync -a` / `cp -p`
+# / `tar -x` / a volume restore booted clean on a file nobody had checked (#15).
 MARKER_NAME = ".alerting-validated"
 
 ENVIRONMENTS = ("dev", "prod")
@@ -460,26 +469,65 @@ def marker_name(deploy_env: str) -> str:
 
     The environment is what the check is ABOUT — `required_keys` differs per environment and so
     does the topic — so "this configuration has been validated" is not a fact about the file alone.
-    An empty marker in `CONFIG_PATH` compared by timestamp is still exactly what the standard
-    specifies; it constrains neither the filename nor the count.
+    The marker lives in `CONFIG_PATH`, one per environment, exactly as the standard specifies; it
+    constrains neither the filename nor the count.
     """
     return f"{MARKER_NAME}-{normalise_env(deploy_env)}"
 
 
-def _marker_is_fresh(marker: Path, config: Path) -> bool:
-    """Whether the marker post-dates the config file, i.e. this boot may skip validation.
+def _config_digest(config: str | os.PathLike[str]) -> str:
+    """`sha256:<hex>` for the config file's RAW BYTES, or `""` if it cannot be read.
 
-    ⭐ STRICTLY NEWER. Equal timestamps validate AGAIN. Filesystem timestamp granularity is coarse
-    — one second on some filesystems — so "the config was edited in the same tick the marker was
-    written" is a real ordering, and the safe reading of it is to re-check. Skipping is an
-    optimisation; validating is the point.
+    ⚠️ BYTES, NOT PARSED TEXT, and not decoded text either. A file re-saved in another encoding
+    parses to the same keys and is a different file — cp1252 is the encoding this module refuses
+    at boot, so a silent re-encode is precisely a change worth re-validating. Hashing the bytes
+    also means the digest can be taken before anything has decided the file is readable.
+
+    `""` on failure rather than a raise: the caller's question is "may this boot skip validation",
+    and the answer to "I could not read the config" is no. Whatever went wrong is then reported
+    properly by `_check_layout` / `read_config`, which say WHICH thing was wrong.
     """
     try:
-        return marker.stat().st_mtime > config.stat().st_mtime
+        return "sha256:" + hashlib.sha256(Path(config).read_bytes()).hexdigest()
     except OSError:
-        # Either file may be absent or unreadable. Both mean "cannot establish that the marker is
-        # newer", and the answer to that is to validate.
+        return ""
+
+
+def _marker_matches(marker: Path, config: Path) -> bool:
+    """Whether this exact config file has already been validated, i.e. this boot may skip.
+
+    ⭐⭐ THE DIGEST, NOT THE TIMESTAMP (#15). The marker used to be empty and the question used to
+    be "is the marker NEWER than the config". `rsync -a`, `cp -p`, `tar -x` and a volume restore
+    all PRESERVE mtime, so a config restored at an older timestamp left the marker still newer: a
+    broken configuration booted clean, announced nothing, and the service came up alerting nobody.
+    Measured exactly that way. A timestamp cannot answer "did the contents change"; a digest can,
+    and it answers it whatever the clock says.
+
+    Three things fall out of the change, all of them wanted:
+
+      * the ORDER of the two writes stops mattering, so the whole coarse-filesystem problem goes
+        away — a one-second-granularity ext4 made the old marker unable to outrank the config at
+        all, and every boot re-alerted forever. That fix (`_outrank`) is deleted, not kept.
+      * the one-second window it left — a config edited in the second AFTER a boot was dated no
+        later than the marker and got skipped — closes too. Any edit changes the digest.
+      * a marker written by 1.2.0 is EMPTY, so it matches nothing and the first boot after the
+        upgrade validates once and rewrites it. That is the correct migration and it is silent.
+
+    Anything unreadable, absent, empty or malformed answers False: the safe reading of "I cannot
+    establish that this file was validated" is to validate it.
+    """
+    try:
+        recorded = marker.read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
         return False
+    if not recorded.startswith("sha256:"):
+        return False
+    current = _config_digest(config)
+    # ⚠️ `and` on a non-empty current, because `_config_digest` answers `""` for an unreadable
+    # config — and `"" == ""` would make an unreadable config match an unreadable marker. It
+    # cannot happen through the branch above, which already required the `sha256:` prefix, and it
+    # is written out anyway: this is the comparison that decides whether validation runs at all.
+    return bool(current) and recorded == current
 
 
 def validate_boot(settings: AlertSettings, deploy_env: str,
@@ -489,8 +537,9 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
     """Verify the alerting configuration at startup. Refuse to boot if it is not usable.
 
     Returns `True` if this boot validated (and therefore alerted and wrote the marker), `False` if
-    it skipped because the marker is newer than the config file. Raises `AlertEnvError` on any
-    failure — the caller's `main()` is expected to let that stop the process.
+    it skipped because the marker records the digest of this exact config file. Raises
+    `AlertEnvError` on any failure — the caller's `main()` is expected to let that stop the
+    process.
 
     `marker_dir` is the directory the marker is written to, and it must be the app's OWN
     read-write directory — the `CONFIG_PATH` variable. ⚠️ That is a REQUIREMENT ON THE CALLER, not
@@ -510,11 +559,11 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
     report, so an attempt to alert about it either goes nowhere or, worse, appears to succeed.
 
     ⚠️ WHAT THE MARKER CANNOT SEE, stated because a check that implies coverage it lacks is worse
-    than none: a config file RESTORED at an older timestamp — `rsync -a`, `cp -p`, `tar -x`, a
-    volume restore, all of which preserve mtime — leaves the marker still newer, so a file that
-    changed is not re-validated. The standard specifies an empty marker and a timestamp
-    comparison, and that is the limit of what a timestamp can answer; recording the config's own
-    digest would close it and is a different design. Filed rather than papered over.
+    than none. It records the digest of the CONFIG FILE, so any change to that file re-validates,
+    whatever the file's timestamp says (#15). What it does not cover is a change OUTSIDE the file:
+    the ntfy endpoint going away, the SMTP password being revoked at the provider, DNS moving. A
+    boot check answers "is this configuration well-formed and sendable-looking", never "is the
+    remote end still there" — the periodic self-test is what answers that one.
     """
     env = normalise_env(deploy_env)
     config = Path(settings.config_file) if settings.config_file else None
@@ -524,9 +573,10 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
             "with load_alert_settings() or load_alert_settings_from_env().")
 
     marker = Path(marker_dir) / marker_name(env)
-    if _marker_is_fresh(marker, config):
-        log.info("alerting: %s configuration validated on an earlier boot (%s is newer than %s); "
-                 "skipping. Touch or edit the config file to force a re-check.",
+    if _marker_matches(marker, config):
+        log.info("alerting: %s configuration validated on an earlier boot (%s records the current "
+                 "digest of %s); skipping. Any edit to the config file forces a re-check; delete "
+                 "the marker to force one without editing it.",
                  env, marker, config)
         return False
 
@@ -739,63 +789,40 @@ def _announce(settings: AlertSettings, env: str, values: dict[str, str], config:
     return True
 
 
-def _outrank(marker: Path, config: Path) -> None:
-    """Make the marker's timestamp STRICTLY newer than the config's, if it is not already.
-
-    ⭐⭐ THIS IS NOT TIDINESS — WITHOUT IT THE MARKER NEVER WORKS ON A COARSE FILESYSTEM, AND THE
-    SYMPTOM IS AN ALERT ON EVERY BOOT, FOREVER.
-
-    `_marker_is_fresh` asks whether the marker is STRICTLY newer, and that reading is the correct
-    one: equal timestamps genuinely cannot establish an order, and skipping on a tie would skip a
-    config edit that landed in the same tick. But "write the config, then write the marker" only
-    produces a strictly greater timestamp on a filesystem whose granularity is finer than the gap
-    between the two writes. On one with **one-second** timestamps — an ext4 built with 128-byte
-    inodes, which is what several CI runners' scratch disks are — the two writes land on the SAME
-    second and the marker can never outrank the config. Every boot then re-validates and re-sends
-    the confirmation alert, permanently, until somebody edits the file.
-
-    Measured exactly that way: green on Windows (NTFS, 100 ns) and RED on both Linux jobs, on the
-    same commit, with the second boot returning `True` where it must return `False`.
-
-    So the ordering is ESTABLISHED rather than hoped for. The bump is one second past the config,
-    not "now", because the point is to outrank that file and nothing else — and one second is the
-    smallest step a one-second filesystem would not round away.
-
-    ⚠️ WHAT THIS DOES NOT CATCH, stated rather than implied: a config edit made in the second
-    AFTER a boot is dated no later than the marker, so the next boot skips it and the change is
-    picked up on the boot after that. Any mtime scheme has that window; this makes it one second
-    wide instead of zero. The alternative — recording the config's own digest in the marker — is
-    not what the standard specifies, which is an empty marker and a timestamp comparison.
-    """
-    try:
-        config_mtime = config.stat().st_mtime
-        if marker.stat().st_mtime > config_mtime:
-            return
-        stamp = config_mtime + 1
-        os.utime(marker, (stamp, stamp))
-    except OSError as exc:
-        # Same posture as a failed write: the configuration is valid and has been announced. The
-        # cost of not being able to stamp the marker is a duplicate alert per boot, not an outage.
-        log.warning("alerting: could not date the validation marker %s past %s (%s) — the "
-                    "configuration is valid and was announced, but this boot's marker may not "
-                    "suppress the next one.", marker, config, type(exc).__name__)
-
-
 def _write_marker(marker: Path, config: Path) -> None:
-    """Write the empty marker into the app's own read-write directory, dated past the config.
+    """Record the validated config's digest in the app's own read-write directory.
+
+    ⭐ ONE LINE, `sha256:<hex>`, AND NOTHING ELSE. The marker used to be empty and its whole
+    meaning lived in its modification time; it now carries the answer itself, so nothing about the
+    ORDER of these two writes matters any more. That deleted a real defect rather than a nicety:
+    on a one-second-granularity filesystem — an ext4 with 128-byte inodes, which several CI
+    runners' scratch disks are — the config and the marker landed on the same second, the marker
+    could never be strictly newer, and every boot re-validated and re-alerted forever. Measured
+    green on NTFS and red on both Linux jobs at the same commit. A digest has no such failure mode.
+
+    The digest is taken HERE rather than passed in, so the recorded value is the file as it stands
+    at the moment it is recorded. A config rewritten during validation therefore does not match on
+    the next boot, which re-validates — the safe direction.
 
     ⚠️ A FAILURE HERE IS NOT A BOOT FAILURE. The configuration IS valid — that has already been
     established and announced. An unwritable `CONFIG_PATH` costs one redundant validation and one
     duplicate alert per boot, which is noise; refusing to start over it would turn a
     missing-read-write-volume into an outage of the service itself.
     """
+    digest = _config_digest(config)
+    if not digest:
+        # Unreadable HERE, having been read successfully moments ago: the file changed or went
+        # away mid-validation. Writing a marker with no digest in it would be a marker that never
+        # matches, which is harmless but silent; saying so costs one line.
+        log.warning("alerting: could not digest %s to record the validation marker — the "
+                    "configuration is valid and was announced, but the next boot will validate "
+                    "again.", config)
+        return
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_bytes(b"")
+        marker.write_text(digest + "\n", encoding="utf-8")
     except OSError as exc:
         log.warning("alerting: could not write the validation marker %s (%s) — the configuration "
                     "is valid and was announced, but every boot will re-validate and re-announce "
                     "until this directory is writable. It is the CONFIG_PATH variable.",
                     marker, type(exc).__name__)
-        return
-    _outrank(marker, config)

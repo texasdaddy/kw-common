@@ -415,7 +415,7 @@ def test_scan_added_passes_a_clean_line():
 
 
 def test_a_binary_SUFFIX_no_longer_hides_TEXT_from_the_range_scan():
-    """⭐ THIS TEST USED TO PIN THE DEFECT (keystone#22), and its old assertion is the change.
+    """⭐ THIS TEST USED TO PIN THE DEFECT (sibling#22), and its old assertion is the change.
 
     It required every `SKIP_SUFFIXES` name to swallow a leak in an ADDED LINE, on the reasoning
     that the two scans must agree about which files count. They must — but they were agreeing on
@@ -1613,7 +1613,7 @@ def test_the_identity_scan_reads_every_field_not_just_the_author_email() -> None
 
 
 # =============================================================================================
-# The remaining gambit refinements, each pinned by the behaviour it changes.
+# The remaining engine refinements, each pinned by the behaviour it changes.
 # =============================================================================================
 
 
@@ -1627,7 +1627,7 @@ def test_the_self_exemption_follows_the_FILE_not_a_hardcoded_path(tmp_path: Path
 
     ⚠️ AN ORDINARY CLEAN FILE IS TRACKED ALONGSIDE IT, and it is not decoration. A tree whose ONLY
     tracked file is the guard is a tree the scan reads NOTHING from, which the zero-scan floor
-    (keystone#22) now refuses rather than reports clean — correctly, since a scan that opened no
+    (sibling#22) now refuses rather than reports clean — correctly, since a scan that opened no
     file cannot clear anything. Without the second file this test's exit code would be reporting
     the floor rather than the self-exemption, which is the question it exists to ask.
     """

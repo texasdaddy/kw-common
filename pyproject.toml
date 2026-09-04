@@ -54,6 +54,18 @@ version = { attr = "kw_common.__version__" }
 [tool.setuptools.packages.find]
 where = ["src"]
 
+# ⭐ PEP 561. Without `py.typed` INSIDE the installed package, a consumer's mypy treats
+# `kw_common` as untyped and silently ignores every annotation in it — `disallow_untyped_defs`
+# below runs over this repository's own source and proves nothing at all for anybody who installs
+# it. The annotations were already written; the marker that says they may be used was not.
+#
+# ⚠️ THE MARKER IS DATA, NOT CODE, so `packages.find` does not carry it — it walks for
+# `__init__.py` and takes `.py` files. Without the line below the file sits in the source tree,
+# is committed, reads as done, and is ABSENT from the wheel: exactly the failure it exists to fix,
+# invisible from inside this repository. The wheel job asserts the built artifact contains it.
+[tool.setuptools.package-data]
+kw_common = ["py.typed"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
