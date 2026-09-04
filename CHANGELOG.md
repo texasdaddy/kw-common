@@ -36,17 +36,21 @@ A check that shipped inside the thing it was checking, and a marker that recorde
   exactly like a pass. Install: `git config core.hooksPath .githooks` plus one config key naming
   the guard, so no operator path is written into this repository.
 
-  ⚠️ **Declared bound, stated rather than implied:** a hook is a local convention. Nothing here and
-  nothing in CI can assert that it ran on somebody's machine, because CI must not have the list
-  either. `tests/test_leak_guard_hook.py` drives the real hook against a real `git push` to a real
-  bare remote and asserts whether the REMOTE REF MOVED — refused for a leaking commit, for a
-  value a LATER COMMIT REMOVED (the worktree is clean, so only the commit scan can see it), for a
-  leaking worktree, for the second ref of a two-ref push, and for an unconfigured guard; allowed
-  for a clean push, and for a branch deletion even when the worktree carries a finding, since a
-  deletion publishes nothing and refusing it blocks the cleanup itself. A brand-new branch is
-  scanned with `--not --remotes=<the remote being pushed to>` — bare `--remotes` spans EVERY
-  remote, so a branch already fetched from a private one had its whole history excluded and
-  published unread.
+  ⚠️ **Declared bounds, stated rather than implied:** a hook is a local convention. Nothing here
+  and nothing in CI can assert that it ran on somebody's machine, because CI must not have the
+  list either. And `core.hooksPath .githooks` is a RELATIVE path, so a checkout that predates the
+  hook has none and git says nothing — filed as #17, since closing it is a workstation install
+  rather than a package change.
+
+  `tests/test_leak_guard_hook.py` drives the real hook against a real `git push` to a real bare
+  remote and asserts whether the REMOTE REF MOVED — refused for a leaking commit, for a value a
+  LATER COMMIT REMOVED (the worktree is clean, so only the commit scan can see it), for a leaking
+  worktree, for the second ref of a two-ref push, and for an unconfigured guard; allowed for a
+  clean push, and — even when the worktree carries a finding — for the two pushes that publish
+  NOTHING: a branch deletion, and one git reports `Everything up-to-date`. Refusing either of
+  those blocks the cleanup itself. A brand-new branch is scanned with
+  `--not --remotes=<the remote being pushed to>` — bare `--remotes` spans EVERY remote, so a
+  branch already fetched from a private one had its whole history excluded and published unread.
 
 ### Changed
 

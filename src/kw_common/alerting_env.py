@@ -585,9 +585,9 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
 
     _check_layout(config, shared_root)
     # ⭐⭐ THE DIGEST IS TAKEN HERE AND CARRIED TO THE MARKER — before anything whose RESULT is
-    # used to validate has read the file. Precisely: `_marker_matches` above already read it, to
-    # answer whether to skip at all, and `_check_layout` only stats directories; what must not get
-    # in front of this line is `read_config` and everything after it.
+    # used to validate has read the file. Not before every read: `_marker_matches` above may hash
+    # it, to answer whether to skip at all, and `_check_layout` stats directories. What must not
+    # get in front of this line is `read_config` and everything after it.
     #
     # Taking it at WRITE time instead was a defect with #15's own outcome. `_announce` is an SMTP
     # round-trip plus an HTTP POST, so the gap between validating and marking is SECONDS of wall

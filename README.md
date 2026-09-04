@@ -345,10 +345,19 @@ git config core.hooksPath .githooks && git config kw.privateGuard "<absolute pat
 ```
 
 It scans the tracked working tree (what the wheel and the sdist are built from) and the commits
-each ref would publish, and it **refuses the push** on any finding — including when
-`kw.privateGuard` is unset, because a guard that is silently not running looks exactly like a
-pass. The one exception is a push that only DELETES refs: it publishes nothing, so the tree scan
-is skipped and it goes through even when the worktree still holds the value you are cleaning up.
+each ref would publish, and it **refuses the push** on any finding — and refuses outright when
+`kw.privateGuard` is unset or does not name a file, because a guard that is silently not running
+looks exactly like a pass.
+
+Two pushes are not scanned against the working tree, because they **publish nothing**: one that
+only DELETES refs, and one git reports as `Everything up-to-date` (it runs the hook with an empty
+ref list). Both go through even when the worktree still holds the value you are cleaning up —
+which is the point, since refusing them blocks the cleanup itself. Anything either push *does*
+publish is still scanned commit by commit.
+
+⚠️ The unconfigured-guard refusal comes FIRST, before the ref list is read, so it applies to those
+two as well: on a fresh clone with `core.hooksPath` set and no `kw.privateGuard`, even a deletion
+is refused — and the message names the config key rather than your tree.
 
 ⚠️ **Declared bounds.** A hook is a local convention. Nothing in this repository, and nothing in
 CI, can assert that it ran on somebody's machine — CI must not have the list either. And

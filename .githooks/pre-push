@@ -20,8 +20,9 @@
 #
 #   STOP: It is a PYTHON SCRIPT, not "a program". The invocations below are `$PY "${GUARD}" ...`,
 #     where `$PY` is whichever of python3 / python / py -3 answers. Point this at a shell script or
-#     a compiled binary and it is handed to the interpreter, which fails -- so every push is
-#     refused, with the interpreter's own error printed above the refusal. The only check made on
+#     a compiled binary and it is handed to the interpreter, which fails -- so every push that
+#     runs it is refused, with the interpreter's own error printed above the refusal. (The two
+#     that publish nothing never invoke it, so those still go through.) The only check made on
 #     the path is that it is a file.
 #
 #     <python> <guard> --repo <path> --public-repo [--range "<rev-range>"]

@@ -616,11 +616,15 @@ def test_an_UP_TO_DATE_push_is_not_refused_for_what_is_in_the_worktree(tmp_path:
     push that would have moved nothing. Same false-red class as refusing a deletion, and the same
     remedy — an empty list WITH a remote means there is nothing to publish.
 
-    ⚠️ Asserted by the guard log as well as the exit code. "It was not refused" is also true of a
-    hook that stopped running at all, and the previous test in this file is what would catch that.
+    ⚠️ "IT WAS NOT REFUSED" IS ALSO TRUE OF A HOOK THAT NEVER RAN, so the first push here is
+    checked for having invoked the guard BEFORE the log is cleared. Without that, replacing the
+    hook with `exit 0` leaves this test green — measured — and a test that a dead hook satisfies
+    is not evidence about a live one.
     """
     work, remote, log = _scratch(tmp_path)
     assert _git(work, "push", "origin", "main").returncode == 0
+    assert log.read_text(encoding="utf-8").strip(), (
+        "the hook did not run on the first push either, so nothing below is about this hook")
     head = _remote_head(remote)
     log.write_text("", encoding="utf-8")
 
