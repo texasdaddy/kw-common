@@ -20,9 +20,11 @@ A check that shipped inside the thing it was checking, and a marker that recorde
   place: widening the test's reach while the list stayed would have made the disclosure worse, and
   hashing or splitting the list in-repo is the same disclosure with extra steps.
 
-  Measured before the change: **seventeen occurrences across four shipped test files**, none of
-  which any check could see. The list moved OUT of this repository, into a guard that is committed
-  to no repository at all.
+  Measured against the artifacts 1.2.0 actually published: **17 occurrences in 4 files of the
+  sdist**, 0 in the wheel — the one file any check looked at was the one file that was clean, and
+  every occurrence was in a test the wheel does not carry and `recursive-include tests *.py` puts
+  in the tarball. The list moved OUT of this repository, into a guard committed to no repository
+  at all. The same measurement against 1.3.0's wheel and sdist: 0 and 0.
 
 - **`.githooks/pre-push` (#10).** The check moved to the moment publication happens. CI catches a
   leak *after* the push, and a push to a public remote is permanent — the value stays readable at
