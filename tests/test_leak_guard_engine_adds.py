@@ -254,6 +254,56 @@ def test_a_NEW_pattern_reaches_every_surface_unless_an_override_says_otherwise(
         guard.message_patterns.cache_clear()
 
 
+# ================================ #11: two inherited false reds — text that identifies nobody
+# ⚠️ Every shape below is ASSEMBLED at runtime — the firing ones because this file is scanned by
+# the guard it tests and only the engine's own source is exempt; the two placeholder UUIDs
+# because a SIBLING guard that has not learned this carve-out yet scans this repository too, and
+# a literal here would redden it until it is re-ported.
+_NIL_UUID = "-".join("0" * n for n in (8, 4, 4, 4, 12))
+_MAX_UUID = "-".join("f" * n for n in (8, 4, 4, 4, 12))
+_USERS = "C:" + "\\Users\\"
+
+
+def test_the_windows_administrator_profile_is_a_built_in_and_does_not_fire() -> None:
+    """`C:\\Users\\Administrator` is the canonical Windows Server account. It names no person, it
+    appears in ordinary runbooks, and it is the same class as `runneradmin`, which was added to
+    the carve-out for the same reason. A guard that reddens it gets switched off."""
+    for text in (f"log files land in {_USERS}Administrator\\AppData\\Local\\Temp",
+                 f"posix-separated {_USERS.replace(chr(92), '/')}Administrator/Documents"):
+        assert guard.scan_text(text, guard.compile_patterns()) == [], text
+
+
+@pytest.mark.parametrize("account", ["Administrator2", "Administrators", "Administrator-old"])
+def test_a_profile_that_merely_begins_with_administrator_still_fires(account: str) -> None:
+    """The carve-out is bounded on `(?![\\w.-])`: an account somebody CREATED, however it is
+    spelled, is still a profile path naming them."""
+    hits = guard.scan_text(f"profile at {_USERS}{account}\\AppData", guard.compile_patterns())
+    assert [label for _, label, _ in hits] == ["windows profile path"]
+
+
+def test_the_nil_and_max_uuids_are_the_placeholder_convention_and_do_not_fire() -> None:
+    """RFC 9562 reserves all-zeroes and all-`f` exactly as RFC 5737 reserves the documentation
+    ranges: they identify nobody by construction, and they reach real repositories as a
+    `DEFAULT_TENANT` sentinel, a `.csproj` `ProjectGuid` or a migration's seed row."""
+    for text in (f"DEFAULT_TENANT = '{_NIL_UUID}'", f"MAX = '{_MAX_UUID}'",
+                 f"<ProjectGuid>{{{_MAX_UUID.upper()}}}</ProjectGuid>"):
+        assert guard.scan_text(text, guard.compile_patterns()) == [], text
+
+
+def test_one_digit_off_the_nil_uuid_is_a_real_id_and_still_fires() -> None:
+    nearly = _NIL_UUID[:-1] + "1"
+    hits = guard.scan_text(f"TENANT={nearly}", guard.compile_patterns())
+    assert [label for _, label, _ in hits] == ["uuid (access policy / tenant id)"]
+
+
+def test_the_nil_uuid_grants_no_amnesty_to_a_leak_beside_it() -> None:
+    """A permitted span suppresses only what it CONTAINS — the containment rule the whole allowlist
+    rests on — so a real value sharing the line with the placeholder is still reported."""
+    host = "host-a" + ".lan"
+    hits = guard.scan_text(f"TENANT={_NIL_UUID} on {host}", guard.compile_patterns())
+    assert [label for _, label, _ in hits] == ["private lan domain"]
+
+
 def test_the_PATH_surface_runs_a_DIFFERENT_pattern_set_and_says_which() -> None:
     """⭐⭐ A PATH IS NOT FILE CONTENT, and three patterns rely on bounds that only hold in the
     grammar they were written for. Applied verbatim to paths they reddened trees that leak nothing

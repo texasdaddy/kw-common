@@ -61,14 +61,14 @@ and downloads the template beside it; neither runs anything it downloaded.
 
 ```powershell
 New-Item -ItemType Directory -Force -Path .\configs
-Invoke-WebRequest -Uri https://raw.githubusercontent.com/texasdaddy/kw-common/v1.4.0/alerting.env.template -OutFile .\configs\alerting.env
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/texasdaddy/kw-common/v1.4.1/alerting.env.template -OutFile .\configs\alerting.env
 ```
 
 ### macOS and Linux
 
 ```sh
 mkdir -p ./configs
-curl -fLo ./configs/alerting.env https://raw.githubusercontent.com/texasdaddy/kw-common/v1.4.0/alerting.env.template
+curl -fLo ./configs/alerting.env https://raw.githubusercontent.com/texasdaddy/kw-common/v1.4.1/alerting.env.template
 ```
 
 `-f` makes `curl` fail on an HTTP error rather than writing the error page into your config file —

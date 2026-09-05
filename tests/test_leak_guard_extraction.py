@@ -195,6 +195,25 @@ def test_an_explicit_config_path_is_honoured_and_a_missing_one_is_an_ERROR(
         f"unreadable or malformed one:\n{_out(missing)}")
 
 
+def test_a_repo_path_outside_any_repository_is_a_usage_error_not_a_traceback(
+        tmp_path: Path) -> None:
+    """⭐ #12. `--repo <not-a-repository>` used to let `CalledProcessError` escape `main`: a stack
+    trace and exit 1. Fail-closed, but `USAGE` reserves exit 2 for a usage error, and this is what
+    a mistyped path looks like to somebody in one of six consuming repositories who has never
+    read the source. Both halves: the exit code, and a sentence instead of a traceback."""
+    plain = tmp_path / "just-a-directory"
+    plain.mkdir()
+    res = _run(plain)
+    assert res.returncode == 2, f"a non-repository must be a usage error (exit 2):\n{_out(res)}"
+    assert "Traceback" not in _out(res), f"a usage error must not print a traceback:\n{_out(res)}"
+    assert "not inside a git repository" in _out(res), _out(res)
+    assert "usage:" in _out(res), "the usage text is what tells the operator which flag to fix"
+
+    absent = _run(tmp_path / "does-not-exist")
+    assert absent.returncode == 2 and "Traceback" not in _out(absent), _out(absent)
+    assert "is not a directory" in _out(absent), _out(absent)
+
+
 def test_selftest_REFUSES_a_config_rather_than_ignoring_one(tmp_path: Path) -> None:
     """⚠️ A MUTATION SURVIVOR until this was written, which is why it is here.
 

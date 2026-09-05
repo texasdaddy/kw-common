@@ -136,6 +136,13 @@ WHAT THIS MODULE WILL NOT PUT IN A LOG
     None of this reaches what a CALLER puts in a title or a message. Sanitise at the raise site,
     where the value is understood.
 
+    ⚠️ AND "ITS OWN CONFIGURATION" IS SCOPED TO THE TWO VALUES `_secret_values` NAMES — the
+    SMTP password and the topic URL. `EMAIL_TO`, `EMAIL_FROM` and `SMTP_USER` are NOT redacted,
+    and smtplib quotes them: `SMTPSenderRefused` carries the sender, `SMTPRecipientsRefused` the
+    recipients, and a relay that echoes the login name puts `SMTP_USER` into
+    `SMTPAuthenticationError`. Those are addresses rather than credentials, and the line is a
+    diagnostic an operator needs — stated here so the claim above is not read as wider than it is.
+
 INVARIANTS
     - `notify()` NEVER raises. Alerting that can crash its caller is worse than no alerting.
     - A channel that fails logs and continues; it never blocks the other channel. Redundancy is
@@ -178,6 +185,7 @@ THE RETRIEVABLE ERROR LOG (`error_log=`)
 
 from __future__ import annotations
 
+import contextlib
 import errno
 import http.client
 import json
@@ -913,6 +921,23 @@ class AlertConfig:
     # the constructor signature. `AlertConfig(url, email, path)` still means what it meant.
     allow_cleartext_ntfy: bool = False
 
+    def __repr__(self) -> str:
+        """The dataclass repr with `SMTP_PASSWORD` shown as `<set>`/`<unset>`, never its value.
+
+        ⭐ A GENERATED REPR PRINTS EVERY FIELD, AND ONE OF THEM HOLDS THE SHARED FILE'S PASSWORD.
+        `Alerter.config()` returns this object to any adopter, and `repr(alerter.config())` in a
+        debug line or a boot-time settings dump was the password in the process log — the same
+        class of escape as the marker's digest (#20), through a different door. The fleet's
+        boot-config-dump standard prints credentials as set/unset; this does the same, and every
+        other field stays readable because they are what an operator needs to see.
+        """
+        email = None if self.email is None else {
+            key: (("<set>" if value else "<unset>") if key == "SMTP_PASSWORD" else value)
+            for key, value in self.email.items()}
+        return (f"AlertConfig(ntfy_url={self.ntfy_url!r}, email={email!r}, "
+                f"config_file={self.config_file!r}, "
+                f"allow_cleartext_ntfy={self.allow_cleartext_ntfy!r})")
+
     @classmethod
     def load(cls, settings: AlertSettings) -> AlertConfig:
         """Read the current config: ntfy from the settings, email from the settings' file.
@@ -1578,7 +1603,7 @@ def _record_is_at_or_after(rec: dict, floor: datetime) -> bool:
 
 def read_jsonl_tail(path: str, limit: int, since_iso: str = "",
                     keep: Callable[[dict], bool] | None = None,
-                    backups: int = ERROR_LOG_BACKUPS) -> list[dict]:
+                    backups: int | None = ERROR_LOG_BACKUPS) -> list[dict]:
     """The most recent records from a rotating jsonl file, oldest-first. Never raises on I/O.
 
     Reads the rotated generations oldest → newest and then the live file, so a `since`/`limit`
@@ -1587,7 +1612,11 @@ def read_jsonl_tail(path: str, limit: int, since_iso: str = "",
     the newest `limit` records — `limit<=0` means no cap.
 
     `backups` MUST match what wrote the file, or the reader silently loses the oldest generation.
-    `Alerter.read_errors()` passes the settings' value and is the call to prefer.
+    `Alerter.read_errors()` passes the settings' value and is the call to prefer. `None` is the
+    sentinel the reference implementation used for "the module default", and it is accepted again
+    (#5): a caller ported from that code passes it explicitly, and the extraction had turned that
+    call into a `TypeError` at the generation count — a behavioural difference for exactly the
+    call site an adopter moves across first.
 
     A bad `since_iso` RAISES — `ValueError`, or `OverflowError` for a value that parses but
     cannot be shifted to UTC (see `parse_since`). A caller who asked for a window must not be
@@ -1604,7 +1633,7 @@ def read_jsonl_tail(path: str, limit: int, since_iso: str = "",
     request.
     """
     floor = parse_since(since_iso)
-    generations = max(1, backups)
+    generations = max(1, ERROR_LOG_BACKUPS if backups is None else backups)
     files = [f"{path}.{i}" for i in range(generations, 0, -1)] + [path]
     # BOUNDED BY `limit`, not by the file. Accumulating every match and slicing at the end costs
     # memory proportional to the FILE rather than to the answer — measured at 122 MB peak for a
@@ -1732,6 +1761,89 @@ def _title_prefix(settings: object) -> str:
     return value if isinstance(value, str) else ""
 
 
+# The characters that end a path in "a directory, not a file". `altsep` is `None` off Windows, so
+# a backslash stays an ordinary filename character there, where it is one.
+_SEPARATORS = tuple(sep for sep in (os.sep, os.altsep) if sep)
+
+
+def _sink_problem(path: str, *, label: str, creates_directories: bool,
+                  appends_in_place: bool) -> str:
+    """Why a file this module will WRITE cannot be, or `""` — asked the way the writer will ask.
+
+    ⭐⭐ THE QUESTION IS "CAN THE SINK BE CREATED", NOT "DOES ITS DIRECTORY EXIST" (#23). The
+    previous detectors asked the second question and answered "fine" for five states in which the
+    write provably fails — a file (or a symlink to nowhere) standing where the directory should
+    be, a trailing separator, the sink being itself a directory, a NUL in the path — because
+    `os.path.isdir` is False for all of them and the parent arm then found a perfectly writable
+    grandparent. Each of those is a different way of asking the same wrong question, and adding a
+    fifth special case would have left a sixth. So this walks to the FIRST ANCESTOR THAT EXISTS
+    and asks about that, which is what `os.makedirs` and `os.open` are about to do.
+
+    ⚠️ AND THE OPPOSITE SIGN. The old "even its parent does not exist, so the volume is probably
+    not mounted" arm reddened `<mount>/svc/logs/errors.log` with `<mount>` mounted and `svc/` not
+    yet created — a configuration `makedirs` handles on the first alert — because its premise held
+    only when the mounted root was exactly one level up. A detector that reddens a working
+    configuration is one that gets switched off, so that arm now fires only when NOTHING on the
+    way to the directory exists except the filesystem root itself, which no volume ever is.
+
+    `creates_directories` — the error-log sink `makedirs` its directory; the state file does not
+    (`_write_state` opens its temp file directly), so for it a missing directory is a problem
+    outright and the wording says so. `appends_in_place` — the error log is opened for append, so
+    an existing sink must be writable; the state file is replaced by rename, which does not need
+    the old file to be.
+
+    The three answers this distinguishes are still: checked and fine (`""`), checked and broken
+    (a sentence), and could not check (the caller's `except`). The third is not the first.
+    """
+    if "\x00" in path:
+        return (f"{label} contains a NUL character, which no filesystem call accepts — the sink "
+                f"cannot be opened")
+    if path.endswith(_SEPARATORS):
+        return (f"{label} {path!r} ends with a path separator, so it names a directory rather "
+                f"than a file, and nothing can be opened at it")
+    full = os.path.abspath(path)
+    directory = os.path.dirname(full)
+    # Walk up to the first thing that exists. `lexists`, not `exists`: a symlink to nowhere is an
+    # entry that `mkdir` refuses, so it is something in the way rather than an absence.
+    probe, missing = directory, 0
+    while not os.path.lexists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe, missing = parent, missing + 1
+    if not os.path.lexists(probe) or (missing and os.path.dirname(probe) == probe):
+        # Nothing on the way exists but the filesystem (or drive) root. On the containers this
+        # library ships to that is a volume that was never mounted: `makedirs` would then succeed
+        # inside the disposable layer, which is the retrieval failure this sink exists to fix,
+        # arriving disguised as success.
+        return (f"{label} points into {directory!r}, and nothing on the way to it exists except "
+                f"the filesystem root — in a container that usually means the volume is not "
+                f"mounted, so these records would be written into the disposable layer and "
+                f"could not be read from the host")
+    if not os.path.isdir(probe):
+        return (f"{label} points into {directory!r}, but {probe!r} is not a directory — a file, "
+                f"or a symlink to nowhere, is standing where the directory should be, and the "
+                f"sink cannot be created through it")
+    if missing:
+        if not creates_directories:
+            return f"{label} points into {directory!r}, which does not exist"
+        if not os.access(probe, os.W_OK):
+            return (f"{label} points into {directory!r}, which does not exist and cannot be "
+                    f"created: its parent {probe!r} is not writable by this process. The "
+                    f"sink will fail on the first WARN or ERROR alert — in a container this "
+                    f"is usually a uid mismatch on a bind-mounted volume")
+        return ""  # the fresh-container case: `makedirs` creates the rest on the first write
+    if os.path.lexists(full):
+        if os.path.isdir(full):
+            return f"{label} {path!r} is a directory, not a file — nothing can be written to it"
+        if appends_in_place and not os.access(full, os.W_OK):
+            return f"{label} {path!r} exists but is not writable by this process"
+        return ""
+    if not os.access(directory, os.W_OK):
+        return f"{label} points into {directory!r}, which is not writable"
+    return ""
+
+
 @dataclass(frozen=True)
 class Alerter:
     """One service's alerting, bound to its injected settings.
@@ -1779,17 +1891,14 @@ class Alerter:
                         "instead of backing off. This is almost always an unset environment "
                         "variable; pass None to disable de-duplication deliberately, or a path "
                         "to enable it")
-            directory = os.path.dirname(path) or "."
-            if not os.path.isdir(directory):
-                return f"state_file points into {directory!r}, which does not exist"
-            if not os.access(directory, os.W_OK):
-                return f"state_file points into {directory!r}, which is not writable"
+            # Asked the way `_write_state` writes: no `makedirs`, and a rename over the leaf.
+            return _sink_problem(path, label="state_file", creates_directories=False,
+                                 appends_in_place=False)
         except Exception as exc:  # noqa: BLE001 — a diagnostic must not become the failure
             # Broad on purpose, and not narrowed to the one failure that came to mind: this runs
             # on the alerting path, called from notify(), so ANY escape takes down the alert it
             # was only annotating. Answer "unusable" instead.
             return f"state_file could not be checked ({type(exc).__name__})"
-        return ""
 
     def error_log_problem(self) -> str:
         """Why the error log will not be retrievable, or "" if it looks fine.
@@ -1811,43 +1920,13 @@ class Alerter:
                 return ("error_log is blank, so the retrievable sink is OFF — WARN and ERROR "
                         "alerts are in the process log only. This is almost always an unset "
                         "environment variable; pass None to disable the sink deliberately")
-            directory = os.path.dirname(path) or "."
-            if os.path.isdir(directory):
-                if not os.access(directory, os.W_OK):
-                    return f"error_log points into {directory!r}, which is not writable"
-                return ""
-            # ⚠️ `abspath` FIRST, AND THE REASON IS A FALSE ALARM THAT ONLY FIRES ON LINUX. For a
-            # RELATIVE `error_log` with one directory component — `logs/errors.log` — `dirname`
-            # of `logs` is `""`, and the old `or os.sep` fallback then made the parent the
-            # FILESYSTEM ROOT rather than the process's own working directory. `/` is not writable
-            # by any non-root uid, so the writability check below reported a perfectly healthy sink
-            # as broken, on exactly the containers this check was written for. `abspath` resolves
-            # a relative directory against the cwd, which is what the line above already does with
-            # its `or "."`, and is a no-op for the absolute paths the standard prescribes.
-            parent = os.path.dirname(os.path.abspath(directory))
-            if not os.path.isdir(parent):
-                return (f"error_log points into {directory!r}, and even its parent {parent!r} "
-                        f"does not exist — in a container that usually means the volume is not "
-                        f"mounted, so these records would be written into the disposable layer "
-                        f"and could not be read from the host")
-            # ⭐⭐ AN ABSENT DIRECTORY UNDER AN UNWRITABLE PARENT IS A PROBLEM, NOT THE ABSENCE OF
-            # ONE. This arm used to fall through to "" — so the one state in which the sink
-            # provably cannot be written was the state this reported healthy. The sink fails and
-            # its own detector says fine, for the same underlying cause, and an operator reading
-            # this to find out why alerting is quiet is told to look elsewhere. That is worse than
-            # having no detector, which is why it is a defect and not a missing nicety.
-            #
-            # The three states this function distinguishes are: checked and fine (""), checked and
-            # broken (this and the arms above), and could not check (the `except` below). The
-            # third is not the first, and this arm was collapsing the second into the first.
-            if not os.access(parent, os.W_OK):
-                return (f"error_log points into {directory!r}, which does not exist and cannot be "
-                        f"created: its parent {parent!r} is not writable by this process. The "
-                        f"sink will fail on the first WARN or ERROR alert — in a container this "
-                        f"is usually a uid mismatch on a bind-mounted volume")
+            # Asked the way `_append_error_record` writes: `makedirs` the directory, then open
+            # the leaf for append. `_sink_problem` walks to the first existing ancestor and asks
+            # about THAT (#22, #23) — see its docstring for the states the old arms got wrong.
+            return _sink_problem(path, label="error_log", creates_directories=True,
+                                 appends_in_place=True)
         except Exception as exc:  # noqa: BLE001 — a diagnostic must not become the failure
             return f"error_log could not be checked ({type(exc).__name__})"
-        return ""
 
     def warn_if_unconfigured(self) -> list[str]:
         """Boot check: report which channels are live, and WARN loudly if none are.
@@ -2079,10 +2158,26 @@ class Alerter:
         path = str(self.settings.state_file)
         tmp = f"{path}.tmp"
         try:
-            with open(tmp, "w", encoding="utf-8") as fh:
+            # ⭐ CREATED 0600 BY `os.open`, THE SAME WAY THE MARKER AND THE ERROR LOG ARE — not by
+            # `open()` at the umask's mode, which is what this was. The file persists every
+            # firing condition's TITLE, and an operator's titles are the identifying half of the
+            # message; a state file written 0644 into a shared appdata volume was readable by
+            # anything with that volume mounted. `os.replace` carries the temp's mode with it, so
+            # an existing wide file from an earlier build is narrowed on its next write with no
+            # `chmod` — the call that fails on a uid-mismatched mount (#21).
+            #
+            # REMOVED FIRST, THEN `O_EXCL`: a temp left behind by a killed process would
+            # otherwise lend its own mode to the marker-style rename. And removed again on
+            # failure, so a read-only mount does not accumulate a `.tmp` beside every boot.
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+            fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(self._prune(state), fh)
             os.replace(tmp, path)
         except Exception as exc:  # noqa: BLE001 — a read-only mount must not break alerting
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
             log.warning("could not save alert state to %s (%s) — recurring conditions will "
                         "re-alert", path, type(exc).__name__)
 

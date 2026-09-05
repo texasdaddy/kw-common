@@ -197,6 +197,7 @@ from __future__ import annotations
 import bisect
 import functools
 import json
+import os
 import re
 import subprocess
 import sys
@@ -308,7 +309,8 @@ PATTERNS: list[tuple[str, str]] = [
      r"|proton(?:mail)?|aol)\."),
     # Any UUID. Cloudflare Access policy ids look like this, and so do tenant/app ids — all of
     # which identify the estate. A legitimate one (a fixture, a migration revision) is meant to
-    # be added to ALLOW_LITERALS deliberately rather than waved through by a looser pattern.
+    # be added to the repository's `.leakguard.json` `allow_literals` deliberately — the injected
+    # form of ALLOW_LITERALS — rather than waved through by a looser pattern.
     # ⚠️ Bounded on the HEX CLASS, not with `\b` and not with `(?<![\w-])`. `_` is a word
     # character, so `\b` does NOT hold after it and `app_id_11111111-2222-...` walked straight
     # through — `<KEY>_<uuid>` is an ordinary config idiom and was the likeliest way for one of
@@ -367,9 +369,15 @@ PATTERNS: list[tuple[str, str]] = [
     # ("ci: fix path handling for C:\\Users\\runneradmin\\AppData\\Local\\Temp"), which is a red
     # nobody can clear without rewriting an already-reviewed commit. Same class as the built-ins,
     # same carve-out, one more spelling.
+    #
+    # ⚠️ `Administrator` IS THE FIFTH BUILT-IN, and it was missing (#11). It is the canonical
+    # Windows Server account, it names no person, and it appears in ordinary operating
+    # instructions and runbooks — the same class as `runneradmin`, added for the same reason. The
+    # bound `(?![\w.-])` keeps it exact: `Administrator2` and `Administrators` are not built-ins
+    # and still fire, which `_MUST_FAIL` pins.
     ("windows profile path",
      r"(?<![\w])(?:[A-Za-z]:|/mnt/[a-z]|%\w+%)[\\/]+Users[\\/]+"
-     r"(?!(?:Public|Default|Default User|All Users|runneradmin)(?![\w.-]))[\w.-]+"),
+     r"(?!(?:Public|Default|Default User|All Users|runneradmin|Administrator)(?![\w.-]))[\w.-]+"),
 ]
 
 # ⭐⭐ THE DENYLIST ABOVE IS WRITTEN FOR FILE CONTENT, AND TWO OF THE FIVE SURFACES ARE NOT CONTENT.
@@ -579,6 +587,15 @@ ALLOW_SPANS: tuple[str, ...] = (
     # rule at the top of this block is not a style note.
     r"(?<![\w-])\.env(?:\.(?:local|development|staging|production|preview|test|dev|prod|ci|qa"
     r"|sandbox))?\.local\b",
+    # ⭐ RFC 9562's NIL AND MAX UUIDs (#11) — the reserved placeholder convention for THAT shape,
+    # exactly as the RFC 5737 ranges above are for an address and `example.com` is for a host.
+    # All-zeroes and all-`f` identify nobody by construction, and they reach real repositories in
+    # ordinary ways: a `DEFAULT_TENANT` sentinel, a `.csproj` `ProjectGuid`, a migration's seed
+    # row. Bounded on the hex class on both sides, the same bound the deny pattern uses, so the
+    # span can contain exactly the deny match and nothing beside it: one digit different
+    # (`…-000000000001`) is outside the span and still fires, which `_MUST_FAIL` pins.
+    r"(?<![0-9a-f])0{8}-0{4}-0{4}-0{4}-0{12}(?![0-9a-f])",
+    r"(?<![0-9a-f])f{8}-f{4}-f{4}-f{4}-f{12}(?![0-9a-f])",
 )
 
 # Text-bearing formats are NEVER skipped — an SVG is XML and carries <title>/<desc>/href, and
@@ -1449,7 +1466,8 @@ def scan_path(rel_path: str) -> list[tuple[str, str]]:
       * A four-component VERSION directory in the `10.` range (`docs/10.0.0.1/`) IS matched, and
         that is a known over-match: `10.0.0.1` as a version and as an address are the same string.
         `192.168.*` and `172.16-31.*` have no such collision. Rename the directory, or add the
-        literal to `ALLOW_LITERALS`.
+        literal to `allow_literals` in the repository's `.leakguard.json` (the injected form of
+        `ALLOW_LITERALS`; the module constant is never edited).
       * `uuid` and `unraid pool path` do not apply here at all — see PATH_PATTERN_OVERRIDES.
 
     Line numbers are dropped: a path is one line by construction, and reporting `:1` on every
@@ -2278,9 +2296,22 @@ _MUST_FAIL: list[tuple[str, str]] = [
     # The same path as it is actually written in source: escaped inside a string literal.
     ("windows profile path", r'{"cache": "D:\\Users\\operator\\AppData\\Roaming"}'),
     ("windows profile path", "posix-separated too: C:/Users/operator/Documents"),
+    # ⭐ THE NEAR-MISSES OF THE TWO #11 CARVE-OUTS, so a later widening of either fails here with
+    # a reason. `Administrator2`/`Administrators` are accounts somebody created; one digit off the
+    # nil UUID is a real id.
+    ("windows profile path", r"profile at C:\Users\Administrator2\AppData\Local\svc"),
+    ("windows profile path", r"group dir C:\Users\Administrators\shared"),
+    ("uuid (access policy / tenant id)", "TENANT=00000000-0000-0000-0000-000000000001"),
+    ("uuid (access policy / tenant id)", "TENANT=ffffffff-ffff-ffff-ffff-fffffffffff0"),
 ]
 
 _MUST_PASS: list[str] = [
+    # ⭐ THE TWO #11 CARVE-OUTS: a Windows built-in account, and RFC 9562's nil/max UUIDs. Every
+    # one of these identifies nobody and no machine, and each reddened a correct tree.
+    r"log files land in C:\Users\Administrator\AppData\Local\Temp",
+    "DEFAULT_TENANT = '00000000-0000-0000-0000-000000000000'",
+    "MAX_UUID = 'ffffffff-ffff-ffff-ffff-ffffffffffff'  # RFC 9562",
+    "<ProjectGuid>{FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF}</ProjectGuid>",
     "host='198.51.100.5'  # RFC5737",
     "peer 192.0.2.1 rejected",
     "doc range 203.0.113.9 is fine",
@@ -2845,9 +2876,14 @@ def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
         print(f"UNREADABLE as UTF-8 ({len(undecodable)}) - not scanned, so not cleared:")
         for u in undecodable:
             print("  " + _ascii(u))
-        print("If it is binary, add its suffix to SKIP_SUFFIXES; if it is text, fix the "
-              "encoding; if it is staged-but-deleted, re-stage it so the scan sees what the "
-              "commit will contain.\n")
+        # ⚠️ NOT "add its suffix to SKIP_SUFFIXES". That list is a constant of the INSTALLED
+        # engine — there is no per-repository way to extend it — so the old sentence told an
+        # operator to edit a library, which is the fork this package exists to end. What they
+        # can do is stated instead, and the list is printed so nobody has to open the module.
+        print("If it is binary, keep it under one of the asset suffixes this scanner skips ("
+              + " ".join(SKIP_SUFFIXES) + " - the list is fixed in the engine, not per "
+              "repository); if it is text, fix the encoding; if it is staged-but-deleted, "
+              "re-stage it so the scan sees what the commit will contain.\n")
     if findings:
         # ⚠️ NOT "this repo is public". That was true of the one repository this guard used to be
         # vendored into and is false for most of the repositories it now scans — and a message
@@ -2981,8 +3017,10 @@ def _scan_staged(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int
               f"CLEARED:")
         for u in unscannable:
             print("  " + _ascii(u.strip()))
-        print("Add a binary suffix to SKIP_SUFFIXES if that is what it is, or stage the file as "
-              "UTF-8 text.\n")
+        # The same correction as the tree scan's banner: the suffix list cannot be extended per
+        # repository, so the remedy names the suffixes that exist rather than an edit to a library.
+        print("If it is an asset, keep it under a suffix this scanner skips ("
+              + " ".join(SKIP_SUFFIXES) + "); otherwise stage the file as UTF-8 text.\n")
     if findings:
         # ⚠️ NOT "this repo is public" — the SAME correction the tree and range banners carry, and
         # this surface was missed when they were fixed: the instance, not the class, in an edit
@@ -3052,10 +3090,11 @@ def _scan_commits(root: Path, rev_range: str,
         # mis-encoded — so it left the operator chasing a problem that does not exist. Each marker
         # now CARRIES its own remediation (see `_unparsed_header`) rather than
         # having this site try to recognise one after the sigil has been stripped for display.
-        print("For an ordinary path above: add a binary suffix to SKIP_SUFFIXES if that is what "
-              "it is, or commit the file as UTF-8 text. A file that DECODES but carries a NUL "
-              "byte is refused here too - BOM-less UTF-16/UTF-32 is valid UTF-8 and would scan "
-              "as nothing, so it is not cleared.\n")
+        print("For an ordinary path above: if it is an asset, keep it under a suffix this "
+              "scanner skips (" + " ".join(SKIP_SUFFIXES) + "); otherwise commit the file as "
+              "UTF-8 text. A file that DECODES but carries a NUL byte is refused here too - "
+              "BOM-less UTF-16/UTF-32 is valid UTF-8 and would scan as nothing, so it is not "
+              "cleared.\n")
     if result.findings:
         # ⚠️ `_ascii` HERE TOO. This is the line that ANNOUNCES a real leak, and with a non-ASCII
         # branch name in `rev_range` it died mid-sentence under a hook's cp1252 stdout — the guard
@@ -3096,10 +3135,31 @@ def _scan_commits(root: Path, rev_range: str,
 
 
 def repo_root(start: str | None) -> Path:
-    """The top level of the repository to scan."""
-    return Path(subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=start,
-                               capture_output=True, check=True, text=True,
-                               timeout=_GIT_TIMEOUT_S).stdout.strip())
+    """The top level of the repository to scan, or a `UsageError` saying why there is none.
+
+    ⭐ A DIRECTORY THAT IS NOT INSIDE A REPOSITORY IS A USAGE ERROR, NOT A TRACEBACK (#12). This
+    used to let `CalledProcessError` escape `main`, so a mistyped `--repo` printed a stack trace
+    and exited 1 — fail-closed, but `USAGE` reserves exit 2 for exactly this, and the guard is a
+    console script on the PATH of every consuming repository, where a traceback is what a wrong
+    path looks like to somebody who has never read this file.
+
+    ⚠️ THE DISTINCTION THIS FILE DRAWS EVERYWHERE ELSE IS KEPT: "this is not a repository" is a
+    usage error, while "git could not be run at all" is an environment failure and must not be
+    reported as a verdict on the tree — so a missing `git` executable (`FileNotFoundError` from
+    `subprocess` itself, when `start` IS a directory) still propagates as what it is.
+    """
+    if start is not None and not os.path.isdir(start):
+        raise UsageError(f"--repo {start!r} is not a directory")
+    try:
+        out = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=start,
+                             capture_output=True, check=True, timeout=_GIT_TIMEOUT_S)
+    except subprocess.CalledProcessError as exc:
+        where = start if start is not None else os.getcwd()
+        said = exc.stderr.decode("utf-8", errors="replace").strip()
+        raise UsageError(
+            f"--repo {where!r} is not inside a git repository, so there is nothing to scan"
+            + (f" (git said: {said})" if said else "")) from None
+    return Path(out.stdout.decode("utf-8", errors="replace").strip())
 
 
 def main(argv: list[str]) -> int:
@@ -3118,7 +3178,13 @@ def main(argv: list[str]) -> int:
         # bite", which is a property of this package and not of any repository.
         return selftest(compile_patterns())
 
-    root = repo_root(args.repo)
+    try:
+        root = repo_root(args.repo)
+    except UsageError as exc:
+        # The same exit and the same shape as a bad flag: `USAGE` promises 2 for a usage error,
+        # and pointing `--repo` at the wrong directory is one (#12).
+        print(f"{exc}\n\n{USAGE}", file=sys.stderr)
+        return 2
     # ⛔ THE CONFIG IS LOADED AND APPLIED BEFORE ANY PATTERN IS COMPILED FOR A SCAN. Both steps
     # can refuse — an unreadable or self-defeating config exits 2 rather than scanning under
     # rules nobody chose. `compile_patterns()` is called AFTER `apply_config` because a scan must

@@ -42,6 +42,12 @@ jobs:
       # `python scripts/check_no_internal_info.py`, which is a path that no longer exists: had it
       # been left, the first `v*` tag would have failed the publish with a FileNotFoundError, and
       # the failure would have looked like a broken workflow rather than a stale invocation.
+      #
+      # ⛔ `-e` IS LOAD-BEARING FOR THE RANGE SCAN BELOW (#13): the guard skips its own synthetic
+      # deny corpus by PATH relative to the scanned root, and a range scan has no bytes to
+      # recognise it by. An editable install resolves `__file__` inside this checkout; a
+      # site-packages install does not, and the range scan over this repository's history then
+      # reports the corpus. Same comment as `ci.yml`; `tests/test_leak_guard_hook.py` pins both.
       - name: Install the package (the guard ships inside it)
         run: |
           python -m pip install --upgrade pip

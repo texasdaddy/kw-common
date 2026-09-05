@@ -861,6 +861,28 @@ def test_the_PUBLISHING_workflow_carries_every_packaging_assertion_the_PR_workfl
         f"{sorted(rel_required - ci_required)}")
 
 
+@pytest.mark.parametrize("workflow", [CI_WORKFLOW, RELEASE_WORKFLOW], ids=["ci", "release"])
+def test_the_leak_guard_job_installs_the_package_EDITABLE_because_the_range_scan_needs_it(
+        workflow: Path) -> None:
+    """⭐ #13. The guard recognises its own source by PATH relative to the scanned root and by
+    BYTES, and a range scan has no bytes — so on THIS repository, the only one whose history
+    contains the engine, a `--range` scan from a site-packages install reports the engine's own
+    synthetic corpus (measured: 105 findings, none a leak). `pip install -e .` is what keeps
+    `__file__` inside the checkout, and nothing but this test says so where the line is."""
+    text = workflow.read_text(encoding="utf-8")
+    start = text.index("  no-internal-info:")
+    end = text.index("\n  test:", start)
+    job = text[start:end]
+    assert "python -m pip install -e ." in job, (
+        f"{workflow.name}: the leak-guard job no longer installs the package EDITABLE, so its "
+        f"range scan will report the engine's own deny corpus as 105 leaks (#13)")
+    assert not re.search(r"pip install \.\s*$", job, re.MULTILINE), (
+        f"{workflow.name}: a non-editable install in the leak-guard job")
+    assert "kw-leak-guard --range" in job, (
+        f"{workflow.name}: the job no longer runs a range scan, so the premise of this test is "
+        f"gone — re-read #13 before deleting it")
+
+
 def test_the_py_typed_marker_exists_and_is_declared_as_package_data() -> None:
     """⛔ WITHOUT IT A CONSUMER'S MYPY IGNORES EVERY ANNOTATION IN THIS PACKAGE, SILENTLY.
 
