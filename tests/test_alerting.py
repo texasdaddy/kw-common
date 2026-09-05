@@ -2473,8 +2473,12 @@ def test_the_detector_agrees_with_the_sink_about_whether_it_can_be_written(
     be, or the detector is one an operator switches off.
     """
     error_log = _plant(tmp_path, state)
-    outcome = _sink_outcome(error_log)
+    # ⚠️ THE DETECTOR FIRST. The sink's own sequence MUTATES the filesystem (`makedirs` creates the
+    # directory a trailing-separator path names), and asked afterwards the detector was answering
+    # a different question — the mutation matrix measured the trailing-separator arm as removable
+    # with this test green, because the sink had already turned the leaf into a directory.
     problem = Alerter(AlertSettings(service="svc", error_log=error_log)).error_log_problem()
+    outcome = _sink_outcome(error_log)
     if outcome:
         assert problem != "", f"the sink raises {outcome} here and the detector says no problem"
         assert "could not be checked" not in problem, (

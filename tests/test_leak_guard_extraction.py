@@ -214,6 +214,26 @@ def test_a_repo_path_outside_any_repository_is_a_usage_error_not_a_traceback(
     assert "is not a directory" in _out(absent), _out(absent)
 
 
+def test_the_self_identity_normalises_the_guards_OWN_line_endings_too(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_own_source_lf` caches the LF form of the engine's own bytes. The mutation "return the raw
+    bytes instead" is EQUIVALENT on an LF checkout — every existing line-ending test compares a
+    CRLF COPY against an LF original — and only bites the other way round: an `autocrlf`
+    checkout of the engine (CRLF on disk) scanning an LF copy of itself. Planted here, because
+    the mutation matrix measured it as a survivor for exactly that reason."""
+    lf = guard._own_source_bytes()
+    assert lf is not None and b"\r\n" not in lf, "premise: the engine's own source is LF here"
+    crlf = lf.replace(b"\n", b"\r\n")
+    monkeypatch.setattr(guard, "_own_source_bytes", lambda: crlf)
+    guard._own_source_lf.cache_clear()
+    try:
+        assert guard._is_self("anything.py", None, lf) is True, (
+            "an LF copy of a CRLF-checked-out engine was not recognised as the engine")
+        assert guard._is_self("anything.py", None, lf + b"# extra\n") is False
+    finally:
+        guard._own_source_lf.cache_clear()
+
+
 def test_selftest_REFUSES_a_config_rather_than_ignoring_one(tmp_path: Path) -> None:
     """⚠️ A MUTATION SURVIVOR until this was written, which is why it is here.
 

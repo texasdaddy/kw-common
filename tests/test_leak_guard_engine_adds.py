@@ -62,7 +62,6 @@ WHY THIS FILE EXISTS
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -194,9 +193,19 @@ _ADDR = "192.168." + "77.77"       # assembled: this file is scanned by the guar
 _HOST = "host-a" + ".lan"
 
 
-@pytest.mark.skipif(os.name != "posix",
-                    reason="a real symlink; Windows checks a link out as a text file holding "
-                           "the link text, which takes the ordinary read path")
+def _link(repo: Path, name: str, target: Path) -> None:
+    """A REAL symlink, stored as a 120000 entry. Skips where the platform refuses to create one
+    (Windows without developer mode) rather than passing over nothing — and adds it under
+    `core.symlinks=true` so git stores the link even on a platform whose default is to read
+    through it, which is what makes this measurable on the workstation and not only in CI."""
+    try:
+        (repo / name).symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"this platform cannot create a symlink here ({type(exc).__name__})")
+    _git(repo, "-c", "core.symlinks=true", "add", name)
+    assert _git(repo, "ls-files", "-s", name).startswith("120000"), "premise: a link entry"
+
+
 def test_a_tracked_symlink_is_scanned_as_its_link_text_not_its_target(tmp_path: Path) -> None:
     """⛔ A SYMLINK PUBLISHES ITS LINK TEXT. `read_bytes` follows the link, so the tree scan used
     to read whatever it pointed at and never the one thing git stores for it. Measured by the
@@ -209,9 +218,7 @@ def test_a_tracked_symlink_is_scanned_as_its_link_text_not_its_target(tmp_path: 
     (outside / "notes.txt").write_bytes(b"clean\n")
     repo = tmp_path / "links"
     _seeded(repo)
-    (repo / "link").symlink_to(Path("..") / _HOST / "notes.txt")
-    _git(repo, "add", "link")
-    assert _git(repo, "ls-files", "-s", "link").startswith("120000"), "premise: a link entry"
+    _link(repo, "link", Path("..") / _HOST / "notes.txt")
     res = _cli(repo)
     assert res.returncode == 1, _out(res)
     assert f"link:1: private lan domain: {_HOST!r}" in _out(res), _out(res)
@@ -221,8 +228,7 @@ def test_a_tracked_symlink_is_scanned_as_its_link_text_not_its_target(tmp_path: 
     (plain / "notes.txt").write_bytes(f"AGENT={_ADDR}\n".encode())
     clean = tmp_path / "clean-link"
     _seeded(clean)
-    (clean / "link").symlink_to(Path("..") / "plain" / "notes.txt")
-    _git(clean, "add", "link")
+    _link(clean, "link", Path("..") / "plain" / "notes.txt")
     res = _cli(clean)
     assert res.returncode == 0, f"foreign content behind a clean link was scanned:\n{_out(res)}"
 
