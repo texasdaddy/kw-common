@@ -2218,9 +2218,14 @@ def test_a_working_volume_with_an_uncreated_subtree_is_not_reported_unmounted(
     the one that gets switched off."""
     missing = tmp_path / "svc" / "logs" / "svc-errors.log"
     alerter = Alerter(AlertSettings(service="svc", error_log=str(missing)))
-    assert alerter.error_log_problem() == ""
-    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
-        alerter.warn_if_unconfigured()
+    # ⚠️ `os.name` PINNED, like its twin below. The arm this test guards against is POSIX-gated,
+    # so on Windows the assertion measured nothing and a mutation making it fire for ANY missing
+    # directory survived the matrix here. Pinned, the claim is asserted on every platform.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(alerting.os, "name", "posix")
+        assert alerter.error_log_problem() == ""
+        with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+            alerter.warn_if_unconfigured()
     assert "the volume is not mounted" not in caplog.text
     # And the sink really does work there, so "" is the right answer rather than a lucky one.
     alerter.notify(ERROR, "svc: down", "no route to host")
@@ -2565,10 +2570,16 @@ def test_a_state_file_under_a_missing_directory_is_still_reported_missing(tmp_pa
     the state file a missing directory is a problem outright, while for the error log it is the
     fresh-container case `makedirs` handles. One walk, two answers, by design."""
     missing = tmp_path / "svc" / "state.json"
-    assert "does not exist" in Alerter(AlertSettings(service="svc", state_file=str(missing))
-                                       ).state_file_problem()
-    assert Alerter(AlertSettings(service="svc", error_log=str(tmp_path / "svc" / "errors.log"))
-                   ).error_log_problem() == ""
+    # `os.name` pinned for the same reason as the twin above: the "not mounted" arm that must NOT
+    # claim this one is POSIX-gated, so without the pin a mutation letting it answer for the
+    # state file survives on Windows.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(alerting.os, "name", "posix")
+        assert "does not exist" in Alerter(AlertSettings(service="svc", state_file=str(missing))
+                                           ).state_file_problem()
+        assert Alerter(AlertSettings(service="svc",
+                                     error_log=str(tmp_path / "svc" / "errors.log"))
+                       ).error_log_problem() == ""
 
 
 @posix_only
@@ -3083,6 +3094,11 @@ def test_the_config_repr_shows_a_non_mapping_email_as_it_is_rather_than_raising(
     for email in ("", [], None):
         text = repr(AlertConfig(email=email))  # type: ignore[arg-type]
         assert f"email={email!r}" in text
+    # ⭐ AND THE MASKING FOLLOWS THE KEY, NOT THE CONCRETE TYPE: a `MappingProxyType` carrying
+    # the password was shown unmasked while an `isinstance(..., dict)` test decided it.
+    from types import MappingProxyType
+    proxied = repr(AlertConfig(email=MappingProxyType({"SMTP_PASSWORD": CANARY_PASSWORD})))
+    assert CANARY_PASSWORD not in proxied and "<set>" in proxied
 
 
 def test_a_non_object_state_file_is_rewritten_so_the_warning_fires_once(

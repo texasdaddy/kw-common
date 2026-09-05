@@ -67,7 +67,10 @@ again). Every fix carries the test that would have caught it.
   reported with the errno. A generation that simply does not exist yet is still silent.
 - **A state file holding valid JSON that is not an object gets the same WARNING invalid JSON
   gets**, and a state entry that is not a record says so when it is replaced. Both became `{}`
-  in silence one branch below the line the unparseable case earns.
+  in silence one branch below the line the unparseable case earns. ⚠️ The READ rewrites such a
+  file empty, so the line fires once rather than on every notification — an `OK` never writes
+  the state file unless it clears something, and a heartbeat-only service would otherwise have
+  read the same list forever. Where the rewrite itself fails, "could not save" appears beside it.
 - **`email_ready()` refuses the credential the send path refuses.** A non-ASCII `SMTP_USER` or
   `SMTP_PASSWORD` was rejected by `_send_email` (before smtplib could quote the character) and
   reported READY by the readiness check — so the boot report and `validate_boot` called usable a

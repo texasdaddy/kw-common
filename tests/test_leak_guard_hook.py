@@ -908,7 +908,11 @@ def test_the_leak_guard_job_cannot_be_made_advisory(workflow: Path) -> None:
     job = text[text.index("  no-internal-info:"):text.index("\n  test:")]
     code = "\n".join(ln for ln in job.splitlines() if not ln.strip().startswith("#"))
     assert "continue-on-error" not in code, f"{workflow.name}: the leak-guard job is advisory"
-    assert not re.search(r"^\s+if:", code, re.MULTILINE), (
+    # ⚠️ `(?:-\s+)?` — a step whose FIRST key is the condition is spelled `- if: …` with the
+    # list dash in front, and the bare `^\s+if:` form walked past it: the confirming pass planted
+    # exactly that on the tree-scan step and this test stayed green while the guard was skipped
+    # on every pull request and the required check still reported success.
+    assert not re.search(r"^\s+(?:-\s+)?if:", code, re.MULTILINE), (
         f"{workflow.name}: the leak-guard job or a step in it is conditional — a skipped "
         f"required check satisfies branch protection")
     invocations = [ln for ln in code.splitlines() if "kw-leak-guard" in ln]

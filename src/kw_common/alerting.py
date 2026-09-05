@@ -198,7 +198,7 @@ import sys
 import time
 import urllib.request
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
@@ -934,10 +934,15 @@ class AlertConfig:
         """
         # ⚠️ A NON-MAPPING `email` (a hand-built config; the send path tolerates any falsy value
         # via `cfg.email or {}`) is shown as it is rather than raising: a repr that raises turns
-        # a `%r` log line into "--- Logging error ---" on stderr and drops the record. There is
-        # nothing to mask in a value that has no `SMTP_PASSWORD` key.
+        # a `%r` log line into "--- Logging error ---" on stderr and drops the record.
+        #
+        # ⭐ `Mapping`, NOT `dict` — the masking must follow the KEY, not the concrete type. A
+        # `MappingProxyType` or any other Mapping carrying `SMTP_PASSWORD` was shown unmasked by
+        # the `dict` test, which is the leak this method exists to close arriving through a
+        # different container. `AlertConfig.load` only ever builds a plain dict; a consumer
+        # hand-building one is exactly the population the rest of this module's backstops serve.
         email: object = self.email
-        if isinstance(email, dict):
+        if isinstance(email, Mapping):
             email = {key: (("<set>" if value else "<unset>") if key == "SMTP_PASSWORD" else value)
                      for key, value in email.items()}
         return (f"AlertConfig(ntfy_url={self.ntfy_url!r}, email={email!r}, "
@@ -1864,10 +1869,16 @@ def _sink_problem(path: str, *, label: str, creates_directories: bool,
         # mounted: `makedirs` would then succeed inside the disposable layer, which is the
         # retrieval failure this sink exists to fix, arriving disguised as success.
         #
-        # ⚠️ POSIX ONLY, and the gate is what found the need: on Windows a DRIVE ROOT is a
-        # volume — `C:\svc-logs\errors.log` is an ordinary, host-reachable place to write — and
-        # this arm reddened it while the sink wrote there perfectly well (measured). Off POSIX
-        # the walk falls through to the writability check below, which is the honest answer.
+        # ⚠️ THE `at_root` HALF IS POSIX ONLY, and the gate is what found the need: on Windows a
+        # DRIVE ROOT is a volume — `C:\svc-logs\errors.log` is an ordinary, host-reachable place
+        # to write — and this arm reddened it while the sink wrote there perfectly well
+        # (measured). Off POSIX a path under an EXISTING root falls through to the writability
+        # check below, which is the honest answer.
+        #
+        # ⚠️ The `not lexists(probe)` half is NOT gated, and that is deliberate rather than an
+        # oversight: it means the walk ran out of ancestors without finding one — a drive letter
+        # that does not exist at all (`Z:\svc\logs`), which is a volume that is not there. The
+        # sentence is the right one for it on both platforms.
         return (f"{label} points into {directory!r}, and nothing on the way to it exists except "
                 f"the filesystem root — in a container that usually means the volume is not "
                 f"mounted, so these records would be written into the disposable layer and "
@@ -2174,9 +2185,12 @@ class Alerter:
             log.warning("alert state %s holds a JSON %s, not an object — treating every "
                         "condition as new, so this alert goes out, and the file is being "
                         "rewritten empty", path, type(data).__name__)
-            # ⭐ REWRITTEN HERE, so the line fires ONCE. An OK never writes the state file unless
-            # it clears something, so a service that only ever sends heartbeats would have read
-            # the same list and warned on every notification forever (the gate measured it).
+            # ⭐ REWRITTEN HERE, so the line fires once WHERE THE REWRITE LANDS. An OK never
+            # writes the state file unless it clears something, so a service that only ever
+            # sends heartbeats read the same list and warned on every notification forever (the
+            # gate measured it). On a mount where the rewrite itself fails, the warning does
+            # recur — with `_write_state`'s own "could not save" line beside it saying why,
+            # which is the pair an operator needs rather than a repeat with no cause.
             self._write_state({})
             return {}
         return data
@@ -2238,8 +2252,10 @@ class Alerter:
             # `ValueError` as well as `OSError`, BOTH times: a NUL in `state_file` raises it from
             # `unlink`, and in the cleanup arm below that escaped the `except` — so the one
             # function documented as never letting a failure reach its caller raised, and
-            # `notify()`'s fail-open guard then logged an ERROR with a traceback per alert
-            # (the gate measured it; 1.4.0 logged one WARNING).
+            # `notify()`'s fail-open guard then logged an ERROR with a traceback per alert.
+            # What the repair removes is that ERROR and its traceback; the two "unreadable"
+            # WARNINGs either side of it are what 1.4.0 logged for the same setting and are
+            # unchanged (three per WARN notify, measured — the reads are separate from this).
             with contextlib.suppress(OSError, ValueError):
                 os.unlink(tmp)
             fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
