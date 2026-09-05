@@ -1165,15 +1165,22 @@ def test_a_non_ascii_smtp_credential_is_refused_before_smtplib_sees_it(
     monkeypatch.setattr(alerting.smtplib, "SMTP", FakeSMTP)
     FakeSMTP.instances = []
 
+    # The READINESS check now refuses it first (the audit found readiness saying READY for a
+    # credential the send path refused), so through `notify()` the channel is skipped, not
+    # failed — and the send-path refusal is asked of `_send_email` directly below, because the
+    # two are separate guards and either alone was measured insufficient.
     with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
-        assert Alerter(settings).notify(ERROR, "t", "m") == {"email": "failed"}
+        assert Alerter(settings).notify(ERROR, "t", "m") == {"email": "skipped"}
+        with pytest.raises(ValueError, match="SMTP_PASSWORD") as excinfo:
+            alerting._send_email(Alerter(settings).config(), alerting.SEVERITIES[ERROR], "t", "m")
 
     # Not one byte of the credential went anywhere: no connection was even opened.
     assert FakeSMTP.instances == [], "the refusal must happen BEFORE a socket is opened"
     assert "SMTP_PASSWORD" in caplog.text, "the SETTING is named, which is the actionable half"
-    assert "15-character value" in caplog.text, "its shape is named, exactly like SMTP_PORT's"
+    assert "15-character value" in str(excinfo.value), "its shape is named, like SMTP_PORT's"
     for fragment in ("ä", "ö", "\\xe4", "\\xf6", "position "):
         assert fragment not in caplog.text, f"{fragment!r} reached the log"
+        assert fragment not in str(excinfo.value), f"{fragment!r} reached the exception"
 
 
 def test_the_same_refusal_covers_the_user_not_only_the_password(
@@ -1189,10 +1196,12 @@ def test_the_same_refusal_covers_the_user_not_only_the_password(
     FakeSMTP.instances = []
 
     with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
-        assert Alerter(settings).notify(ERROR, "t", "m") == {"email": "failed"}
+        assert Alerter(settings).notify(ERROR, "t", "m") == {"email": "skipped"}
+        with pytest.raises(ValueError, match="SMTP_USER") as excinfo:
+            alerting._send_email(Alerter(settings).config(), alerting.SEVERITIES[ERROR], "t", "m")
     assert FakeSMTP.instances == []
     assert "SMTP_USER" in caplog.text
-    assert "ö" not in caplog.text
+    assert "ö" not in caplog.text and "ö" not in str(excinfo.value)
 
 
 def test_an_ascii_credential_still_sends(
@@ -2881,6 +2890,102 @@ def test_a_stale_state_temp_is_not_reused_and_a_failed_write_leaves_none(
         Alerter(settings).notify(ERROR, "svc: other", "x")  # must not raise
     assert "could not save alert state" in caplog.text
     assert not tmp.exists(), "a failed rename left its temp behind"
+
+
+# ================================ the audit's silent-failure siblings of #21 / #22
+def test_a_generation_the_roller_cannot_shift_is_reported_not_swallowed(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The roller's shift loop was `except OSError: pass` — the exact shape #21 fixed one
+    function up. A `.2` that is a directory leaves `.1` in place and the unconditional move
+    then OVERWRITES it: the oldest records are gone and, before this, nothing said so (measured
+    by the audit: an empty log). The roll still happens; the loss is reported, with the errno."""
+    live = tmp_path / "errors.log"
+    live.write_text("x" * 50 + "\n", encoding="utf-8")
+    (tmp_path / "errors.log.1").write_text('{"title": "GEN1"}\n', encoding="utf-8")
+    (tmp_path / "errors.log.2").mkdir()
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        alerting._roll_error_log(str(live), max_bytes=10, backups=2)
+    assert "could not shift the error-log generation" in caplog.text
+    assert ".1 to .2" in caplog.text
+    assert not live.exists(), "the roll must still happen — refusing it lets the live file grow"
+    assert "GEN1" not in (tmp_path / "errors.log.1").read_text(encoding="utf-8"), (
+        "premise: the overwrite this warning describes did not happen")
+
+
+def test_a_missing_generation_is_still_silent(tmp_path: Path,
+                                              caplog: pytest.LogCaptureFixture) -> None:
+    """The normal case — the log has not rolled `backups` times yet — must stay quiet, or the
+    warning above is one an operator learns to ignore."""
+    live = tmp_path / "errors.log"
+    live.write_text("x" * 50 + "\n", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        alerting._roll_error_log(str(live), max_bytes=10, backups=3)
+    assert caplog.records == []
+    assert (tmp_path / "errors.log.1").exists()
+
+
+@pytest.mark.parametrize("content, kind", [("[]", "list"), ("null", "NoneType"),
+                                           ('"text"', "str"), ("42", "int")])
+def test_a_state_file_that_is_valid_json_but_not_an_object_is_said_not_swallowed(
+        settings: AlertSettings, caplog: pytest.LogCaptureFixture, content: str,
+        kind: str) -> None:
+    """Valid JSON that is not a mapping became `{}` in silence, one branch below the WARNING
+    that unparseable content earns — so a firing condition re-paged once and the file was
+    quietly overwritten with nothing in the log to explain it. Same line, same level, now."""
+    Path(settings.state_file or "").write_text(content, encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        assert Alerter(settings)._read_state() == {}
+    assert f"holds a JSON {kind}, not an object" in caplog.text
+
+
+def test_a_state_entry_that_is_not_a_record_is_said_when_it_is_replaced(
+        settings: AlertSettings, caplog: pytest.LogCaptureFixture) -> None:
+    Path(settings.state_file or "").write_text(json.dumps({"svc: down": 5}), encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        results = Alerter(settings).notify(ERROR, "svc: down", "x")
+    assert results["ntfy"] == "sent"
+    assert "the state entry for 'svc: down' is a JSON int, not a record" in caplog.text
+    stored = json.loads(Path(settings.state_file or "").read_text(encoding="utf-8"))
+    assert isinstance(stored["svc: down"], dict) and stored["svc: down"]["count"] == 1
+
+
+@pytest.mark.parametrize("key", ["SMTP_USER", "SMTP_PASSWORD"])
+def test_email_readiness_refuses_the_credential_the_send_path_refuses(
+        settings: AlertSettings, caplog: pytest.LogCaptureFixture, key: str) -> None:
+    """`_send_email` rejects a non-ASCII `SMTP_USER`/`SMTP_PASSWORD` before smtplib can quote
+    the character — and `email_ready()` said READY for exactly that credential, so the boot
+    report and `validate_boot` called usable a channel that then failed every send: the
+    "dead while looking configured" failure this module names as its worst. The readiness
+    check now makes the send path's refusal first. Key NAME in the log, never the value."""
+    write_email_config(settings, **{key: "päss-CANARY-91c"})
+    with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
+        ready = Alerter(settings).config().email_ready()
+    assert ready is False
+    assert f"{key} in" in caplog.text and "non-ASCII" in caplog.text
+    assert "CANARY-91c" not in caplog.text, "the value must not be echoed"
+
+
+def test_a_partial_recipient_refusal_is_reported_not_counted_as_delivered(
+        settings: AlertSettings, fake_smtp: type[FakeSMTP], monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """`send_message` raises only when EVERY recipient is refused; when some are, it RETURNS
+    them and the send counts as delivered — so the operator who was dropped never hears from
+    this service again, and nothing said so (measured). The COUNT is logged, never the
+    addresses: this line repeats per alert."""
+    write_email_config(settings, EMAIL_TO="ops@example.com; second@example.com")
+
+    def refuse_one(self: FakeSMTP, msg: object) -> dict[str, tuple[int, bytes]]:
+        self.calls.append("send_message")
+        self.sent.append(msg)
+        return {"second@example.com": (550, b"5.1.1 recipient rejected")}
+
+    monkeypatch.setattr(fake_smtp, "send_message", refuse_one)
+    monkeypatch.setattr(alerting, "_CHANNELS", (("email", alerting._send_email),))
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        results = Alerter(settings).notify(ERROR, "svc: down", "x")
+    assert results["email"] == "sent", "one recipient did get it; that is not a failure"
+    assert "the server refused 1 of 2" in caplog.text
+    assert "second@example.com" not in caplog.text, "addresses stay out of the per-alert line"
 
 
 @posix_only

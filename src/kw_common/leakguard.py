@@ -1107,12 +1107,21 @@ def _is_self(rel_path: str, root: Path | None = None, data: bytes | None = None)
     if data is None:
         return False
     own = _own_source_bytes()
-    return own is not None and (data == own or _lf(data) == _lf(own))
+    return own is not None and (data == own or _lf(data) == _own_source_lf())
 
 
 def _lf(data: bytes) -> bytes:
     """CRLF-normalised, so "is this my own source" is not a question about the checkout's config."""
     return data.replace(b"\r\n", b"\n")
+
+
+@functools.cache
+def _own_source_lf() -> bytes | None:
+    """`_lf` of this module's own bytes, computed once. It was recomputed over ~200 KB for EVERY
+    tracked file the tree scan read — measured at 0.3 ms a file, which is a real fraction of a
+    scan's time for a question whose answer never changes within a run."""
+    own = _own_source_bytes()
+    return None if own is None else _lf(own)
 
 
 @functools.cache
@@ -1197,16 +1206,22 @@ def gitlinks(root: Path) -> set[str]:
     this, adding a submodule makes the repository permanently RED on a path whose contents are a
     different repository's business and are scanned by that repository's own guard.
     """
+    return {path for path, mode in _index_modes(root).items() if mode.startswith("160000")}
+
+
+def _index_modes(root: Path) -> dict[str, str]:
+    """Repo-relative path -> git MODE for every index entry (`100644`, `100755`, `120000`,
+    `160000`), asked of `git ls-files -s` once. Shared by the submodule filter and the symlink
+    branch of the tree scan, so the two read one listing rather than two."""
     out = subprocess.run(["git", "ls-files", "-s", "-z"], cwd=root, capture_output=True,
                          check=True, timeout=_GIT_TIMEOUT_S)
-    found: set[str] = set()
+    modes: dict[str, str] = {}
     for entry in out.stdout.decode("utf-8", errors="replace").split("\0"):
         if not entry:
             continue
         meta, _, path = entry.partition("\t")
-        if meta.startswith("160000"):
-            found.add(path)
-    return found
+        modes[path] = meta.split(" ", 1)[0]
+    return modes
 
 
 def compile_patterns() -> list[tuple[str, re.Pattern[str]]]:
@@ -1396,12 +1411,16 @@ def scan_text(text: str, compiled: list[tuple[str, re.Pattern[str]]],
     no-silent-hangs rule forbids.
     """
     hits: list[tuple[int, str, str]] = []
+    # ⚡ THE PATH EXEMPTION IS A PROPERTY OF THE FILE, NOT OF THE LINE — asked once here rather
+    # than once per (line × pattern), which is where it was: ~150,000 calls answering a constant
+    # on a tree scan of this repository, about a sixth of the scan's time (measured). Same
+    # answer, same order, one evaluation.
+    active = [(label, rx) for label, rx in compiled
+              if not (rel_path and _exempt(label, rel_path))]
     for lineno, line in enumerate(_lines(text), start=1):
         permitted = _permitted_spans(line)
         starts, best = _containment_index(permitted) if permitted else ([], [])
-        for label, rx in compiled:
-            if rel_path and _exempt(label, rel_path):
-                continue
+        for label, rx in active:
             if not permitted:
                 # ⚡ THE ORDINARY CASE — no allowlist token on this line, so nothing can be
                 # suppressed and the first match is the answer. Kept as its own branch because the
@@ -2142,7 +2161,8 @@ def _rev_tokens(rev_range: str) -> list[str]:
     return out
 
 
-def refs_being_published(root: Path, rev_range: str) -> list[tuple[str, str, str]]:
+def refs_being_published(root: Path, rev_range: str,
+                         unreadable: list[str] | None = None) -> list[tuple[str, str, str]]:
     """[(kind, sha, text)] for every TAG OBJECT the range NAMES.
 
     ⛔⛔ REF **NAMES** ARE NOT SCANNED HERE, AND THAT IS A DELIBERATE REVERT RATHER THAN AN
@@ -2206,6 +2226,14 @@ def refs_being_published(root: Path, rev_range: str) -> list[tuple[str, str, str
                     break
                 body = _git(root, "cat-file", "tag", sha)
             except subprocess.CalledProcessError:
+                # ⛔ NOT A SILENT `break`. A tag object git cannot read is a tag object this scan
+                # cannot vouch for, and dropping it made the push clean — the same "could not
+                # look, so nothing was found" shape the unscannable list exists to refuse
+                # everywhere else. Reported to the caller's list when it hands one in; the
+                # measured case was a `cat-file` failure mid-chain leaving `[]` and no output.
+                if unreadable is not None:
+                    unreadable.append(f"<tag object> {sha[:10]} (git could not read it, so it "
+                                      f"was not scanned)")
                 break
             found.append(("tag object", sha, body))
             nxt = ""
@@ -2259,7 +2287,7 @@ def scan_range(root: Path, rev_range: str,
         findings += scan_identity(sha, commit_identity(root, sha), compiled)
         findings += scan_message(sha, commit_message(root, sha))
         unscannable += blind
-    findings += scan_tags(refs_being_published(root, rev_range))
+    findings += scan_tags(refs_being_published(root, rev_range, unscannable))
     return RangeResult(findings, unscannable, len(commits))
 
 
@@ -2721,7 +2749,8 @@ def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
     scanned = 0
     # Submodule entries, resolved once. See `gitlinks` for why they cannot be told apart from a
     # staged-but-deleted file by catching exceptions.
-    submodules = gitlinks(root)
+    modes = _index_modes(root)
+    submodules = {rel for rel, mode in modes.items() if mode.startswith("160000")}
     tracked = tracked_files(root)
     for path in tracked:
         rel = path.relative_to(root).as_posix()
@@ -2749,6 +2778,21 @@ def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
         raw: bytes | None = None
         text: str | None = None
         absent_from_worktree = False
+        # ⛔⛔ A SYMLINK PUBLISHES ITS LINK TEXT, NOT ITS TARGET — and `read_bytes` FOLLOWS the
+        # link, so this scan used to read whatever the link pointed at and never the one thing
+        # git actually stores for it. Measured by the audit: a tracked link whose text was
+        # `../<host>.lan/notes.txt`, pointing at a clean file, scanned CLEAN here while the
+        # staged scan of the same index reported the host. That is a bypass through the tree
+        # scan; the target being outside the repository is the false-red half of the same defect
+        # (foreign content scanned as if it were this repository's).
+        #
+        # Fail-closed on a SPOOFED mode: `update-index --cacheinfo 120000,...` can mark a regular
+        # file as a link, and on Windows with `core.symlinks=false` git itself checks a link out
+        # as a regular file holding the link text. Both are ordinary files on disk, so
+        # `is_symlink()` is False and they take the `read_bytes` path — the real content in the
+        # first case, the link text in the second. Only a REAL symlink at a 120000 entry is read
+        # as a link, and `readlink` raises the same `OSError` family the arms below handle.
+        is_link = modes.get(rel, "").startswith("120000") and path.is_symlink()
         try:
             # ⚠️ READ BYTES AND DECODE — do NOT use `read_text`, which applies UNIVERSAL NEWLINES
             # and translates `\r\n` and a lone `\r` to `\n` BEFORE any splitting. That left
@@ -2766,7 +2810,7 @@ def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
             # `except UnicodeDecodeError` here could not ask that. `read_bytes` still raises the
             # same FileNotFoundError and OSError subclasses (a checked-out submodule is still
             # IsADirectoryError / PermissionError), which is all this `try` ever needed to cover.
-            raw = path.read_bytes()
+            raw = os.fsencode(os.readlink(path)) if is_link else path.read_bytes()
         except FileNotFoundError:
             # ⚠️ NOT SILENT, and not `continue`. A tracked file missing from the worktree is
             # STAGED-BUT-DELETED (or mid-rebase): its content is still in the INDEX and still goes
@@ -2776,7 +2820,7 @@ def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
             #
             # SCAN THE STAGED BLOB rather than merely refusing to vouch for it: that reports a
             # staged leak precisely (file and line) AND stops an unstaged `rm` of a clean file
-            # from reddening the commit. See `staged_text`.
+            # from reddening the commit. See `staged_blob`.
             #
             # ⚠️ ONE SUBPROCESS PER ABSENT FILE, ~74 ms each (issue #34). Irrelevant for the
             # handful of files normally in this state, and ~77 s if a 1000-file tracked directory

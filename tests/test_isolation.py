@@ -28,6 +28,7 @@ import contextlib
 import importlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -296,13 +297,27 @@ def _environment_reads(tree: ast.Module) -> list[str]:
     """
     offenders: list[str] = []
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr in ("environ", "getenv"):
+        if isinstance(node, ast.Attribute) and node.attr in _ENVIRONMENT_NAMES:
             value = node.value
             if isinstance(value, ast.Name) and value.id == "os":
                 offenders.append(f"os.{node.attr} at line {node.lineno}")
-        elif isinstance(node, ast.Name) and node.id in ("getenv", "environ"):
+        elif isinstance(node, ast.Name) and node.id in _ENVIRONMENT_NAMES:
             offenders.append(f"{node.id} at line {node.lineno}")
+        elif isinstance(node, ast.ImportFrom) and node.module == "os":
+            # ⭐ THE ALIASED SPELLING. `from os import environ as _ambient` binds the mapping to a
+            # name the two arms above never see, and every later `_ambient.get(...)` walked past
+            # this guard — measured by the audit: the aliased form survived on both modules the
+            # walk is run over. An import is where the environment enters a module, so the
+            # import is what is flagged, whatever it is called afterwards.
+            for alias in node.names:
+                if alias.name in _ENVIRONMENT_NAMES:
+                    offenders.append(f"from os import {alias.name} at line {node.lineno}")
     return offenders
+
+
+# `environb` too: it is the same mapping as bytes, and a walk that names one spelling of the
+# thing it forbids is an arms race it loses.
+_ENVIRONMENT_NAMES = ("environ", "environb", "getenv", "getenvb")
 
 
 @pytest.mark.parametrize("module", MODULES, ids=MODULE_IDS)
@@ -359,6 +374,9 @@ def test_the_environment_layer_reads_exactly_the_three_declared_variables(
     pytest.param("import os\nX = os.environ['SECRET']\n", id="os.environ-subscript"),
     pytest.param("import os\n\n\ndef f():\n    return os.getenv('SECRET')\n", id="os.getenv"),
     pytest.param("from os import getenv\nX = getenv('SECRET')\n", id="bare-getenv"),
+    pytest.param("from os import environ as _ambient\nX = _ambient.get('SECRET')\n",
+                 id="aliased-environ"),
+    pytest.param("import os\nX = os.environb.get(b'SECRET')\n", id="os.environb"),
 ])
 def test_the_guard_above_would_actually_catch_an_environment_read(source: str) -> None:
     """⭐ THE NEGATIVE DIRECTION, through the REAL guard.
@@ -373,24 +391,101 @@ def test_the_guard_above_would_actually_catch_an_environment_read(source: str) -
         "the guard cannot see this environment read, so the positive test proves nothing")
 
 
+# The modules whose EVERY string constant is checked for an absolute path. `leakguard` is not
+# among them on purpose: its self-test corpora are synthetic path SHAPES by design (`/mnt/POOL/...`
+# and the deny cases), exercised by `--selftest` and scanned for real values by the guard itself,
+# so for it only the module-level assignments are checked.
+_DEEP_PATH_SCAN = {"alerting", "alerting_env"}
+_ABSOLUTE_PATH = re.compile(r"^(?:/[\w.-]|[A-Za-z]:[\\/])")
+
+
+def _string_constants(tree: ast.Module, *, deep: bool) -> list[ast.Constant]:
+    """Every string constant in `tree` — at any depth when `deep`, docstrings excluded, else
+    only the value of a module-level assignment."""
+    if not deep:
+        return [node.value for node in tree.body
+                if isinstance(node, (ast.Assign, ast.AnnAssign))
+                and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)]
+    docstrings = {id(node.body[0].value) for node in ast.walk(tree)
+                  if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef,
+                                       ast.ClassDef))
+                  and node.body and isinstance(node.body[0], ast.Expr)
+                  and isinstance(node.body[0].value, ast.Constant)
+                  and isinstance(node.body[0].value.value, str)}
+    return [node for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and id(node) not in docstrings]
+
+
 @pytest.mark.parametrize("module", MODULES, ids=MODULE_IDS)
-def test_no_module_level_constant_holds_an_absolute_path(module: Path) -> None:
+def test_no_constant_holds_an_absolute_path(module: Path) -> None:
     """A default path is a promise this library cannot keep — see the module docstring. The
     predecessor defaulted its error log into a volume its adopters did not all have, and got
     `os.makedirs` SUCCEEDING inside the container's disposable layer: no error, no warning,
-    records unreachable from the host."""
-    offenders: list[str] = []
-    for node in _module_ast(module).body:
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
-            continue
-        value = node.value
-        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
-            continue
-        text = value.value
-        if text.startswith("/") or (len(text) > 2 and text[1] == ":" and text[2] in "\\/"):
-            offenders.append(f"line {node.lineno}: {text!r}")
+    records unreachable from the host.
+
+    ⭐ AT ANY DEPTH for the alerting modules, docstrings excluded. The module-body-only walk this
+    used to be let a dataclass FIELD DEFAULT of `/mnt/POOL/appdata/svc/errors.log` through
+    (measured by the audit) — which is precisely the spelling a default path takes in this
+    library, since every path setting is an `AlertSettings` field."""
+    deep = module.stem in _DEEP_PATH_SCAN
+    offenders = [f"line {node.lineno}: {node.value!r}"
+                 for node in _string_constants(_module_ast(module), deep=deep)
+                 if _ABSOLUTE_PATH.match(node.value)]
     assert offenders == [], (
-        f"{module.stem}: module-level absolute paths must be injected instead: {offenders}")
+        f"{module.stem}: absolute paths must be injected instead: {offenders}")
+
+
+def test_the_path_walk_would_catch_a_field_default() -> None:
+    """The negative direction for the deep walk, through the real helper."""
+    source = ("from dataclasses import dataclass\n\n\n@dataclass\nclass S:\n"
+              "    error_log: str = '/mnt/POOL/appdata/svc/errors.log'\n"
+              "    note: str = 'a docstring-free string'\n")
+    found = [n.value for n in _string_constants(ast.parse(source), deep=True)
+             if _ABSOLUTE_PATH.match(n.value)]
+    assert found == ["/mnt/POOL/appdata/svc/errors.log"]
+
+
+# ------------------------------------------------------------- stdlib-first, and the matrix
+PYPROJECT = SRC.parents[1] / "pyproject.toml"
+CI_WORKFLOW = SRC.parents[1] / ".github" / "workflows" / "ci.yml"
+RELEASE_WORKFLOW = SRC.parents[1] / ".github" / "workflows" / "release.yml"
+
+
+def test_the_package_declares_no_runtime_dependency() -> None:
+    """Contract rule 3, at the one place it is actually decided. Every module test above proves
+    a module IMPORTS nothing third-party; this proves nothing is INSTALLED alongside it either —
+    `dependencies` is written out empty so that adding one is a visible diff on this line, and
+    this is what makes the diff a red test rather than a review comment."""
+    text = PYPROJECT.read_text(encoding="utf-8")
+    assert re.search(r"^dependencies = \[\]\s*$", text, re.MULTILINE), (
+        "pyproject.toml no longer declares `dependencies = []` — a runtime dependency is a "
+        "supply-chain surface across the whole fleet and needs a stated justification")
+
+
+def test_ci_measures_exactly_the_interpreters_the_package_claims() -> None:
+    """Contract rule 4: 3.10 and 3.12, both required, in BOTH workflows — and the classifiers
+    claim no version CI never runs. Read from the workflow text, because a matrix is only ever
+    a piece of YAML; the claim it makes is what this pins."""
+    for workflow in (CI_WORKFLOW, RELEASE_WORKFLOW):
+        text = workflow.read_text(encoding="utf-8")
+        matrix = re.search(r'python: \[([^\]]*)\]', text)
+        assert matrix, f"{workflow.name}: no python matrix found"
+        versions = sorted(v.strip().strip('"') for v in matrix.group(1).split(","))
+        assert versions == ["3.10", "3.12"], f"{workflow.name} runs {versions}"
+    classifiers = re.findall(r'"Programming Language :: Python :: (3\.\d+)"',
+                             PYPROJECT.read_text(encoding="utf-8"))
+    assert sorted(classifiers) == ["3.10", "3.12"], (
+        f"pyproject.toml claims {classifiers}; a classifier for a version CI never runs is a "
+        f"claim nobody measured")
+
+
+def test_the_package_exports_only_its_version() -> None:
+    """`__init__.py` re-exports NOTHING — the whole isolation property rests on that — and its
+    `__all__` says so. The audit measured that deleting the line left every test green."""
+    import kw_common
+    assert kw_common.__all__ == ["__version__"]
+    assert isinstance(kw_common.__version__, str) and kw_common.__version__
 
 
 # ------------------------------------------------------------------- the public API is explicit

@@ -160,7 +160,8 @@ def _scratch(tmp_path: Path, *, configure_guard: bool = True) -> tuple[Path, Pat
     if configure_guard:
         # ⚠️ The hook runs `python3`/`python`/`py -3`, not this interpreter. The stub is plain
         # stdlib so any of them runs it; what matters is that the PATH has one, which the probe
-        # inside the hook establishes and `test_the_hook_refuses_when_no_interpreter...` pins.
+        # inside the hook establishes and
+        # `test_the_hook_probes_the_interpreter_by_RUNNING_it_not_by_command_v` pins.
         assert _git(work, "config", "kw.privateGuard", str(guard)).returncode == 0
     assert _git(work, "remote", "add", "origin", str(remote)).returncode == 0
 
@@ -855,10 +856,76 @@ def test_the_PUBLISHING_workflow_carries_every_packaging_assertion_the_PR_workfl
 
     ci_required, rel_required = required_paths(ci), required_paths(rel)
     assert len(ci_required) >= 5, f"the sdist required-file list is no longer parsed: {ci_required}"
+    # ⛔ THE ROLL-CALL IS ANCHORED AT THE TOP OF THE TARBALL. Right-anchored only, `grep` accepted
+    # `vendor/tests/conftest.py` for `/tests/conftest.py` (measured by the audit). A shell step
+    # cannot be driven from here, so the anchor itself is pinned.
+    for name, text in (("ci.yml", ci), ("release.yml", rel)):
+        assert 'grep -q "^[^/]*${required}\\$"' in text, (
+            f"{name}: the sdist roll-call grep is no longer anchored to the tarball's top "
+            f"directory, so a nested copy of a required file satisfies it")
     assert ci_required == rel_required, (
         f"the two sdist checks require different files. Only in ci.yml: "
         f"{sorted(ci_required - rel_required)}; only in release.yml: "
         f"{sorted(rel_required - ci_required)}")
+
+    # ⭐ AND THE BODIES, for the steps that must be the SAME check. Names alone let a step keep
+    # its name while its body became `echo skipped` (measured by the audit: the release copy of
+    # the py.typed assertion, neutered, left this test green). The three packaging checks have
+    # no legitimate reason to differ between the two files, so they are compared byte for byte.
+    def step_body(text: str, fragment: str) -> str:
+        start = next(i for i, ln in enumerate(text.splitlines())
+                     if ln.strip().startswith("- name:") and fragment.lower() in ln.lower())
+        lines = text.splitlines()[start + 1:]
+        end = next((i for i, ln in enumerate(lines) if ln.strip().startswith(("- name:", "- uses:"))
+                    or (ln and not ln.startswith(" " * 6))), len(lines))
+        return "\n".join(ln for ln in lines[:end] if not ln.strip().startswith("#"))
+
+    for fragment, why in _PACKAGING_STEPS:
+        assert step_body(ci, fragment) == step_body(rel, fragment), (
+            f"the {fragment!r} step ({why}) differs between ci.yml and release.yml — one of "
+            f"them is no longer asking the same question")
+
+    # The tool pins too: the same ruff/mypy/pytest in both, or a rule added by a newer linter
+    # reddens one workflow and not the other on an unchanged tree.
+    pins = re.compile(r'"(ruff|mypy|pytest|pytest-timeout)==([\d.]+)"')
+    ci_pins, rel_pins = set(pins.findall(ci)), set(pins.findall(rel))
+    assert ci_pins == rel_pins and len(ci_pins) == 4, (
+        f"tool pins differ or drifted: ci={sorted(ci_pins)} release={sorted(rel_pins)}")
+
+
+@pytest.mark.parametrize("workflow", [CI_WORKFLOW, RELEASE_WORKFLOW], ids=["ci", "release"])
+def test_the_leak_guard_job_cannot_be_made_advisory(workflow: Path) -> None:
+    """⭐ The audit planted `continue-on-error: true` on the range-scan step, `|| true` after the
+    guard, and removed its `set -eu` — and every workflow-text test stayed green, because each
+    asked only whether a string was PRESENT. A guard job that cannot fail the run is not a guard;
+    these are the three ways to make it one while every name stays put."""
+    text = workflow.read_text(encoding="utf-8")
+    job = text[text.index("  no-internal-info:"):text.index("\n  test:")]
+    code = "\n".join(ln for ln in job.splitlines() if not ln.strip().startswith("#"))
+    assert "continue-on-error" not in code, f"{workflow.name}: the leak-guard job is advisory"
+    invocations = [ln for ln in code.splitlines() if "kw-leak-guard" in ln]
+    assert len(invocations) >= 3, f"{workflow.name}: the guard is no longer invoked: {invocations}"
+    for line in invocations:
+        assert "|| true" not in line and "|| :" not in line and "|| echo" not in line, (
+            f"{workflow.name}: a guard invocation has its exit status discarded: {line.strip()}")
+    # The range step's own script — from its `run: |` to the invocation — must begin `set -eu`,
+    # or a failed `git rev-list` inside a substitution scans an empty range as clean.
+    call = code.index("kw-leak-guard --range")
+    step = code[code.rfind("run: |", 0, call):call]
+    assert "set -eu" in step, f"{workflow.name}: the range step no longer runs `set -eu`"
+
+
+def test_the_required_status_check_names_are_the_jobs_own_names_not_comment_text() -> None:
+    """The count-based twin in `test_leak_guard_range.py` is satisfied by a rename that leaves the
+    old name in two comments (measured by the audit). This reads the `name:` lines only."""
+    text = CI_WORKFLOW.read_text(encoding="utf-8")
+    names = [ln.split("name:", 1)[1].strip() for ln in text.splitlines()
+             if re.match(r"\s{4}name:", ln)]
+    for context in ("No internal info (leak guard)",
+                    "Lint, type-check and test (py${{ matrix.python }})",
+                    "The built wheel installs and imports"):
+        assert context in names, f"{context!r} is recorded as a status-check context but no job "\
+                                 f"is named it: {names}"
 
 
 @pytest.mark.parametrize("workflow", [CI_WORKFLOW, RELEASE_WORKFLOW], ids=["ci", "release"])

@@ -207,7 +207,12 @@ jobs:
           for required in '/tests/conftest.py' '/.leakguard.json' '/.github/workflows/ci.yml' \
                           '/alerting.env.template' '/docs/alerting-setup.md' \
                           '/.githooks/pre-push'; do
-            echo "$names" | grep -q "${required}\$" || {
+            # ⛔ ANCHORED AT THE TOP OF THE TARBALL, not only on the right. `"${required}\$"` alone
+            # is satisfied at ANY depth — a `vendor/tests/conftest.py` with no top-level
+            # `tests/conftest.py` passed this roll-call (measured by the audit). The tarball's
+            # names all begin with ONE directory (`kw_common-X.Y.Z/`), so exactly one
+            # slash-free component may precede the required path.
+            echo "$names" | grep -q "^[^/]*${required}\$" || {
               echo "::error::the sdist has no ${required} — its suite ships without something it"
               echo "::error::depends on. Check MANIFEST.in."
               exit 1

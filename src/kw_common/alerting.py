@@ -521,7 +521,8 @@ class AlertSettings:
     `service`      the name that appears in every error-log record. Required, non-blank.
     `config_file`  path to a `KEY=VALUE` file holding the email settings named in `EMAIL_KEYS`.
                    `None` (the default) means the email channel is unconfigured.
-                   Read fresh on every notification rather than cached, so rotating the SMTP
+                   Read fresh on every delivered notification rather than cached (a suppressed
+                   repeat reads nothing), so rotating the SMTP
                    password or moving the inbox takes effect WITHOUT restarting the service.
     `ntfy_url`     the FULL ntfy topic URL (`https://ntfy.example.com/<topic>`). A bare topic is
                    REJECTED, loudly: `urllib` raises `unknown url type: '<topic>'` on every send,
@@ -970,9 +971,9 @@ class AlertConfig:
         # and on a relay whose user is literally `apikey`, so the key stays — it just is not
         # something an operator should have to type twice.
         #
-        # ⚠️ APPLIED HERE, NOT IN THE LOADER, because this file is re-read on EVERY notification
-        # so that rotating the password takes effect without a restart. A default injected once at
-        # boot would be discarded by the first send.
+        # ⚠️ APPLIED HERE, NOT IN THE LOADER, because this file is re-read on every DELIVERED
+        # notification so that rotating the password takes effect without a restart. A default
+        # injected once at boot would be discarded by the first send.
         #
         # ⚠️ AND IT PRESERVES "NOTHING IS CONFIGURED". An absent or empty file leaves `EMAIL_FROM`
         # blank, so `SMTP_USER` stays blank too and `email_ready()` still reports the channel
@@ -1210,6 +1211,18 @@ class AlertConfig:
             log.error("email alerts DISABLED — %s missing or unusable in %s",
                       ", ".join(missing), self.config_file)
             return False
+        # ⭐ THE SAME REFUSAL THE SEND PATH MAKES, ASKED HERE FIRST. `_send_email` rejects a
+        # non-ASCII `SMTP_USER`/`SMTP_PASSWORD` before smtplib can quote the character — and this
+        # method said READY for exactly that credential, so the boot report and `validate_boot`
+        # (which asks this) called a channel usable that then failed 100% of sends. "Dead while
+        # looking configured" is the failure this module names as its worst; a readiness check
+        # that disagrees with its own send path is how it happens. Key names only, never values.
+        for key in ("SMTP_USER", "SMTP_PASSWORD"):
+            if not resolved.get(key, "").isascii():
+                log.error("email alerts DISABLED — %s in %s contains a non-ASCII character, "
+                          "which SMTP AUTH cannot carry; re-set it to an ASCII value",
+                          key, self.config_file)
+                return False
         return True
 
     def smtp_port(self) -> int:
@@ -1332,7 +1345,16 @@ def _send_email(cfg: AlertConfig, spec: SeveritySpec, title: str, message: str) 
         # the whole reason that password lives in a file rather than the environment.
         smtp.starttls(context=ssl.create_default_context())
         smtp.login(email["SMTP_USER"], email["SMTP_PASSWORD"])
-        smtp.send_message(msg)
+        refused = smtp.send_message(msg)
+    if refused:
+        # ⭐ A PARTIAL REFUSAL IS THE QUIETEST WAY TO LOSE A RECIPIENT. `send_message` raises only
+        # when EVERY recipient is refused; when some are, it returns them and the send counts as
+        # delivered — so the operator who was dropped simply never hears from this service again,
+        # and nothing said so (measured). The COUNT, never the addresses: the line repeats per
+        # alert and is the one that gets pasted into a bug report.
+        log.warning("email alert delivered to some recipients only — the server refused %d of "
+                    "%d. Check EMAIL_TO against the server's recipient policy.",
+                    len(refused), len(_RECIPIENT_SEPARATORS.split(msg["To"])))
 
 
 class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
@@ -1489,12 +1511,23 @@ def _roll_error_log(path: str, max_bytes: int, backups: int) -> None:
     # bite is in `read_jsonl_tail()`, where a zero would stop the reader looking at a generation
     # the roller still writes.
     for i in range(backups, 1, -1):
-        try:  # noqa: SIM105 — the `except` body carries the reason; suppress() would hide it
+        try:
             os.replace(f"{path}.{i - 1}", f"{path}.{i}")
-        except OSError:
+        except FileNotFoundError:
             # That generation does not exist yet — normal until the log has rolled `backups`
             # times. Skipping it leaves the older ones where they are, which is correct.
             pass
+        except OSError as exc:
+            # ⭐ ANY OTHER REFUSAL IS SAID, NOT SWALLOWED — the `except OSError: pass` this was is
+            # the exact shape #21 fixed one function up. A `.2` that is a directory, or a
+            # generation this process may not rename, leaves `.1` in place, and the unconditional
+            # move below then OVERWRITES it: the oldest records are gone and, before this line,
+            # nothing anywhere said so (measured by the audit — a planted directory at `.2` lost
+            # the whole `.1` generation with an empty log). The roll still proceeds, because
+            # refusing it would let the live file grow past its cap; the loss is reported.
+            log.warning("alerting: could not shift the error-log generation %s.%d to .%d (%s) — "
+                        "the roll continues and the records in .%d are being overwritten",
+                        path, i - 1, i, errno.errorcode.get(exc.errno or 0, exc.errno), i - 1)
     os.replace(path, f"{path}.1")
 
 
@@ -2113,7 +2146,17 @@ class Alerter:
             log.warning("alert state %s unreadable (%s) — treating every condition as new, so "
                         "this alert goes out", path, type(exc).__name__)
             return {}
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            # ⭐ VALID JSON THAT IS NOT A MAPPING GETS THE SAME LINE AS INVALID JSON. `[]`, `null`,
+            # a string — a file something else wrote, or a truncation that happened to parse —
+            # used to become `{}` in silence, one branch below the WARNING that unparseable
+            # content earns, so a firing condition re-paged once and the file was quietly
+            # overwritten with nothing in the log to explain it.
+            log.warning("alert state %s holds a JSON %s, not an object — treating every "
+                        "condition as new, so this alert goes out, and the file will be "
+                        "rewritten", path, type(data).__name__)
+            return {}
+        return data
 
     def _prune(self, state: dict[str, dict]) -> dict[str, dict]:
         """Keep the remembered conditions bounded, dropping the oldest first.
@@ -2192,11 +2235,19 @@ class Alerter:
     def _forget_unreported(self, title: str, previous: object) -> None:
         """Undo the "already firing" note for a notification that no channel delivered.
 
-        The note is written BEFORE the send on purpose — a crash between the two then re-alerts
-        rather than going quiet. But leaving it behind when NOTHING reached a human turns a
-        delivery outage into a permanent silence: the condition reads as already-reported, so an
-        edge-triggered one is suppressed from then on and only an `OK` naming it will ever bring
-        it back.
+        The note is written BEFORE the send, and this rollback is what pays for that order: a
+        delivery that reaches nobody is un-recorded, because leaving the note behind turns a
+        delivery outage into a permanent silence — the condition reads as already-reported, so
+        an edge-triggered one is suppressed from then on and only an `OK` naming it will ever
+        bring it back.
+
+        ⚠️ WHAT THIS DOES NOT COVER, stated because the previous wording claimed the opposite: a
+        process that DIES between the note and the send. The note then stays, and an
+        edge-triggered condition is suppressed until its `OK` (an escalating one re-alerts after
+        its gap). The earlier sentence said such a crash "re-alerts rather than going quiet";
+        for an edge-triggered condition it goes quiet. Writing the note AFTER the send would
+        invert the trade — a crash then re-pages instead — and is a change to the state machine
+        rather than to this docstring.
         """
         try:
             state = self._read_state()
@@ -2268,6 +2319,12 @@ class Alerter:
         entry = state.get(title)
         if not isinstance(entry, dict):
             # Not firing (or the entry is junk): this is the edge, so it always goes out.
+            if entry is not None:
+                # Junk is SAID. An entry that is not a record is something else's write or a
+                # hand edit, and replacing it in silence hides that from the one log that
+                # would explain the extra page.
+                log.warning("alerting: the state entry for %r is a JSON %s, not a record — "
+                            "treating the condition as new", title, type(entry).__name__)
             state[title] = {"first": _now(), "last": _now(), "count": 1}
             self._write_state(state)
             return True

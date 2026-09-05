@@ -211,4 +211,5 @@ re-validates whatever the timestamps say, and a restore of identical contents co
 ⚠️ What it still cannot see is a change **outside** the file: the ntfy endpoint going away, the
 app password being revoked at the provider, DNS moving. Boot validation answers "is this
 configuration well-formed and sendable-looking", never "is the far end still there" — that is what
-the periodic self-test is for.
+a periodic self-test is for. The fleet standard requires one of every adopter; this library does
+not implement it, and nothing in it is scheduled.

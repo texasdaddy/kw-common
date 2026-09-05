@@ -62,6 +62,7 @@ WHY THIS FILE EXISTS
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -184,6 +185,141 @@ def _cli(repo: Path, *args: str) -> subprocess.CompletedProcess:
 
 def _out(res: subprocess.CompletedProcess) -> str:
     return (res.stdout or "") + (res.stderr or "")
+
+
+# ===========================================================================================
+# the audit's guard findings — a symlink is its link text, a dropped tag, the verdict itself
+# ===========================================================================================
+_ADDR = "192.168." + "77.77"       # assembled: this file is scanned by the guard it tests
+_HOST = "host-a" + ".lan"
+
+
+@pytest.mark.skipif(os.name != "posix",
+                    reason="a real symlink; Windows checks a link out as a text file holding "
+                           "the link text, which takes the ordinary read path")
+def test_a_tracked_symlink_is_scanned_as_its_link_text_not_its_target(tmp_path: Path) -> None:
+    """⛔ A SYMLINK PUBLISHES ITS LINK TEXT. `read_bytes` follows the link, so the tree scan used
+    to read whatever it pointed at and never the one thing git stores for it. Measured by the
+    audit: a link whose text named a LAN host, pointing at a clean file, scanned CLEAN while the
+    staged scan of the same index reported the host. Both directions here — the leak in the
+    link text is found, and a clean link to a leaking file OUTSIDE the repository is not blamed
+    for foreign content."""
+    outside = tmp_path / _HOST
+    outside.mkdir()
+    (outside / "notes.txt").write_bytes(b"clean\n")
+    repo = tmp_path / "links"
+    _seeded(repo)
+    (repo / "link").symlink_to(Path("..") / _HOST / "notes.txt")
+    _git(repo, "add", "link")
+    assert _git(repo, "ls-files", "-s", "link").startswith("120000"), "premise: a link entry"
+    res = _cli(repo)
+    assert res.returncode == 1, _out(res)
+    assert f"link:1: private lan domain: {_HOST!r}" in _out(res), _out(res)
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "notes.txt").write_bytes(f"AGENT={_ADDR}\n".encode())
+    clean = tmp_path / "clean-link"
+    _seeded(clean)
+    (clean / "link").symlink_to(Path("..") / "plain" / "notes.txt")
+    _git(clean, "add", "link")
+    res = _cli(clean)
+    assert res.returncode == 0, f"foreign content behind a clean link was scanned:\n{_out(res)}"
+
+
+def test_a_regular_file_the_index_calls_a_symlink_is_still_read(tmp_path: Path) -> None:
+    """Fail-closed on a SPOOFED mode. `update-index --cacheinfo 120000,…` marks any path as a
+    link while the file goes on sitting in the worktree, readable and published — and on
+    Windows with `core.symlinks=false` git itself checks a link out as a regular file holding
+    the link text. Both are ordinary files on disk, so both take the `read_bytes` path."""
+    repo = tmp_path / "spoof"
+    _seeded(repo)
+    _write(repo, "link", f"AGENT={_ADDR}\n")
+    blob = _git(repo, "hash-object", "-w", "link").strip()
+    _git(repo, "update-index", "--add", "--cacheinfo", f"120000,{blob},link")
+    assert _git(repo, "ls-files", "-s", "link").startswith("120000"), "premise"
+    res = _cli(repo)
+    assert res.returncode == 1 and "link:1: private IPv4 (RFC1918)" in _out(res), _out(res)
+
+
+def test_a_tag_object_git_cannot_read_is_reported_not_dropped(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`refs_being_published` broke out of the tag walk on a `cat-file` failure and returned
+    `[]` — a tag this scan could not vouch for, silently cleared. Measured by the audit. It is
+    now an `unscannable` entry, which is exit 1 at the CLI."""
+    repo = tmp_path / "tags"
+    _seeded(repo)
+    _git(repo, "tag", "-a", "v1", "-m", "release notes")
+    real = guard._git
+
+    def refuse_tag_bodies(root: Path, *args: str) -> str:
+        if args[:2] == ("cat-file", "tag"):
+            raise subprocess.CalledProcessError(128, ["git", *args], output=b"", stderr=b"")
+        return real(root, *args)
+
+    monkeypatch.setattr(guard, "_git", refuse_tag_bodies)
+    unreadable: list[str] = []
+    assert guard.refs_being_published(repo, "refs/tags/v1", unreadable) == []
+    assert unreadable and "could not read it" in unreadable[0], unreadable
+    result = guard.scan_range(repo, "refs/tags/v1", guard.compile_patterns())
+    assert result.unscannable, "the dropped tag did not reach the range result"
+
+
+def test_the_selftest_verdict_is_live_in_both_directions(
+        monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """`selftest()` collects a `bad` list and returns 1 on it — and no test ever handed it a
+    corpus it should refuse, so `bad = []` inserted before the verdict left every self-test
+    test green (measured by the audit). A deny case that cannot fire, and an allow case that
+    does, must each fail it."""
+    compiled = guard.compile_patterns()
+    assert guard.selftest(compiled) == 0
+    monkeypatch.setattr(guard, "_MUST_FAIL",
+                        [*guard._MUST_FAIL, ("private IPv4 (RFC1918)", "nothing to see here")])
+    assert guard.selftest(compiled) == 1
+    assert "SHOULD have been caught" in capsys.readouterr().out
+    monkeypatch.undo()
+    monkeypatch.setattr(guard, "_MUST_PASS", [*guard._MUST_PASS, f"AGENT={_ADDR}"])
+    assert guard.selftest(compiled) == 1
+    assert "false positive" in capsys.readouterr().out
+
+
+@pytest.mark.timeout(300)
+def test_a_shallow_clone_is_refused_rather_than_scanned_as_complete(tmp_path: Path) -> None:
+    """The refusal exists (`is_shallow`) and nothing drove it: a `--depth 1` clone's history is
+    truncated, so `rev-list` succeeds against the wrong base and a range scan there would
+    vouch for commits it never saw. Exit 1, and the word an operator can search for."""
+    origin = tmp_path / "origin"
+    _seeded(origin)
+    _write(origin, "a.txt", "second\n")
+    _commit(origin, "second")
+    shallow = tmp_path / "shallow"
+    _git(tmp_path, "clone", "-q", "--depth", "1", origin.as_uri(), str(shallow))
+    assert (shallow / ".git" / "shallow").exists(), "premise: the clone is not shallow"
+    res = _cli(shallow, "--range", "HEAD")
+    assert res.returncode == 1, _out(res)
+    assert "SHALLOW" in _out(res), _out(res)
+
+
+def test_an_svg_is_text_and_a_leak_inside_one_is_found(tmp_path: Path) -> None:
+    """`.svg` is pinned OUT of `SKIP_SUFFIXES` by tuple membership — which a second suffix list
+    consulted by the scan would walk past. This plants the leak the icon-URL incident was."""
+    repo = tmp_path / "svg"
+    _seeded(repo)
+    _write(repo, "icon.svg", f'<svg><title>{_HOST}</title></svg>\n')
+    _commit(repo, "icon")
+    res = _cli(repo)
+    assert res.returncode == 1 and f"icon.svg:1: private lan domain: {_HOST!r}" in _out(res)
+
+
+def test_a_utf8_bom_does_not_hide_a_leak_on_the_first_line(tmp_path: Path) -> None:
+    """Caught today (the audit measured it) and pinned nowhere: a BOM is three bytes in front of
+    the first line, and a left bound that treated them as a word character would hide it."""
+    repo = tmp_path / "bom"
+    _seeded(repo)
+    (repo / "notes.txt").write_bytes(b"\xef\xbb\xbfAGENT=" + _ADDR.encode() + b"\n")
+    _commit(repo, "bom")
+    res = _cli(repo)
+    assert res.returncode == 1 and "notes.txt:1: private IPv4 (RFC1918)" in _out(res), _out(res)
 
 
 # ===========================================================================================

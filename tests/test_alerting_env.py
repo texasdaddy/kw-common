@@ -1596,6 +1596,34 @@ def test_a_marker_that_lands_readable_anyway_is_reported_and_kept(
     assert silence(channels) == []
 
 
+def test_a_nul_in_the_config_path_is_refused_in_this_modules_own_terms(tmp_path: Path) -> None:
+    """`_config_digest` caught `OSError` only, and an embedded NUL raises `ValueError` from
+    `open` — so it travelled out of `validate_boot` as a bare exception with no refusal logged,
+    past the `except AlertEnvError` the setup document tells an adopter to write. The same
+    "a predicate that looks total is not" class `_checked_is_dir` closes (measured by the
+    audit). It is `read_config`'s own NUL arm that names it now."""
+    from dataclasses import replace
+
+    settings = replace(load_alert_settings(write_shared(tmp_path), "prod", "feed-poller"),
+                       config_file=str(tmp_path / "con\x00fig.env"))
+    with pytest.raises(AlertEnvError) as excinfo:
+        validate_boot(settings, "prod", tmp_path / "app", alerter=Alerter(settings))
+    assert "not a usable path" in str(excinfo.value)
+
+
+def test_a_nul_in_the_marker_directory_costs_the_marker_not_the_boot(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The other side of the same class: `CONFIG_PATH` carrying a NUL made `mkdir` raise
+    `ValueError` inside `_write_marker`, whose arm caught `OSError` only. A marker failure is
+    documented as never being a boot failure; this one was, as a traceback."""
+    settings = load_alert_settings(write_shared(tmp_path), "prod", "feed-poller")
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        assert validate_boot(settings, "prod", tmp_path / "ap\x00p",
+                             alerter=Alerter(settings)) is True
+    assert "could not write the validation marker" in caplog.text
+    assert "ValueError" in caplog.text
+
+
 def test_a_shared_root_that_cannot_be_checked_refuses_in_this_modules_own_terms(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture) -> None:
