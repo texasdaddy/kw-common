@@ -22,9 +22,12 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
+import uuid
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
@@ -1162,15 +1165,22 @@ def test_a_non_ascii_smtp_credential_is_refused_before_smtplib_sees_it(
     monkeypatch.setattr(alerting.smtplib, "SMTP", FakeSMTP)
     FakeSMTP.instances = []
 
+    # The READINESS check now refuses it first (the audit found readiness saying READY for a
+    # credential the send path refused), so through `notify()` the channel is skipped, not
+    # failed — and the send-path refusal is asked of `_send_email` directly below, because the
+    # two are separate guards and either alone was measured insufficient.
     with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
-        assert Alerter(settings).notify(ERROR, "t", "m") == {"email": "failed"}
+        assert Alerter(settings).notify(ERROR, "t", "m") == {"email": "skipped"}
+        with pytest.raises(ValueError, match="SMTP_PASSWORD") as excinfo:
+            alerting._send_email(Alerter(settings).config(), alerting.SEVERITIES[ERROR], "t", "m")
 
     # Not one byte of the credential went anywhere: no connection was even opened.
     assert FakeSMTP.instances == [], "the refusal must happen BEFORE a socket is opened"
     assert "SMTP_PASSWORD" in caplog.text, "the SETTING is named, which is the actionable half"
-    assert "15-character value" in caplog.text, "its shape is named, exactly like SMTP_PORT's"
+    assert "15-character value" in str(excinfo.value), "its shape is named, like SMTP_PORT's"
     for fragment in ("ä", "ö", "\\xe4", "\\xf6", "position "):
         assert fragment not in caplog.text, f"{fragment!r} reached the log"
+        assert fragment not in str(excinfo.value), f"{fragment!r} reached the exception"
 
 
 def test_the_same_refusal_covers_the_user_not_only_the_password(
@@ -1186,10 +1196,12 @@ def test_the_same_refusal_covers_the_user_not_only_the_password(
     FakeSMTP.instances = []
 
     with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
-        assert Alerter(settings).notify(ERROR, "t", "m") == {"email": "failed"}
+        assert Alerter(settings).notify(ERROR, "t", "m") == {"email": "skipped"}
+        with pytest.raises(ValueError, match="SMTP_USER") as excinfo:
+            alerting._send_email(Alerter(settings).config(), alerting.SEVERITIES[ERROR], "t", "m")
     assert FakeSMTP.instances == []
     assert "SMTP_USER" in caplog.text
-    assert "ö" not in caplog.text
+    assert "ö" not in caplog.text and "ö" not in str(excinfo.value)
 
 
 def test_an_ascii_credential_still_sends(
@@ -1645,6 +1657,19 @@ def test_the_reader_skips_a_truncated_final_line(tmp_path: Path) -> None:
     assert [r["title"] for r in alerting.read_jsonl_tail(str(path), limit=0)] == ["good"]
 
 
+def test_the_reader_accepts_the_reference_implementations_none_sentinel(tmp_path: Path) -> None:
+    """#5. The code adopters port FROM spelled `backups: int | None = None`, `None` meaning "the
+    module default". The extraction turned an explicit `backups=None` into a `TypeError` at the
+    generation count — for exactly the `GET /v1/admin/errors` handler a service moves across
+    first. `None` is the default again: one generation, so the rolled file is read too."""
+    path = tmp_path / "errors.log"
+    path.write_text('{"ts": "2026-08-30T10:00:00Z", "title": "live"}\n', encoding="utf-8")
+    (tmp_path / "errors.log.1").write_text(
+        '{"ts": "2026-08-30T09:00:00Z", "title": "rolled"}\n', encoding="utf-8")
+    records = alerting.read_jsonl_tail(str(path), limit=0, backups=None)
+    assert [r["title"] for r in records] == ["rolled", "live"]
+
+
 def test_an_absurd_limit_is_clamped_rather_than_raising(tmp_path: Path) -> None:
     """`deque(maxlen=)` narrows to a C ssize_t and raises `OverflowError` above 2**63."""
     path = tmp_path / "errors.log"
@@ -1702,6 +1727,238 @@ def test_a_record_with_an_unparseable_timestamp_is_kept(tmp_path: Path) -> None:
     path.write_text('{"ts": "not-a-time", "title": "anomaly"}\n', encoding="utf-8")
     kept = alerting.read_jsonl_tail(str(path), limit=0, since_iso="2026-08-30T00:00:00Z")
     assert [r["title"] for r in kept] == ["anomaly"]
+
+
+# ================================ #6: the v1.0.0 mutation survivors, each pinned by the test
+# that catches its mutation. Measured before any of these existed: 20 of 27 mutations survived
+# the suite — three of them by design (guards the code documents as individually redundant) —
+# across items 2, 3, 4, 5, 6, 7, 8, 9 and 11 of the issue; the items already pinned were the
+# ERROR ntfy tag (6) and the `#` comment skip (10). Item 4's third gate, `notify`'s own, is
+# uncatchable by construction — the other two make it a no-op — and is not claimed here.
+def test_a_failed_delivery_restores_the_previous_entry_of_an_escalating_condition(
+        settings: AlertSettings, channels: dict[str, Spy],
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """#6 item 2: `_forget_unreported`'s RESTORE branch. An escalating condition that was already
+    firing with `count=2` must not lose that count when a re-alert reaches nobody — the entry is
+    put back as it was, not popped (which would restart the backoff from the base gap)."""
+    now = 1_700_000_000.0
+    monkeypatch.setattr(alerting, "_now", lambda: now)
+    previous = {"first": now - 7200.0, "last": now - 7200.0, "count": 2}
+    state_path = Path(settings.state_file or "")
+    state_path.write_text(json.dumps({"svc: down": previous}), encoding="utf-8")
+    channels["ntfy"].fail = OSError("down")
+
+    results = Alerter(settings).notify(ERROR, "svc: down", "still", escalating=True)
+
+    assert "sent" not in results.values(), "premise: nothing may have been delivered"
+    assert channels["ntfy"].calls, "premise: the re-alert was attempted (the 2h gap had passed)"
+    assert json.loads(state_path.read_text(encoding="utf-8"))["svc: down"] == previous
+
+
+def test_peek_condition_returns_the_stored_entry_before_anything_touches_it(
+        settings: AlertSettings) -> None:
+    """#6 item 2, the other half: the snapshot must be the REAL entry, or the restore above has
+    nothing to restore."""
+    entry = {"first": 1.0, "last": 2.0, "count": 3}
+    Path(settings.state_file or "").write_text(json.dumps({"svc: down": entry}),
+                                                encoding="utf-8")
+    alerter = Alerter(settings)
+    assert alerter._peek_condition("svc: down") == entry
+    assert alerter._peek_condition("svc: other") is alerting._MISSING
+
+
+def test_an_ok_that_reaches_nobody_still_leaves_the_condition_cleared(
+        settings: AlertSettings, channels: dict[str, Spy]) -> None:
+    """#6 item 3: the two `previous`-snapshot guards are individually redundant — the code says
+    so — and REMOVING BOTH restores a firing condition that has just recovered, on the one
+    delivery that failed. Nothing enforced that claim; this does. The OK clears the condition
+    whether or not anybody heard it, because a recovery is a fact and not a page."""
+    state_path = Path(settings.state_file or "")
+    state_path.write_text(json.dumps({"svc: down": {"first": 1.0, "last": 1.0, "count": 1}}),
+                          encoding="utf-8")
+    channels["ntfy"].fail = OSError("down")
+
+    results = Alerter(settings).notify(OK, "svc: down", "recovered")
+
+    assert "sent" not in results.values(), "premise: nothing may have been delivered"
+    assert "svc: down" not in json.loads(state_path.read_text(encoding="utf-8")), (
+        "a recovered condition was put back to firing because the OK's delivery failed")
+
+
+def test_the_opt_out_touches_no_file_not_even_one_named_None(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, channels: dict[str, Spy]) -> None:
+    """#6 item 4: the de-duplication opt-out gates in `_read_state` and `_write_state`.
+    `str(None)` is `"None"`, so without those gates the opt-out would READ a file by that name in
+    the working directory and WRITE one — planted here, so a gate that stops gating is caught by
+    the file it then reads or the file it then leaves behind."""
+    monkeypatch.chdir(tmp_path)
+    planted = json.dumps({"svc: down": {"first": 1.0, "last": 1.0, "count": 1}})
+    (tmp_path / "None").write_text(planted, encoding="utf-8")
+    alerter = Alerter(AlertSettings(service="svc", ntfy_url="https://ntfy.example.com/svc",
+                                    state_file=None))
+
+    assert alerter.notify(ERROR, "svc: down", "x")["ntfy"] == "sent"
+    assert alerter.notify(ERROR, "svc: down", "x")["ntfy"] == "sent", (
+        "the opt-out de-duplicated against a file it must never have read")
+    assert alerter._read_state() == {}, "the read gate let a file named 'None' through"
+    alerter._write_state({"svc: other": {"first": 1.0, "last": 1.0, "count": 1}})
+    assert (tmp_path / "None").read_text(encoding="utf-8") == planted, "the write gate wrote"
+    assert not (tmp_path / "None.tmp").exists()
+
+
+def test_the_default_sizing_knobs_are_the_documented_values() -> None:
+    """#6 item 5: every default is what a consumer actually gets, and every test that exercised
+    these passed an explicit override — so 1 MB -> 1 GB, 200 -> 2 and 587 -> 25 all survived.
+    The numbers are the standard's (the sink must fit through a flaky agent whole; STARTTLS
+    submission is 587), pinned at the two places a consumer meets them."""
+    knobs = AlertSettings(service="svc")
+    assert (knobs.error_log_max_bytes, knobs.error_log_backups, knobs.max_record_field,
+            knobs.max_tracked_conditions) == (1_000_000, 1, 4000, 200)
+    assert (alerting.ERROR_LOG_MAX_BYTES, alerting.ERROR_LOG_BACKUPS, alerting.MAX_RECORD_FIELD,
+            alerting.MAX_TRACKED_CONDITIONS) == (1_000_000, 1, 4000, 200)
+    assert alerting.DEFAULT_SMTP_PORT == 587
+    assert AlertConfig(email={"SMTP_PORT": ""}).smtp_port() == 587, "a blank port must fall back"
+
+
+@pytest.mark.parametrize("severity, level, tag, priority", [
+    (OK, logging.INFO, "white_check_mark", "low"),
+    (WARN, logging.WARNING, "warning", "high"),
+    (ERROR, logging.ERROR, "red_circle", "urgent")])
+def test_each_severity_logs_at_the_standard_level_and_carries_its_standard_tag(
+        alerter: Alerter, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture,
+        severity: str, level: int, tag: str, priority: str) -> None:
+    """#6 item 6: the `SeveritySpec` fields. WARN logging at INFO survived — the process log is
+    the one record that always goes out, and a WARN that lands below the operator's threshold is
+    a WARN nobody sees. The ntfy tag and priority are the standard's table, asserted as what
+    reaches the CHANNEL rather than as the table's own text."""
+    with caplog.at_level(logging.INFO, logger="kw_common.alerting"):
+        alerter.notify(severity, "svc: thing", "detail")
+    lines = [r for r in caplog.records if r.getMessage().startswith(f"[{severity}] svc: thing")]
+    assert [r.levelno for r in lines] == [level]
+    (_cfg, spec, _title, _message), = channels["ntfy"].calls
+    assert (spec.ntfy_tags, spec.ntfy_priority) == (tag, priority)
+
+
+def test_pruning_drops_the_oldest_by_first_seen_not_by_insertion_order(tmp_path: Path) -> None:
+    """#6 item 7: the existing test inserted conditions in first-seen order, so insertion order
+    and `sorted(key=first_seen)` were indistinguishable. Shuffled here; and a JUNK `first` must
+    sort oldest (dropped first), not newest."""
+    settings = AlertSettings(service="svc", state_file=str(tmp_path / "state.json"),
+                             max_tracked_conditions=3)
+    state = {
+        "c-mid": {"first": 50.0}, "c-newest": {"first": 90.0}, "c-oldest": {"first": 10.0},
+        "c-junk": {"first": "not a number"}, "c-old": {"first": 20.0},
+    }
+    kept = Alerter(settings)._prune(state)
+    assert set(kept) == {"c-old", "c-mid", "c-newest"}
+
+
+def test_a_missing_limit_is_a_programming_error_not_no_cap(tmp_path: Path) -> None:
+    """#6 item 8: `limit and limit > 0` would make a MISSING query parameter mean "read the whole
+    file" — the memory amplifier the bound exists to stop. `None` raises, loudly, at the caller."""
+    path = tmp_path / "errors.log"
+    path.write_text('{"ts": "2026-08-30T10:00:00Z", "title": "one"}\n', encoding="utf-8")
+    with pytest.raises(TypeError):
+        alerting.read_jsonl_tail(str(path), limit=None)  # type: ignore[arg-type]
+
+
+def test_a_record_that_is_not_an_object_is_skipped(tmp_path: Path) -> None:
+    """#6 item 8: a JSON array or a bare string on a line is not a record, and returning it would
+    hand a consumer's endpoint something with no `title` to read."""
+    path = tmp_path / "errors.log"
+    path.write_text('[1, 2]\n"text"\n42\n{"ts": "2026-08-30T10:00:00Z", "title": "good"}\n',
+                    encoding="utf-8")
+    assert [r["title"] for r in alerting.read_jsonl_tail(str(path), limit=0)] == ["good"]
+
+
+def test_the_keep_predicate_is_consulted_with_each_record(tmp_path: Path) -> None:
+    """#6 item 8: no test ever passed `keep`. It RECORDS and asserts outside the callback —
+    `read_jsonl_tail` calls `keep` inside its per-file `except Exception`, so an assertion raised
+    in there would be swallowed and this would pass whether or not `keep` ran."""
+    path = tmp_path / "errors.log"
+    path.write_text('{"ts": "2026-08-30T10:00:00Z", "title": "keep"}\n'
+                    '{"ts": "2026-08-30T10:00:01Z", "title": "drop"}\n', encoding="utf-8")
+    seen: list[str] = []
+
+    def keep(rec: dict) -> bool:
+        seen.append(rec["title"])
+        return rec["title"] != "drop"
+
+    kept = alerting.read_jsonl_tail(str(path), limit=0, keep=keep)
+    assert [r["title"] for r in kept] == ["keep"]
+    assert seen == ["keep", "drop"]
+
+
+def test_a_record_stamped_exactly_at_since_is_kept(tmp_path: Path) -> None:
+    """#6 item 9: the `>=` boundary. "Since 10:00" includes 10:00."""
+    path = tmp_path / "errors.log"
+    path.write_text('{"ts": "2026-08-30T10:00:00Z", "title": "at"}\n', encoding="utf-8")
+    kept = alerting.read_jsonl_tail(str(path), limit=0, since_iso="2026-08-30T10:00:00Z")
+    assert [r["title"] for r in kept] == ["at"]
+
+
+@contextlib.contextmanager
+def _local_zone_five_hours_west() -> Iterator[None]:
+    """The local zone pinned to UTC-5 where `time.tzset` exists (POSIX — CI), so a naive
+    timestamp read as LOCAL time is measurably wrong there.
+
+    ⚠️ CONFIG-DEPENDENT IN REVERSE: on a UTC host the wrong implementation gives the right answer,
+    and both naive-timestamp tests below were vacuous on `ubuntu-latest` without this (the gate
+    measured the record-side one surviving under `TZ=UTC0`). On Windows there is no `tzset`; the
+    assertions run against whatever the local zone is, and the docstring says so rather than
+    claiming cover the platform cannot give.
+
+    ⚠️ AND THE PIN IS ASSERTED TO HAVE TAKEN. Without tzdata the name is unknown, `tzset`
+    silently yields UTC, and the wrong implementation passes — a vacuous green the gate pointed at.
+    """
+    old = os.environ.get("TZ")
+    if hasattr(time, "tzset"):
+        os.environ["TZ"] = "Etc/GMT+5"  # POSIX sign convention: this IS five hours WEST of UTC
+        time.tzset()
+        assert time.timezone == 5 * 3600, f"TZ pin did not take (timezone={time.timezone})"
+    try:
+        yield
+    finally:
+        if hasattr(time, "tzset"):
+            if old is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = old
+            time.tzset()
+
+
+def test_a_naive_record_timestamp_is_read_as_utc(tmp_path: Path) -> None:
+    """#6 item 9: a record from another writer with no offset is UTC, and compared as such.
+    Without the branch, a naive stamp meets an aware floor with a `TypeError`, which the per-file
+    guard turns into "records missing from this result" — the whole file silently gone. And
+    read as UTC, not LOCAL: under the UTC-5 pin a local reading puts "11:00" at 16:00Z, which is
+    still after the floor — so the "before" record is placed at 09:00 local = 14:00Z and would
+    be KEPT by the wrong implementation. Both records are what the assertion checks."""
+    path = tmp_path / "errors.log"
+    path.write_text('{"ts": "2026-08-30T09:00:00", "title": "before"}\n'
+                    '{"ts": "2026-08-30T11:00:00", "title": "after"}\n', encoding="utf-8")
+    with _local_zone_five_hours_west():
+        kept = alerting.read_jsonl_tail(str(path), limit=0, since_iso="2026-08-30T10:00:00Z")
+    assert [r["title"] for r in kept] == ["after"]
+
+
+def test_a_naive_since_is_read_as_utc_not_as_local_time() -> None:
+    """#6 item 9: `parse_since`'s naive branch. `astimezone()` on a naive value assumes LOCAL
+    time, so on a workstation five hours behind UTC "since 10:00" would become "since 15:00Z" and
+    drop five hours of records."""
+    with _local_zone_five_hours_west():
+        assert alerting.parse_since("2026-08-30T10:00:00") == datetime(
+            2026, 8, 30, 10, tzinfo=timezone.utc)
+
+
+def test_a_missing_config_file_is_not_an_error_and_logs_nothing(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """#6 item 11: the `except FileNotFoundError` in `_parse_env_file` is not redundant with the
+    `OSError` clause below it — that clause LOGS. A missing file means the email channel is
+    unconfigured, which the boot report says once; it is not a WARNING per notification."""
+    with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
+        assert alerting._parse_env_file(str(tmp_path / "absent.env")) == {}
+    assert caplog.records == []
 
 
 # =============================================================================== settings & boot
@@ -1951,15 +2208,69 @@ def test_warn_if_unconfigured_reports_the_dedup_opt_out(
     assert "disables de-duplication" in caplog.text
 
 
-def test_warn_if_unconfigured_reports_an_unmounted_error_log_volume(
+def test_a_working_volume_with_an_uncreated_subtree_is_not_reported_unmounted(
         tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    missing = tmp_path / "not-mounted" / "logs" / "svc-errors.log"
+    """⭐ #23's OPPOSITE SIGN, and this test used to pin the defect: `<mount>/svc/logs/errors.log`
+    with `<mount>` mounted and `svc/` not yet created was reported "the volume is not mounted",
+    because the old arm's premise — a missing grandparent means a missing mount — holds only when
+    the mounted root is exactly one level above the log directory. `os.makedirs` is recursive, so
+    the sink writes there perfectly well, and a detector that reddens a working configuration is
+    the one that gets switched off."""
+    missing = tmp_path / "svc" / "logs" / "svc-errors.log"
+    alerter = Alerter(AlertSettings(service="svc", error_log=str(missing)))
+    # ⚠️ `os.name` PINNED, like its twin below. The arm this test guards against is POSIX-gated,
+    # so on Windows the assertion measured nothing and a mutation making it fire for ANY missing
+    # directory survived the matrix here. Pinned, the claim is asserted on every platform.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(alerting.os, "name", "posix")
+        assert alerter.error_log_problem() == ""
+        with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+            alerter.warn_if_unconfigured()
+    assert "the volume is not mounted" not in caplog.text
+    # And the sink really does work there, so "" is the right answer rather than a lucky one.
+    alerter.notify(ERROR, "svc: down", "no route to host")
+    assert missing.is_file()
+
+
+def test_a_path_with_nothing_below_the_filesystem_root_is_reported_unmounted(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """The case the old arm was written for, kept — narrowed to the premise that actually holds.
+    When NOTHING on the way to the directory exists except the filesystem root, no volume is
+    mounted anywhere on that path: a container running as root would `makedirs` the whole
+    chain into its disposable layer, which is the retrieval failure this sink exists to fix.
+    Nothing is written here — the path is only asked about.
+
+    ⚠️ POSIX-ONLY PREMISE, and the gate found the other platform: on Windows a DRIVE ROOT is a
+    volume, so there the same path is an ordinary place to write and the arm must NOT fire —
+    the twin below asserts that. Here it is asserted with POSIX root semantics regardless of
+    platform, by pinning `os.name`, because the arithmetic is the property under test."""
+    nowhere = os.path.join(os.path.abspath(os.sep), f"kw-common-{uuid.uuid4().hex}", "logs",
+                           "svc-errors.log")
     alerter = Alerter(AlertSettings(service="svc", ntfy_url="https://ntfy.example.com/t",
-                                    error_log=str(missing)))
-    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
-        alerter.warn_if_unconfigured()
-    assert "does not exist" in caplog.text
+                                    error_log=nowhere))
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(alerting.os, "name", "posix")
+        problem = alerter.error_log_problem()
+        assert "the volume is not mounted" in problem
+        with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+            alerter.warn_if_unconfigured()
     assert "the volume is not mounted" in caplog.text
+
+
+def test_a_drive_root_is_a_volume_so_nothing_below_it_is_not_unmounted_off_posix() -> None:
+    """⭐ THE GATE'S FINDING. `C:\\svc-logs\\errors.log` with `C:\\svc-logs` absent is a healthy,
+    host-reachable configuration on Windows — the drive root is a volume — and the "not mounted"
+    arm reddened it while the sink wrote there. Off POSIX the walk falls through to the
+    writability check. Pinned by `os.name`, so it is asserted on every platform."""
+    nowhere = os.path.join(os.path.abspath(os.sep), f"kw-common-{uuid.uuid4().hex}", "logs",
+                           "svc-errors.log")
+    alerter = Alerter(AlertSettings(service="svc", error_log=nowhere))
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(alerting.os, "name", "nt")
+        real_access = os.access
+        mp.setattr(alerting.os, "access", lambda p, m, *a, **k: True if os.path.dirname(p) == p
+                   else real_access(p, m, *a, **k))
+        assert alerter.error_log_problem() == ""
 
 
 def test_warn_if_unconfigured_cannot_raise(monkeypatch: pytest.MonkeyPatch,
@@ -2149,6 +2460,143 @@ def test_the_uncreatable_log_directory_reaches_the_boot_report(
         Alerter(settings).warn_if_unconfigured()
     assert "ALERTING ERROR LOG for svc" in caplog.text
     assert repr(str(parent)) in caplog.text
+
+
+# ================================ #23: the detector asks whether the sink can be CREATED
+def _sink_outcome(error_log: str) -> str:
+    """GROUND TRUTH: `_append_error_record`'s own sequence, run for real. The exception class it
+    raises, or `""` when the write lands. The table below is checked against THIS rather than
+    against a list of expected messages, so it cannot drift from what the sink actually does."""
+    try:
+        directory = os.path.dirname(error_log)
+        if directory:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+        fd = os.open(error_log, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+        os.close(fd)
+    except Exception as exc:  # noqa: BLE001 — the class name IS the measurement
+        return type(exc).__name__
+    return ""
+
+
+def _plant(tmp_path: Path, state: str) -> str:
+    """One of #23's states, planted under `tmp_path`; returns the `error_log` to configure."""
+    if state == "a file where the directory should be":
+        (tmp_path / "logs").write_text("a file", encoding="utf-8")
+        return str(tmp_path / "logs" / "errors.log")
+    if state == "a symlink to nowhere where the directory should be":
+        try:
+            os.symlink(str(tmp_path / "nowhere"), str(tmp_path / "logs"))
+        except OSError as exc:  # unprivileged Windows without developer mode
+            pytest.skip(f"cannot plant a symlink here ({type(exc).__name__})")
+        return str(tmp_path / "logs" / "errors.log")
+    if state == "a trailing separator":
+        (tmp_path / "logs").mkdir()
+        return str(tmp_path / "logs" / "errors.log") + os.sep
+    if state == "the sink is itself a directory":
+        (tmp_path / "logs" / "errors.log").mkdir(parents=True)
+        return str(tmp_path / "logs" / "errors.log")
+    if state == "a NUL in the path":
+        return str(tmp_path / "lo\x00gs" / "errors.log")
+    if state == "a healthy directory":
+        (tmp_path / "logs").mkdir()
+        return str(tmp_path / "logs" / "errors.log")
+    if state == "a healthy uncreated subtree":
+        return str(tmp_path / "svc" / "logs" / "errors.log")
+    raise AssertionError(state)
+
+
+@pytest.mark.parametrize("state", [
+    "a file where the directory should be",
+    "a symlink to nowhere where the directory should be",
+    "a trailing separator",
+    "the sink is itself a directory",
+    "a NUL in the path",
+    "a healthy directory",
+    "a healthy uncreated subtree",
+])
+def test_the_detector_agrees_with_the_sink_about_whether_it_can_be_written(
+        tmp_path: Path, state: str) -> None:
+    """⭐⭐ #23. Five states in which the sink provably cannot be written all answered `""`, because
+    `error_log_problem` asked whether the DIRECTORY EXISTED rather than whether the sink could be
+    CREATED — `os.path.isdir` is False for a file, a dangling symlink and a NUL path alike, so each
+    fell past the directory arm to a writable grandparent and "no problem". The sink then failed
+    on the first WARN or ERROR, and the function whose job is to say so had said the opposite.
+
+    Asserted against the sink's OWN sequence rather than a table of expected messages, in BOTH
+    directions: a state the sink refuses must be reported, and a state the sink accepts must not
+    be, or the detector is one an operator switches off.
+    """
+    error_log = _plant(tmp_path, state)
+    # ⚠️ THE DETECTOR FIRST. The sink's own sequence MUTATES the filesystem (`makedirs` creates the
+    # directory a trailing-separator path names), and asked afterwards the detector was answering
+    # a different question — the mutation matrix measured the trailing-separator arm as removable
+    # with this test green, because the sink had already turned the leaf into a directory.
+    problem = Alerter(AlertSettings(service="svc", error_log=error_log)).error_log_problem()
+    outcome = _sink_outcome(error_log)
+    if outcome:
+        assert problem != "", f"the sink raises {outcome} here and the detector says no problem"
+        assert "could not be checked" not in problem, (
+            "this is a checked-and-broken state, not a could-not-check one")
+    else:
+        assert problem == "", f"the sink writes fine here and the detector says: {problem}"
+
+
+def test_a_file_in_the_way_is_named_as_such_not_as_missing(tmp_path: Path) -> None:
+    """#23's wrong-TEXT case, for both detectors. With a file standing where the directory should
+    be, the old `state_file_problem` reported "does not exist" — a problem WAS raised, but the
+    stated reason sent the operator looking for something missing rather than something in the
+    way. The error-log side reported nothing at all."""
+    (tmp_path / "logs").write_text("a file", encoding="utf-8")
+    settings = AlertSettings(service="svc", state_file=str(tmp_path / "logs" / "state.json"),
+                             error_log=str(tmp_path / "logs" / "errors.log"))
+    for problem in (Alerter(settings).state_file_problem(),
+                    Alerter(settings).error_log_problem()):
+        assert "not a directory" in problem, problem
+        assert "does not exist" not in problem, problem
+        assert repr(str(tmp_path / "logs")) in problem, "the message must name what is in the way"
+
+
+def test_a_state_file_that_is_a_directory_is_a_problem(tmp_path: Path) -> None:
+    """The LEAF question, which neither detector used to ask. `_write_state` replaces the leaf by
+    rename, and a rename over a directory fails on every platform."""
+    (tmp_path / "state.json").mkdir()
+    problem = Alerter(AlertSettings(service="svc",
+                                    state_file=str(tmp_path / "state.json"))).state_file_problem()
+    assert "is a directory" in problem
+
+
+def test_a_state_file_under_a_missing_directory_is_still_reported_missing(tmp_path: Path) -> None:
+    """The asymmetry #23 records is CORRECT and stays: `_write_state` never calls `makedirs`, so for
+    the state file a missing directory is a problem outright, while for the error log it is the
+    fresh-container case `makedirs` handles. One walk, two answers, by design."""
+    missing = tmp_path / "svc" / "state.json"
+    # `os.name` pinned for the same reason as the twin above: the "not mounted" arm that must NOT
+    # claim this one is POSIX-gated, so without the pin a mutation letting it answer for the
+    # state file survives on Windows.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(alerting.os, "name", "posix")
+        assert "does not exist" in Alerter(AlertSettings(service="svc", state_file=str(missing))
+                                           ).state_file_problem()
+        assert Alerter(AlertSettings(service="svc",
+                                     error_log=str(tmp_path / "svc" / "errors.log"))
+                       ).error_log_problem() == ""
+
+
+@posix_only
+def test_an_existing_sink_this_process_cannot_write_is_a_problem(tmp_path: Path) -> None:
+    """The error log is opened for APPEND, so an existing file that is not writable fails the
+    sink on its first record. Real mode bits; root ignores them, so this skips there."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root is not refused by permission bits, so this cannot be planted here")
+    sink = tmp_path / "errors.log"
+    sink.write_text("", encoding="utf-8")
+    os.chmod(sink, 0o400)
+    try:
+        assert _sink_outcome(str(sink)) == "PermissionError", "the planted condition did not take"
+        problem = Alerter(AlertSettings(service="svc", error_log=str(sink))).error_log_problem()
+    finally:
+        os.chmod(sink, 0o600)
+    assert "not writable" in problem
 
 
 def test_the_boot_report_surfaces_a_blank_path_that_dodged_the_constructor(
@@ -2450,6 +2898,223 @@ def _exact_modes() -> Iterator[None]:
         yield
     finally:
         os.umask(previous)
+
+
+# ================================ the audit's two siblings of #20: a repr and the state file
+def test_the_config_repr_shows_the_password_as_set_or_unset_never_its_value(
+        settings: AlertSettings) -> None:
+    """A generated dataclass repr prints every field, and `AlertConfig.email` holds the shared
+    file's password — so `repr(alerter.config())` in an adopter's debug line or boot dump was
+    the password in the process log. Same class as the marker's digest, a different door."""
+    write_email_config(settings, SMTP_PASSWORD=CANARY_PASSWORD)
+    cfg = Alerter(settings).config()
+    assert cfg.email is not None and cfg.email["SMTP_PASSWORD"] == CANARY_PASSWORD, (
+        "premise: the password must still be READABLE from the object — only the repr masks it")
+    shown = repr(cfg)
+    assert CANARY_PASSWORD not in shown
+    assert "'SMTP_PASSWORD': '<set>'" in shown
+    assert "ops@example.com" in shown, "the non-secret fields must stay readable"
+    assert "<unset>" in repr(AlertConfig(email={"SMTP_PASSWORD": ""}))
+    assert repr(AlertConfig()) == ("AlertConfig(ntfy_url='', email=None, config_file=None, "
+                                   "allow_cleartext_ntfy=False)")
+
+
+@posix_only
+def test_the_state_file_is_created_narrow_and_an_old_wide_one_is_replaced_narrow(
+        settings: AlertSettings, _exact_modes: None) -> None:
+    """The state file persists every firing condition's TITLE — the identifying half of an alert
+    — and it was written by a bare `open()` at the umask's mode: 0644 into a shared appdata
+    volume. Created 0600 by `os.open` now, and because `os.replace` carries the temp's mode, a
+    wide file left by an earlier build is narrowed on its next write with no `chmod`."""
+    state_path = Path(settings.state_file or "")
+    state_path.write_text("{}", encoding="utf-8")
+    os.chmod(state_path, 0o644)
+    Alerter(settings).notify(ERROR, "svc: down", "x")
+    assert json.loads(state_path.read_text(encoding="utf-8")).get("svc: down"), "premise"
+    assert stat.S_IMODE(state_path.stat().st_mode) == 0o600
+
+
+def test_a_stale_state_temp_is_not_reused_and_a_failed_write_leaves_none(
+        settings: AlertSettings, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """Both halves of the temp-file discipline the marker already has. A temp left by a killed
+    process must not be reused (`O_EXCL` would refuse it, so it is removed first), and a failed
+    rename must not leave a `.tmp` beside every boot on a read-only mount."""
+    tmp = Path(f"{settings.state_file}.tmp")
+    tmp.write_text("stale", encoding="utf-8")
+    Alerter(settings).notify(ERROR, "svc: down", "x")
+    assert not tmp.exists(), "the stale temp survived a successful write"
+    assert json.loads(Path(settings.state_file or "").read_text(encoding="utf-8"))["svc: down"]
+
+    def refuse(src: object, dst: object) -> None:
+        raise PermissionError("read-only mount")
+
+    monkeypatch.setattr(alerting.os, "replace", refuse)
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        Alerter(settings).notify(ERROR, "svc: other", "x")  # must not raise
+    assert "could not save alert state" in caplog.text
+    assert not tmp.exists(), "a failed rename left its temp behind"
+
+
+# ================================ the audit's silent-failure siblings of #21 / #22
+def test_a_generation_the_roller_cannot_shift_is_reported_not_swallowed(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """The roller's shift loop was `except OSError: pass` — the exact shape #21 fixed one
+    function up. A `.2` that is a directory leaves `.1` in place and the unconditional move
+    then OVERWRITES it: the oldest records are gone and, before this, nothing said so (measured
+    by the audit: an empty log). The roll still happens; the loss is reported, with the errno."""
+    live = tmp_path / "errors.log"
+    live.write_text("x" * 50 + "\n", encoding="utf-8")
+    (tmp_path / "errors.log.1").write_text('{"title": "GEN1"}\n', encoding="utf-8")
+    (tmp_path / "errors.log.2").mkdir()
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        alerting._roll_error_log(str(live), max_bytes=10, backups=2)
+    assert "could not shift the error-log generation" in caplog.text
+    assert ".1 to .2" in caplog.text
+    assert not live.exists(), "the roll must still happen — refusing it lets the live file grow"
+    assert "GEN1" not in (tmp_path / "errors.log.1").read_text(encoding="utf-8"), (
+        "premise: the overwrite this warning describes did not happen")
+
+
+def test_a_missing_generation_is_still_silent(tmp_path: Path,
+                                              caplog: pytest.LogCaptureFixture) -> None:
+    """The normal case — the log has not rolled `backups` times yet — must stay quiet, or the
+    warning above is one an operator learns to ignore."""
+    live = tmp_path / "errors.log"
+    live.write_text("x" * 50 + "\n", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        alerting._roll_error_log(str(live), max_bytes=10, backups=3)
+    assert caplog.records == []
+    assert (tmp_path / "errors.log.1").exists()
+
+
+@pytest.mark.parametrize("content, kind", [("[]", "list"), ("null", "NoneType"),
+                                           ('"text"', "str"), ("42", "int")])
+def test_a_state_file_that_is_valid_json_but_not_an_object_is_said_not_swallowed(
+        settings: AlertSettings, caplog: pytest.LogCaptureFixture, content: str,
+        kind: str) -> None:
+    """Valid JSON that is not a mapping became `{}` in silence, one branch below the WARNING
+    that unparseable content earns — so a firing condition re-paged once and the file was
+    quietly overwritten with nothing in the log to explain it. Same line, same level, now."""
+    Path(settings.state_file or "").write_text(content, encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        assert Alerter(settings)._read_state() == {}
+    assert f"holds a JSON {kind}, not an object" in caplog.text
+
+
+def test_a_state_entry_that_is_not_a_record_is_said_when_it_is_replaced(
+        settings: AlertSettings, caplog: pytest.LogCaptureFixture) -> None:
+    Path(settings.state_file or "").write_text(json.dumps({"svc: down": 5}), encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        results = Alerter(settings).notify(ERROR, "svc: down", "x")
+    assert results["ntfy"] == "sent"
+    assert "the state entry for 'svc: down' is a JSON int, not a record" in caplog.text
+    stored = json.loads(Path(settings.state_file or "").read_text(encoding="utf-8"))
+    assert isinstance(stored["svc: down"], dict) and stored["svc: down"]["count"] == 1
+
+
+@pytest.mark.parametrize("key", ["SMTP_USER", "SMTP_PASSWORD"])
+def test_email_readiness_refuses_the_credential_the_send_path_refuses(
+        settings: AlertSettings, caplog: pytest.LogCaptureFixture, key: str) -> None:
+    """`_send_email` rejects a non-ASCII `SMTP_USER`/`SMTP_PASSWORD` before smtplib can quote
+    the character — and `email_ready()` said READY for exactly that credential, so the boot
+    report and `validate_boot` called usable a channel that then failed every send: the
+    "dead while looking configured" failure this module names as its worst. The readiness
+    check now makes the send path's refusal first. Key NAME in the log, never the value."""
+    write_email_config(settings, **{key: "päss-CANARY-91c"})
+    with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
+        ready = Alerter(settings).config().email_ready()
+    assert ready is False
+    assert f"{key} in" in caplog.text and "non-ASCII" in caplog.text
+    assert "CANARY-91c" not in caplog.text, "the value must not be echoed"
+
+
+def test_a_partial_recipient_refusal_is_reported_not_counted_as_delivered(
+        settings: AlertSettings, fake_smtp: type[FakeSMTP], monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """`send_message` raises only when EVERY recipient is refused; when some are, it RETURNS
+    them and the send counts as delivered — so the operator who was dropped never hears from
+    this service again, and nothing said so (measured). The COUNT is logged, never the
+    addresses: this line repeats per alert."""
+    write_email_config(settings, EMAIL_TO="ops@example.com; second@example.com")
+
+    def refuse_one(self: FakeSMTP, msg: object) -> dict[str, tuple[int, bytes]]:
+        self.calls.append("send_message")
+        self.sent.append(msg)
+        return {"second@example.com": (550, b"5.1.1 recipient rejected")}
+
+    monkeypatch.setattr(fake_smtp, "send_message", refuse_one)
+    monkeypatch.setattr(alerting, "_CHANNELS", (("email", alerting._send_email),))
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        results = Alerter(settings).notify(ERROR, "svc: down", "x")
+    assert results["email"] == "sent", "one recipient did get it; that is not a failure"
+    assert "the server refused 1 recipient(s)" in caplog.text
+    assert "second@example.com" not in caplog.text, "addresses stay out of the per-alert line"
+
+
+def test_a_mocked_smtp_that_returns_a_truthy_object_is_not_a_partial_refusal(
+        settings: AlertSettings, fake_smtp: type[FakeSMTP], monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """A consumer's own tests commonly replace `smtplib.SMTP` with a `MagicMock`, whose
+    `send_message()` returns a truthy mock. `if refused:` warned "refused 0 of 1" on every such
+    send (the gate measured it); a real server only ever returns the refused DICT."""
+    from unittest.mock import MagicMock
+
+    write_email_config(settings)
+    monkeypatch.setattr(fake_smtp, "send_message", lambda self, msg: MagicMock())
+    monkeypatch.setattr(alerting, "_CHANNELS", (("email", alerting._send_email),))
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        assert Alerter(settings).notify(ERROR, "svc: down", "x")["email"] == "sent"
+    assert "refused" not in caplog.text
+
+
+def test_a_nul_in_the_state_file_costs_one_warning_per_write_not_a_traceback(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """⛔ THE GATE'S FINDING INSIDE THE STATE-FILE FIX. The cleanup `unlink` in `_write_state`'s
+    `except` arm was guarded by `suppress(OSError)` only, and a NUL in `state_file` raises
+    `ValueError` from `unlink` — so the one function documented as never letting a failure reach
+    its caller raised, and `notify()`'s fail-open guard logged an ERROR with a traceback per alert
+    where 1.4.0 logged one WARNING."""
+    settings = AlertSettings(service="svc", ntfy_url="https://ntfy.example.com/svc",
+                             state_file=str(tmp_path / "st\x00ate.json"))
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        Alerter(settings)._write_state({"svc: down": {"first": 1.0, "last": 1.0, "count": 1}})
+        results = Alerter(settings).notify(ERROR, "svc: down", "x")
+    assert results["ntfy"] == "sent"
+    assert "could not save alert state" in caplog.text
+    assert "de-duplication failed" not in caplog.text, (
+        "a NUL path must cost a WARNING, not the de-duplication ERROR that means a bug")
+    assert not [r for r in caplog.records if r.exc_info], "no traceback for a bad setting"
+
+
+def test_the_config_repr_shows_a_non_mapping_email_as_it_is_rather_than_raising() -> None:
+    """A hand-built `AlertConfig(email="")` (the send path tolerates any falsy `email`) made the
+    new repr raise `AttributeError`, which turns a `%r` log line into `--- Logging error ---` on
+    stderr and drops the record. Nothing to mask in a value with no password key."""
+    for email in ("", [], None):
+        text = repr(AlertConfig(email=email))  # type: ignore[arg-type]
+        assert f"email={email!r}" in text
+    # ⭐ AND THE MASKING FOLLOWS THE KEY, NOT THE CONCRETE TYPE: a `MappingProxyType` carrying
+    # the password was shown unmasked while an `isinstance(..., dict)` test decided it.
+    from types import MappingProxyType
+    proxied = repr(AlertConfig(email=MappingProxyType({"SMTP_PASSWORD": CANARY_PASSWORD})))
+    assert CANARY_PASSWORD not in proxied and "<set>" in proxied
+
+
+def test_a_non_object_state_file_is_rewritten_so_the_warning_fires_once(
+        settings: AlertSettings, caplog: pytest.LogCaptureFixture) -> None:
+    """An OK never writes the state file unless it clears something, so a service that only sends
+    heartbeats read the same JSON list on every notification and warned each time, forever (the
+    gate measured it). The read now rewrites the file empty, and the line fires once."""
+    state_path = Path(settings.state_file or "")
+    state_path.write_text("[]", encoding="utf-8")
+    alerter = Alerter(settings)
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        alerter.notify(OK, "svc: heartbeat", "alive")
+        alerter.notify(OK, "svc: heartbeat", "alive")
+        alerter.notify(OK, "svc: heartbeat", "alive")
+    assert caplog.text.count("not an object") == 1
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {}
 
 
 @posix_only

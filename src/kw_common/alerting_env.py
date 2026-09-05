@@ -291,8 +291,9 @@ def read_config(config_path: str | os.PathLike[str]) -> dict[str, str]:
     """Parse the shared alerting file, or raise `AlertEnvError` saying why it could not be.
 
     ⭐⭐ THE PARSER IS `alerting`'s OWN, IMPORTED PRIVATELY AND ON PURPOSE. `alerting` re-reads
-    this file on EVERY notification, so if this module parsed it even slightly differently — one
-    module honouring `export `, or quotes, or a CRLF line ending, and the other not — boot
+    this file on every DELIVERED notification, so if this module parsed it even slightly
+    differently — one module honouring `export `, or quotes, or a CRLF line ending, and the other
+    not — boot
     validation would pass a file the send path then read as something else. A second parser is a
     second answer to the same question. There is exactly one, and this is the seam.
 
@@ -425,7 +426,7 @@ def load_alert_settings(config_path: str | os.PathLike[str], deploy_env: str,
 
     return AlertSettings(
         service=service,
-        # The FILE, not its contents. `alerting` re-reads it on every notification so that
+        # The FILE, not its contents. `alerting` re-reads it on every delivered notification so that
         # rotating the SMTP password or moving the inbox takes effect without a restart — a
         # property that would be thrown away by parsing the email block into the settings here.
         config_file=str(Path(config_path)),
@@ -530,7 +531,12 @@ def _config_digest(config: str | os.PathLike[str]) -> str:
     """
     try:
         return "sha256:" + hashlib.sha256(Path(config).read_bytes()).hexdigest()
-    except OSError:
+    except (OSError, ValueError):
+        # `ValueError` too — an embedded NUL in the path raises it from `open`, and it used to
+        # travel straight out of `validate_boot` as a bare exception with no refusal logged: the
+        # same "a predicate that looks total is not" class `_checked_is_dir` closes. `""` here
+        # means "cannot skip", and `read_config` then refuses with the NUL named (its own
+        # `ValueError` arm), which is the diagnosis an operator can act on.
         return ""
 
 
@@ -561,7 +567,8 @@ def _marker_matches(marker: Path, config: Path) -> bool:
     """
     try:
         recorded = marker.read_text(encoding="utf-8", errors="replace").strip()
-    except OSError:
+    except (OSError, ValueError):
+        # `ValueError` for a NUL in `CONFIG_PATH`, for the reason `_config_digest` gives.
         return False
     if not recorded.startswith("sha256:"):
         return False
@@ -616,7 +623,8 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
     whatever the file's timestamp says (#15). What it does not cover is a change OUTSIDE the file:
     the ntfy endpoint going away, the SMTP password being revoked at the provider, DNS moving. A
     boot check answers "is this configuration well-formed and sendable-looking", never "is the
-    remote end still there" — the periodic self-test is what answers that one.
+    remote end still there" — a periodic self-test is what answers that one, and the standard
+    requires one of every adopter; this library does not implement it.
     """
     env = normalise_env(deploy_env)
     config = Path(settings.config_file) if settings.config_file else None
@@ -908,7 +916,7 @@ def _discard(path: Path) -> None:
     name, a permission fault — surfaces one statement later as the `O_EXCL` failure, which IS
     reported, so a warning here would only ever be the same news said twice.
     """
-    with contextlib.suppress(OSError):
+    with contextlib.suppress(OSError, ValueError):
         path.unlink()
 
 
@@ -925,7 +933,7 @@ def _exposed_bits(path: Path) -> int:
         return 0
     try:
         return stat.S_IMODE(path.stat().st_mode) & 0o077
-    except OSError:
+    except (OSError, ValueError):
         # The mode of a file we have just written and cannot now stat is not a question worth
         # failing a boot over, and the caller has already logged anything that went wrong.
         return 0
@@ -962,7 +970,7 @@ def _can_be_read_back(path: Path) -> bool:
     """
     try:
         path.read_bytes()
-    except OSError:
+    except (OSError, ValueError):
         return False
     return True
 
@@ -992,7 +1000,7 @@ def _reharden(marker: Path) -> None:
         # nothing else, and turn a cosmetic permission repair into a boot crash. The two readers of
         # this file must also decode it the same way or they can disagree about its contents.
         recorded = marker.read_text(encoding="utf-8", errors="replace").strip()
-    except OSError:
+    except (OSError, ValueError):
         # It was readable a moment ago, in `_marker_matches`. If it is not now, the next boot
         # re-validates, which is the safe direction and needs no announcement here.
         return
@@ -1105,7 +1113,9 @@ def _write_marker(marker: Path, digest: str, *, consequence: str) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(digest + "\n")
         os.replace(tmp, marker)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # `ValueError` too: a NUL in `CONFIG_PATH` raises it from `mkdir` and `os.open`, and it
+        # used to escape `validate_boot` bare — the same class `_config_digest` closes.
         _discard(tmp)
         log.warning("alerting: could not write the validation marker %s (%s). %s It is the "
                     "%s variable.", marker, type(exc).__name__, consequence, CONFIG_PATH_VAR)

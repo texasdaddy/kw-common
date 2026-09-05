@@ -66,6 +66,15 @@ jobs:
       # it, and the repository that OWNS the engine must not be the one place it is used
       # differently. `pip install -e .` puts the `kw-leak-guard` console script on PATH, so this
       # job exercises the exact entry point a consumer's CI calls.
+      #
+      # ⛔ `-e` IS LOAD-BEARING FOR THE RANGE SCAN BELOW, NOT A CONVENIENCE (#13). The guard
+      # recognises its own source by PATH relative to the scanned root, and by BYTES — and only
+      # the tree scan has a file's bytes; a range scan sees a diff. With an editable install
+      # `__file__` resolves inside this checkout, so the path half fires and the engine's own
+      # synthetic deny corpus is skipped. Installed non-editable it lives in site-packages, the
+      # path half grants nothing, and `--range` over this repository's history reports that
+      # corpus — measured at 105 findings on the range that added it, none of them a leak.
+      # `tests/test_leak_guard_hook.py` pins this line in both workflows.
       - name: Install the package (the guard ships inside it)
         run: |
           python -m pip install --upgrade pip
@@ -198,7 +207,12 @@ jobs:
           for required in '/tests/conftest.py' '/.leakguard.json' '/.github/workflows/ci.yml' \
                           '/alerting.env.template' '/docs/alerting-setup.md' \
                           '/.githooks/pre-push'; do
-            echo "$names" | grep -q "${required}\$" || {
+            # ⛔ ANCHORED AT THE TOP OF THE TARBALL, not only on the right. `"${required}\$"` alone
+            # is satisfied at ANY depth — a `vendor/tests/conftest.py` with no top-level
+            # `tests/conftest.py` passed this roll-call (measured by the audit). The tarball's
+            # names all begin with ONE directory (`kw_common-X.Y.Z/`), so exactly one
+            # slash-free component may precede the required path.
+            echo "$names" | grep -q "^[^/]*${required}\$" || {
               echo "::error::the sdist has no ${required} — its suite ships without something it"
               echo "::error::depends on. Check MANIFEST.in."
               exit 1

@@ -16,13 +16,13 @@ no port, no alignment audit, and no "which copy is the good one" question to ans
 Consumers install from git at an **exact tag** — never a branch:
 
 ```
-pip install git+https://github.com/texasdaddy/kw-common@v1.4.0
+pip install git+https://github.com/texasdaddy/kw-common@v1.4.1
 ```
 
 In a `requirements.in` / `requirements.txt`:
 
 ```
-kw-common @ git+https://github.com/texasdaddy/kw-common@v1.4.0
+kw-common @ git+https://github.com/texasdaddy/kw-common@v1.4.1
 ```
 
 ⛔ **Never pin a branch.** `@main` makes every rebuild of every consumer a silent, unreviewed
@@ -177,15 +177,16 @@ shared library, and saying so is a better outcome than bending the rule.
    either. **The "no other `kw_common` module" half binds every module EXCEPT `alerting_env`**,
    which imports `alerting` because it exists to return an `AlertSettings` — a stated, single,
    one-directional dependency, not an exception that grows. `alerting` must never import it back.
-   *(Enforced for `alerting` by `tests/test_isolation.py`, which does exactly that in a
-   subprocess, and for `leakguard` by a narrower check in `test_leak_guard_extraction.py`.
-   Generalising that file over every module is issue #12 — it binds one `MODULE_PATH` today.)*
+   *(Enforced for EVERY module by `tests/test_isolation.py`, which is parametrised over
+   `src/kw_common/*.py` and does exactly that in a subprocess — so a module is held to the
+   contract the day it is added. The one allowed edge is data in that file, and the direction is
+   asserted both ways.)*
 2. **Configuration is INJECTED, never assumed.** No hardcoded filename, environment-variable name,
    path, topic or service name. The caller passes what it uses. Anything a consumer must customise
    is a parameter or a registered hook — **never a constant the consumer is expected to edit after
    install**, because an edited install is a fork, which is the thing this repository exists to
-   stop. *(Enforced against the AST: `alerting` may not read `os.environ`, and no module-level
-   constant may hold an absolute path.)*
+   stop. *(Enforced against the AST for every module: none may read `os.environ`, and no
+   module-level constant may hold an absolute path.)*
    **`alerting_env` is the deliberate exception, and it is scoped rather than waived**: reading
    the environment IS its job, so the AST check asked of it is a different one — it may read only
    the three documented variables, through one helper, and it still may not hold an absolute path.

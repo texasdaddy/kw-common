@@ -195,6 +195,52 @@ def test_an_explicit_config_path_is_honoured_and_a_missing_one_is_an_ERROR(
         f"unreadable or malformed one:\n{_out(missing)}")
 
 
+def test_a_repo_path_outside_any_repository_is_a_usage_error_not_a_traceback(
+        tmp_path: Path) -> None:
+    """⭐ #12. `--repo <not-a-repository>` used to let `CalledProcessError` escape `main`: a stack
+    trace and exit 1. Fail-closed, but `USAGE` reserves exit 2 for a usage error, and this is what
+    a mistyped path looks like to somebody in one of six consuming repositories who has never
+    read the source. Both halves: the exit code, and a sentence instead of a traceback."""
+    plain = tmp_path / "just-a-directory"
+    plain.mkdir()
+    res = _run(plain)
+    assert res.returncode == 2, f"a non-repository must be a usage error (exit 2):\n{_out(res)}"
+    assert "Traceback" not in _out(res), f"a usage error must not print a traceback:\n{_out(res)}"
+    assert "has no git working tree to scan" in _out(res), _out(res)
+    assert "usage:" in _out(res), "the usage text is what tells the operator which flag to fix"
+    # A BARE repository IS a repository, so the sentence must not say otherwise — git's own
+    # reason is carried, which is what tells a bare repo and a plain directory apart.
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True, timeout=60)
+    res = _run(bare)
+    assert res.returncode == 2 and "has no git working tree" in _out(res), _out(res)
+    assert "git said:" in _out(res), "git's own reason must be carried for the bare case"
+
+    absent = _run(tmp_path / "does-not-exist")
+    assert absent.returncode == 2 and "Traceback" not in _out(absent), _out(absent)
+    assert "is not a directory" in _out(absent), _out(absent)
+
+
+def test_the_self_identity_normalises_the_guards_OWN_line_endings_too(
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_own_source_lf` caches the LF form of the engine's own bytes. The mutation "return the raw
+    bytes instead" is EQUIVALENT on an LF checkout — every existing line-ending test compares a
+    CRLF COPY against an LF original — and only bites the other way round: an `autocrlf`
+    checkout of the engine (CRLF on disk) scanning an LF copy of itself. Planted here, because
+    the mutation matrix measured it as a survivor for exactly that reason."""
+    lf = guard._own_source_bytes()
+    assert lf is not None and b"\r\n" not in lf, "premise: the engine's own source is LF here"
+    crlf = lf.replace(b"\n", b"\r\n")
+    monkeypatch.setattr(guard, "_own_source_bytes", lambda: crlf)
+    guard._own_source_lf.cache_clear()
+    try:
+        assert guard._is_self("anything.py", None, lf) is True, (
+            "an LF copy of a CRLF-checked-out engine was not recognised as the engine")
+        assert guard._is_self("anything.py", None, lf + b"# extra\n") is False
+    finally:
+        guard._own_source_lf.cache_clear()
+
+
 def test_selftest_REFUSES_a_config_rather_than_ignoring_one(tmp_path: Path) -> None:
     """⚠️ A MUTATION SURVIVOR until this was written, which is why it is here.
 

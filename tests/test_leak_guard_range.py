@@ -1455,7 +1455,7 @@ def test_staged_content_that_is_not_UTF8_is_still_reported_as_not_cleared(tmp_pa
 def test_an_unmerged_absent_path_is_not_blamed_on_the_ENCODING(tmp_path: Path) -> None:
     """⚠️ The message must not name a cause the guard does not know.
 
-    `staged_text` returns None for two different reasons — the blob is not UTF-8, or `git cat-file`
+    `staged_blob` returns None for two different reasons — the blob is not UTF-8, or `git cat-file`
     refused the path because it is UNMERGED and has no stage-0 entry. The message asserted the
     first, so a conflicted file that is also absent from the worktree sent the operator after an
     encoding problem that did not exist. The content here is valid UTF-8 throughout.
@@ -2596,7 +2596,7 @@ def test_bomless_utf16le_is_not_cleared_by_the_TREE_scan(tmp_path: Path) -> None
 
 @pytest.mark.timeout(300)
 def test_bomless_utf16le_is_not_cleared_through_the_STAGED_blob(tmp_path: Path) -> None:
-    """#242, decode site 2 — `staged_text`, reached by the same content one step later: stage the
+    """#242, decode site 2 — `staged_blob`, reached by the same content one step later: stage the
     file, delete it from the worktree, and the tree scan reads the index blob instead.
 
     This is the site the sibling repo's attempt missed, which is why the check is placed on what

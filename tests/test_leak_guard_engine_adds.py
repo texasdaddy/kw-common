@@ -187,6 +187,165 @@ def _out(res: subprocess.CompletedProcess) -> str:
 
 
 # ===========================================================================================
+# the audit's guard findings — a symlink is its link text, a dropped tag, the verdict itself
+# ===========================================================================================
+_ADDR = "192.168." + "77.77"       # assembled: this file is scanned by the guard it tests
+_HOST = "host-a" + ".lan"
+
+
+def _link(repo: Path, name: str, target: Path) -> None:
+    """A REAL symlink, stored as a 120000 entry. Skips where the platform refuses to create one
+    (Windows without developer mode) rather than passing over nothing — and adds it under
+    `core.symlinks=true` so git stores the link even on a platform whose default is to read
+    through it, which is what makes this measurable on the workstation and not only in CI."""
+    try:
+        (repo / name).symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"this platform cannot create a symlink here ({type(exc).__name__})")
+    _git(repo, "-c", "core.symlinks=true", "add", name)
+    assert _git(repo, "ls-files", "-s", name).startswith("120000"), "premise: a link entry"
+
+
+def test_a_tracked_symlink_is_scanned_as_its_link_text_not_its_target(tmp_path: Path) -> None:
+    """⛔ A SYMLINK PUBLISHES ITS LINK TEXT. `read_bytes` follows the link, so the tree scan used
+    to read whatever it pointed at and never the one thing git stores for it. Measured by the
+    audit: a link whose text named a LAN host, pointing at a clean file, scanned CLEAN while the
+    staged scan of the same index reported the host. Both directions here — the leak in the
+    link text is found, and a clean link to a leaking file OUTSIDE the repository is not blamed
+    for foreign content."""
+    outside = tmp_path / _HOST
+    outside.mkdir()
+    (outside / "notes.txt").write_bytes(b"clean\n")
+    repo = tmp_path / "links"
+    _seeded(repo)
+    _link(repo, "link", Path("..") / _HOST / "notes.txt")
+    res = _cli(repo)
+    assert res.returncode == 1, _out(res)
+    assert f"link:1: private lan domain: {_HOST!r}" in _out(res), _out(res)
+
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "notes.txt").write_bytes(f"AGENT={_ADDR}\n".encode())
+    clean = tmp_path / "clean-link"
+    _seeded(clean)
+    _link(clean, "link", Path("..") / "plain" / "notes.txt")
+    res = _cli(clean)
+    assert res.returncode == 0, f"foreign content behind a clean link was scanned:\n{_out(res)}"
+
+
+def test_a_symlink_whose_text_is_a_pool_path_is_found_however_the_platform_spells_it(
+        tmp_path: Path) -> None:
+    """⛔ THE GATE'S FINDING INSIDE THE SYMLINK FIX. Git for Windows stores a link's reparse point
+    with BACKSLASHES and turns them back to `/` when it reads the blob, so `os.readlink` on a
+    Windows `core.symlinks=true` checkout answered a backslashed pool path for a blob git
+    publishes forward-slashed — and the pool-path pattern, which is separator-sensitive, went
+    blind in the tree scan while `--staged` reported it. The link here is built from a `Path`, so
+    on Windows its text is backslashed exactly as git makes it; on POSIX it is forward-slashed
+    either way. (The pool path itself is assembled from fragments, as this file's rule says.)"""
+    repo = tmp_path / "poollink"
+    _seeded(repo)
+    _link(repo, "appdata", Path("..") / _MNT_USER.lstrip("/") / "appdata" / "svc")
+    res = _cli(repo)
+    assert res.returncode == 1, _out(res)
+    assert "appdata:1: unraid pool path" in _out(res), _out(res)
+
+
+def test_a_regular_file_the_index_calls_a_symlink_is_still_read(tmp_path: Path) -> None:
+    """Fail-closed on a SPOOFED mode. `update-index --cacheinfo 120000,…` marks any path as a
+    link while the file goes on sitting in the worktree, readable and published — and on
+    Windows with `core.symlinks=false` git itself checks a link out as a regular file holding
+    the link text. Both are ordinary files on disk, so both take the `read_bytes` path."""
+    repo = tmp_path / "spoof"
+    _seeded(repo)
+    _write(repo, "link", f"AGENT={_ADDR}\n")
+    blob = _git(repo, "hash-object", "-w", "link").strip()
+    _git(repo, "update-index", "--add", "--cacheinfo", f"120000,{blob},link")
+    assert _git(repo, "ls-files", "-s", "link").startswith("120000"), "premise"
+    res = _cli(repo)
+    assert res.returncode == 1 and "link:1: private IPv4 (RFC1918)" in _out(res), _out(res)
+
+
+def test_a_tag_object_git_cannot_read_is_reported_not_dropped(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`refs_being_published` broke out of the tag walk on a `cat-file` failure and returned
+    `[]` — a tag this scan could not vouch for, silently cleared. Measured by the audit. It is
+    now an `unscannable` entry, which is exit 1 at the CLI."""
+    repo = tmp_path / "tags"
+    _seeded(repo)
+    _git(repo, "tag", "-a", "v1", "-m", "release notes")
+    real = guard._git
+
+    def refuse_tag_bodies(root: Path, *args: str) -> str:
+        if args[:2] == ("cat-file", "tag"):
+            raise subprocess.CalledProcessError(128, ["git", *args], output=b"", stderr=b"")
+        return real(root, *args)
+
+    monkeypatch.setattr(guard, "_git", refuse_tag_bodies)
+    unreadable: list[str] = []
+    assert guard.refs_being_published(repo, "refs/tags/v1", unreadable) == []
+    assert unreadable and "could not read it" in unreadable[0], unreadable
+    result = guard.scan_range(repo, "refs/tags/v1", guard.compile_patterns())
+    assert result.unscannable, "the dropped tag did not reach the range result"
+
+
+def test_the_selftest_verdict_is_live_in_both_directions(
+        monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """`selftest()` collects a `bad` list and returns 1 on it — and no test ever handed it a
+    corpus it should refuse, so `bad = []` inserted before the verdict left every self-test
+    test green (measured by the audit). A deny case that cannot fire, and an allow case that
+    does, must each fail it."""
+    compiled = guard.compile_patterns()
+    assert guard.selftest(compiled) == 0
+    monkeypatch.setattr(guard, "_MUST_FAIL",
+                        [*guard._MUST_FAIL, ("private IPv4 (RFC1918)", "nothing to see here")])
+    assert guard.selftest(compiled) == 1
+    assert "SHOULD have been caught" in capsys.readouterr().out
+    monkeypatch.undo()
+    monkeypatch.setattr(guard, "_MUST_PASS", [*guard._MUST_PASS, f"AGENT={_ADDR}"])
+    assert guard.selftest(compiled) == 1
+    assert "false positive" in capsys.readouterr().out
+
+
+@pytest.mark.timeout(300)
+def test_a_shallow_clone_is_refused_rather_than_scanned_as_complete(tmp_path: Path) -> None:
+    """The refusal exists (`is_shallow`) and nothing drove it: a `--depth 1` clone's history is
+    truncated, so `rev-list` succeeds against the wrong base and a range scan there would
+    vouch for commits it never saw. Exit 1, and the word an operator can search for."""
+    origin = tmp_path / "origin"
+    _seeded(origin)
+    _write(origin, "a.txt", "second\n")
+    _commit(origin, "second")
+    shallow = tmp_path / "shallow"
+    _git(tmp_path, "clone", "-q", "--depth", "1", origin.as_uri(), str(shallow))
+    assert (shallow / ".git" / "shallow").exists(), "premise: the clone is not shallow"
+    res = _cli(shallow, "--range", "HEAD")
+    assert res.returncode == 1, _out(res)
+    assert "SHALLOW" in _out(res), _out(res)
+
+
+def test_an_svg_is_text_and_a_leak_inside_one_is_found(tmp_path: Path) -> None:
+    """`.svg` is pinned OUT of `SKIP_SUFFIXES` by tuple membership — which a second suffix list
+    consulted by the scan would walk past. This plants the leak the icon-URL incident was."""
+    repo = tmp_path / "svg"
+    _seeded(repo)
+    _write(repo, "icon.svg", f'<svg><title>{_HOST}</title></svg>\n')
+    _commit(repo, "icon")
+    res = _cli(repo)
+    assert res.returncode == 1 and f"icon.svg:1: private lan domain: {_HOST!r}" in _out(res)
+
+
+def test_a_utf8_bom_does_not_hide_a_leak_on_the_first_line(tmp_path: Path) -> None:
+    """Caught today (the audit measured it) and pinned nowhere: a BOM is three bytes in front of
+    the first line, and a left bound that treated them as a word character would hide it."""
+    repo = tmp_path / "bom"
+    _seeded(repo)
+    (repo / "notes.txt").write_bytes(b"\xef\xbb\xbfAGENT=" + _ADDR.encode() + b"\n")
+    _commit(repo, "bom")
+    res = _cli(repo)
+    assert res.returncode == 1 and "notes.txt:1: private IPv4 (RFC1918)" in _out(res), _out(res)
+
+
+# ===========================================================================================
 # consumer#20 — a leak in a PATH
 # ===========================================================================================
 
@@ -252,6 +411,56 @@ def test_a_NEW_pattern_reaches_every_surface_unless_an_override_says_otherwise(
     finally:
         guard.path_patterns.cache_clear()
         guard.message_patterns.cache_clear()
+
+
+# ================================ #11: two inherited false reds — text that identifies nobody
+# ⚠️ Every shape below is ASSEMBLED at runtime — the firing ones because this file is scanned by
+# the guard it tests and only the engine's own source is exempt; the two placeholder UUIDs
+# because a SIBLING guard that has not learned this carve-out yet scans this repository too, and
+# a literal here would redden it until it is re-ported.
+_NIL_UUID = "-".join("0" * n for n in (8, 4, 4, 4, 12))
+_MAX_UUID = "-".join("f" * n for n in (8, 4, 4, 4, 12))
+_USERS = "C:" + "\\Users\\"
+
+
+def test_the_windows_administrator_profile_is_a_built_in_and_does_not_fire() -> None:
+    """`C:\\Users\\Administrator` is the canonical Windows Server account. It names no person, it
+    appears in ordinary runbooks, and it is the same class as `runneradmin`, which was added to
+    the carve-out for the same reason. A guard that reddens it gets switched off."""
+    for text in (f"log files land in {_USERS}Administrator\\AppData\\Local\\Temp",
+                 f"posix-separated {_USERS.replace(chr(92), '/')}Administrator/Documents"):
+        assert guard.scan_text(text, guard.compile_patterns()) == [], text
+
+
+@pytest.mark.parametrize("account", ["Administrator2", "Administrators", "Administrator-old"])
+def test_a_profile_that_merely_begins_with_administrator_still_fires(account: str) -> None:
+    """The carve-out is bounded on `(?![\\w.-])`: an account somebody CREATED, however it is
+    spelled, is still a profile path naming them."""
+    hits = guard.scan_text(f"profile at {_USERS}{account}\\AppData", guard.compile_patterns())
+    assert [label for _, label, _ in hits] == ["windows profile path"]
+
+
+def test_the_nil_and_max_uuids_are_the_placeholder_convention_and_do_not_fire() -> None:
+    """RFC 9562 reserves all-zeroes and all-`f` exactly as RFC 5737 reserves the documentation
+    ranges: they identify nobody by construction, and they reach real repositories as a
+    `DEFAULT_TENANT` sentinel, a `.csproj` `ProjectGuid` or a migration's seed row."""
+    for text in (f"DEFAULT_TENANT = '{_NIL_UUID}'", f"MAX = '{_MAX_UUID}'",
+                 f"<ProjectGuid>{{{_MAX_UUID.upper()}}}</ProjectGuid>"):
+        assert guard.scan_text(text, guard.compile_patterns()) == [], text
+
+
+def test_one_digit_off_the_nil_uuid_is_a_real_id_and_still_fires() -> None:
+    nearly = _NIL_UUID[:-1] + "1"
+    hits = guard.scan_text(f"TENANT={nearly}", guard.compile_patterns())
+    assert [label for _, label, _ in hits] == ["uuid (access policy / tenant id)"]
+
+
+def test_the_nil_uuid_grants_no_amnesty_to_a_leak_beside_it() -> None:
+    """A permitted span suppresses only what it CONTAINS — the containment rule the whole allowlist
+    rests on — so a real value sharing the line with the placeholder is still reported."""
+    host = "host-a" + ".lan"
+    hits = guard.scan_text(f"TENANT={_NIL_UUID} on {host}", guard.compile_patterns())
+    assert [label for _, label, _ in hits] == ["private lan domain"]
 
 
 def test_the_PATH_surface_runs_a_DIFFERENT_pattern_set_and_says_which() -> None:

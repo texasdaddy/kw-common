@@ -61,14 +61,14 @@ and downloads the template beside it; neither runs anything it downloaded.
 
 ```powershell
 New-Item -ItemType Directory -Force -Path .\configs
-Invoke-WebRequest -Uri https://raw.githubusercontent.com/texasdaddy/kw-common/v1.4.0/alerting.env.template -OutFile .\configs\alerting.env
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/texasdaddy/kw-common/v1.4.1/alerting.env.template -OutFile .\configs\alerting.env
 ```
 
 ### macOS and Linux
 
 ```sh
 mkdir -p ./configs
-curl -fLo ./configs/alerting.env https://raw.githubusercontent.com/texasdaddy/kw-common/v1.4.0/alerting.env.template
+curl -fLo ./configs/alerting.env https://raw.githubusercontent.com/texasdaddy/kw-common/v1.4.1/alerting.env.template
 ```
 
 `-f` makes `curl` fail on an HTTP error rather than writing the error page into your config file —
@@ -211,4 +211,5 @@ re-validates whatever the timestamps say, and a restore of identical contents co
 ⚠️ What it still cannot see is a change **outside** the file: the ntfy endpoint going away, the
 app password being revoked at the provider, DNS moving. Boot validation answers "is this
 configuration well-formed and sendable-looking", never "is the far end still there" — that is what
-the periodic self-test is for.
+a periodic self-test is for. The fleet standard requires one of every adopter; this library does
+not implement it, and nothing in it is scheduled.

@@ -42,6 +42,12 @@ jobs:
       # `python scripts/check_no_internal_info.py`, which is a path that no longer exists: had it
       # been left, the first `v*` tag would have failed the publish with a FileNotFoundError, and
       # the failure would have looked like a broken workflow rather than a stale invocation.
+      #
+      # ⛔ `-e` IS LOAD-BEARING FOR THE RANGE SCAN BELOW (#13): the guard skips its own synthetic
+      # deny corpus by PATH relative to the scanned root, and a range scan has no bytes to
+      # recognise it by. An editable install resolves `__file__` inside this checkout; a
+      # site-packages install does not, and the range scan over this repository's history then
+      # reports the corpus. Same comment as `ci.yml`; `tests/test_leak_guard_hook.py` pins both.
       - name: Install the package (the guard ships inside it)
         run: |
           python -m pip install --upgrade pip
@@ -58,7 +64,10 @@ jobs:
       #
       # Two ways an empty range arises on a tag, both real:
       #   * the FIRST release ever — there is no previous tag at all (this is v1.0.0's case);
-      #   * a re-tag of an already-released commit.
+      #   * a tag cut on the SAME commit as the previous release (a re-tag): every tag at HEAD
+      #     is excluded below, so `describe` finds the release before that one and the range is
+      #     then NOT empty — it is only empty when no earlier tag exists at all. (Walked by the
+      #     audit; the earlier wording here called every re-tag an empty range.)
       # In each case fall back to scanning ALL history reachable from the tag. Slower, once, and
       # the only answer that cannot silently publish an unscanned commit.
       # ⭐⭐ THE RANGE NAMES THE TAG REF, NOT `HEAD` — and that is the whole point of this step
@@ -126,9 +135,14 @@ jobs:
           python -m pip install -e .
           python -m pip install "ruff==0.16.1" "mypy==2.3.0" "pytest==9.1.1" \
                                 "pytest-timeout==2.4.0"
-      - run: ruff check .
-      - run: mypy
-      - run: python -u -m pytest
+      # Named, like their `ci.yml` twins, so the step-name comparison in
+      # `tests/test_leak_guard_hook.py` can see them: an anonymous step is invisible to it.
+      - name: Lint
+        run: ruff check .
+      - name: Type-check
+        run: mypy
+      - name: Test
+        run: python -u -m pytest
 
   build:
     name: Build the wheel and sdist
@@ -239,7 +253,12 @@ jobs:
           for required in '/tests/conftest.py' '/.leakguard.json' '/.github/workflows/ci.yml' \
                           '/alerting.env.template' '/docs/alerting-setup.md' \
                           '/.githooks/pre-push'; do
-            echo "$names" | grep -q "${required}\$" || {
+            # ⛔ ANCHORED AT THE TOP OF THE TARBALL, not only on the right. `"${required}\$"` alone
+            # is satisfied at ANY depth — a `vendor/tests/conftest.py` with no top-level
+            # `tests/conftest.py` passed this roll-call (measured by the audit). The tarball's
+            # names all begin with ONE directory (`kw_common-X.Y.Z/`), so exactly one
+            # slash-free component may precede the required path.
+            echo "$names" | grep -q "^[^/]*${required}\$" || {
               echo "::error::the sdist has no ${required} — its suite ships without something it"
               echo "::error::depends on. Check MANIFEST.in."
               exit 1
