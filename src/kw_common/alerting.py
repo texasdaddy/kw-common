@@ -167,9 +167,13 @@ THE RETRIEVABLE ERROR LOG (`error_log=`)
     fetched off the box and read by tooling. Whatever a caller puts in a message now has that
     lifetime. Do not put a credential, a token, or an OAuth callback URL with its query string
     into a title or a message — sanitise at the raise site, where the value is understood. The
-    file is created 0o600 in a 0o700 directory AND an existing one is narrowed to the same on
-    every write, because a mode passed at creation does nothing for a path that already exists.
-    Treat it as operator-confidential, not as safe to hand around.
+    file is created 0o600 in a 0o700 directory, and narrowing an existing one to the same is
+    ATTEMPTED on every write, because a mode passed at creation does nothing for a path that
+    already exists. ⚠️ Attempted, not guaranteed: on a bind mount whose uid does not match this
+    process the `chmod` is refused, and then the file keeps whatever mode it had — a WARNING says
+    so, naming the path and the errno, which is the whole of #21. Treat it as
+    operator-confidential, not as safe to hand around, and read the boot log before believing the
+    mode is what this paragraph asks for.
 """
 
 from __future__ import annotations
@@ -1812,7 +1816,15 @@ class Alerter:
                 if not os.access(directory, os.W_OK):
                     return f"error_log points into {directory!r}, which is not writable"
                 return ""
-            parent = os.path.dirname(directory.rstrip("/\\")) or os.sep
+            # ⚠️ `abspath` FIRST, AND THE REASON IS A FALSE ALARM THAT ONLY FIRES ON LINUX. For a
+            # RELATIVE `error_log` with one directory component — `logs/errors.log` — `dirname`
+            # of `logs` is `""`, and the old `or os.sep` fallback then made the parent the
+            # FILESYSTEM ROOT rather than the process's own working directory. `/` is not writable
+            # by any non-root uid, so the writability check below reported a perfectly healthy sink
+            # as broken, on exactly the containers this check was written for. `abspath` resolves
+            # a relative directory against the cwd, which is what the line above already does with
+            # its `or "."`, and is a no-op for the absolute paths the standard prescribes.
+            parent = os.path.dirname(os.path.abspath(directory))
             if not os.path.isdir(parent):
                 return (f"error_log points into {directory!r}, and even its parent {parent!r} "
                         f"does not exist — in a container that usually means the volume is not "

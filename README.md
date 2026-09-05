@@ -16,13 +16,13 @@ no port, no alignment audit, and no "which copy is the good one" question to ans
 Consumers install from git at an **exact tag** — never a branch:
 
 ```
-pip install git+https://github.com/texasdaddy/kw-common@v1.3.0
+pip install git+https://github.com/texasdaddy/kw-common@v1.4.0
 ```
 
 In a `requirements.in` / `requirements.txt`:
 
 ```
-kw-common @ git+https://github.com/texasdaddy/kw-common@v1.3.0
+kw-common @ git+https://github.com/texasdaddy/kw-common@v1.4.0
 ```
 
 ⛔ **Never pin a branch.** `@main` makes every rebuild of every consumer a silent, unreviewed
@@ -148,7 +148,9 @@ the marker, so the confirmation is not lost to a boot that could not send it.
 preserve mtime, so a config restored at an older timestamp was never re-checked: a broken file
 booted clean and the service came up alerting nobody. A digest answers that whatever the clock
 says, in both directions — a restore with different bytes re-validates, an identical one does not.
-Upgrading from a version that wrote an empty marker costs exactly one re-validation, silently.
+Upgrading from a version that wrote an empty marker costs exactly one re-validation — **and one
+confirmation alert per service**, since a re-validation announces. That is not silent, and an
+operator upgrading a fleet should expect one message per service rather than none.
 
 ⭐ **And the marker is created `0600`, because contents that decide are contents somebody can
 read.** The digest is taken over the file holding the SMTP password, so a marker the rest of a

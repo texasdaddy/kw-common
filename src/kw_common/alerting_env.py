@@ -315,24 +315,23 @@ def read_config(config_path: str | os.PathLike[str]) -> dict[str, str]:
         with open(path, encoding="utf-8", newline="") as fh:
             raw = fh.read()
     except FileNotFoundError as exc:
-        # ⭐⭐ THE MOUNT AND THE FILE ARE SEPARATED HERE, not only in `_check_layout`. The standard
-        # claims a missing MOUNT and a missing FILE send an operator to different places, and
-        # `validate_boot` does carry that split — but on the sequence the setup document
-        # prescribes it never fires, because the loader calls THIS function before validation
-        # runs, so both cases arrived as one undifferentiated "does not exist". The first adopter
-        # measured it both ways. The claim is cheaper to make true than to retract: the file's own
-        # directory answers the question, and it is one `is_dir()` away.
-        if path.parent.is_dir():
-            raise _refuse(
-                f"the shared alerting config {path} does not exist, although the directory "
-                f"{path.parent} it belongs in does — so the volume is mounted and the file is "
-                f"missing. See the setup document for how to create it.") from exc
+        # ⛔ THIS FUNCTION DOES NOT DIAGNOSE THE MOUNT, AND A VERSION OF IT THAT TRIED WAS WRONG
+        # IN BOTH DIRECTIONS. The standard claims a missing MOUNT and a missing FILE send an
+        # operator to different places, and on the prescribed sequence nothing was drawing that
+        # distinction, so an attempt was made here — deciding it from `path.parent`. It cannot be
+        # decided from there: the config lives at `<shared root>/configs/alerting.env`, so the
+        # file's own directory is one level BELOW the mount. A correctly mounted volume whose
+        # `configs/` has not been created yet — the ordinary state between steps 1 and 2 of the
+        # setup document — was accused of not being mounted; and a `configs/` baked into the image
+        # at the mountpoint, with the volume NOT mounted over it, read as "the volume is mounted,
+        # go and create the file", which an operator would then create in the disposable layer.
+        #
+        # Only the SHARED_ROOT value answers the mount question, and this function is not given it.
+        # `_check_layout` has always answered it correctly from that value; what was missing was
+        # anything asking BEFORE this read, which `load_alert_settings_from_env` now does.
         raise _refuse(
-            f"the shared alerting config {path} does not exist, and neither does {path.parent}, "
-            f"the directory it lives in. In a container that is the MOUNT rather than the file: "
-            f"the volume was never added to the template, was added with a host path that does "
-            f"not exist, or points at somewhere that does not contain {CONFIG_RELPATH!r}. Check "
-            f"the volume before looking for the file.") from exc
+            f"the shared alerting config {path} does not exist. It is the file every service in "
+            f"the fleet reads; see the setup document for how to create it.") from exc
     except OSError as exc:
         raise _refuse(
             f"the shared alerting config {path} could not be read ({type(exc).__name__}: {exc}). "
@@ -468,9 +467,32 @@ def load_alert_settings_from_env(service: str) -> AlertSettings:
 
     Raises `AlertEnvError` if either variable is unset or blank. It does not fall back, and it
     does not guess an environment.
+
+    ⭐⭐ THE MOUNT IS CHECKED HERE, BEFORE THE FILE IS READ, AND THAT ORDERING IS THE WHOLE POINT.
+    The standard says a missing MOUNT and a missing FILE send an operator to different places.
+    `validate_boot._check_layout` has always drawn that distinction correctly — and on the sequence
+    the setup document prescribes it never ran, because this function reads the config first, so
+    both cases surfaced as `read_config`'s undifferentiated "does not exist". The first adopter
+    measured it both ways.
+
+    ⛔ IT IS ASKED OF `SHARED_ROOT`, NOT OF THE CONFIG PATH, because only the mount value can
+    answer it. Deciding it from the config file's own directory was tried and is wrong in both
+    directions — that directory is one level BELOW the mount, so a correctly mounted volume whose
+    `configs/` is not yet created reads as a missing volume, and a `configs/` baked into an image
+    at the mountpoint reads as a mounted one. See the note in `read_config`.
+
+    This duplicates `_check_layout`'s first question deliberately. That one still runs, for callers
+    that build settings some other way and validate afterwards; this one exists so the answer
+    arrives on the path every service in this deployment actually takes.
     """
     shared_root = _require_env(SHARED_ROOT_VAR)
     deploy_env = _require_env(DEPLOY_ENV_VAR)
+    if not Path(shared_root).is_dir():
+        raise _refuse(
+            f"the shared root {shared_root} is not a directory, so there is no configuration to "
+            f"read. In a container this is the MOUNT rather than the file: the volume was never "
+            f"added to the template, or was added with a host path that does not exist. It is the "
+            f"{SHARED_ROOT_VAR} variable.")
     return load_alert_settings(config_file_for(shared_root), deploy_env, service)
 
 
@@ -647,7 +669,7 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
         # would send one either, because the marker suppresses them, so the proof was lost until
         # somebody edited the file. The next boot after `configure()` validates and announces.
         return True
-    _write_marker(marker, digest)
+    _write_marker(marker, digest, consequence=_WROTE_NOTHING_AFTER_VALIDATING)
     return True
 
 
@@ -872,6 +894,28 @@ def _exposed_bits(path: Path) -> int:
         return 0
 
 
+def _owner_can_read(path: Path) -> bool:
+    """Whether the user that just wrote this marker can read it BACK.
+
+    ⭐⭐ THE OTHER HALF OF THE MODE, AND THE ONE WITH THE WORSE FAILURE. Checking only that nobody
+    else can read the marker verifies the property this release wanted and not the property it
+    needs. A `umask` of `0477`, or a CIFS mount with `file_mode=0200`, turns the 0600 that was
+    asked for into 0200: no group or other bits, so the exposure check is satisfied — and
+    `_marker_matches` can then never read it, so the service validates and ANNOUNCES on every
+    single boot, forever, with nothing logged. That is the "obvious wrong fix" outcome arrived at
+    from the opposite side, and silently, which is worse than the exposure it was guarding.
+
+    `True` when the mode cannot be inspected, for the same reason `_exposed_bits` answers `0`: a
+    check that cannot see is not evidence of a fault, and warning on it would fire everywhere.
+    """
+    if os.name != "posix":
+        return True
+    try:
+        return bool(stat.S_IMODE(path.stat().st_mode) & stat.S_IRUSR)
+    except OSError:
+        return True
+
+
 def _reharden(marker: Path) -> None:
     """Re-write an already-correct marker that is readable beyond its owner, keeping its contents.
 
@@ -891,7 +935,12 @@ def _reharden(marker: Path) -> None:
     if not _exposed_bits(marker):
         return
     try:
-        recorded = marker.read_text(encoding="utf-8").strip()
+        # ⚠️ `errors="replace"`, MATCHING `_marker_matches`. A strict decode raises
+        # `UnicodeDecodeError`, which is a `ValueError` and NOT an `OSError` — so it would travel
+        # straight out of `validate_boot`, a function documented to raise `AlertEnvError` and
+        # nothing else, and turn a cosmetic permission repair into a boot crash. The two readers of
+        # this file must also decode it the same way or they can disagree about its contents.
+        recorded = marker.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         # It was readable a moment ago, in `_marker_matches`. If it is not now, the next boot
         # re-validates, which is the safe direction and needs no announcement here.
@@ -899,10 +948,27 @@ def _reharden(marker: Path) -> None:
     log.info("alerting: narrowing the validation marker %s, which an earlier release created "
              "readable by anything with this volume mounted. Its contents do not change and this "
              "boot is not re-validated.", marker)
-    _write_marker(marker, recorded)
+    _write_marker(marker, recorded, consequence=_COULD_NOT_NARROW_AN_EXISTING_MARKER)
 
 
-def _write_marker(marker: Path, digest: str) -> None:
+# ⭐⭐ THE CONSEQUENCE OF A FAILED MARKER WRITE DEPENDS ENTIRELY ON WHY IT WAS BEING WRITTEN, AND
+# ONE SENTENCE FOR BOTH WAS FALSE FOR ONE OF THEM. `_write_marker` was written for the validation
+# path and its message says "the configuration is valid and was announced, but every boot will
+# re-validate and re-announce". Reused verbatim by the upgrade repair, every clause of that is
+# wrong: nothing was announced on that boot, and no later boot re-validates — the marker still
+# matches, so the skip keeps firing — while the thing that IS true, that the marker could not be
+# narrowed and is still readable, went unsaid. So the caller supplies the consequence, because the
+# caller is the only one that knows it.
+_WROTE_NOTHING_AFTER_VALIDATING = (
+    "The configuration is valid and was announced, but every boot will re-validate and re-announce "
+    "until this directory is writable.")
+_COULD_NOT_NARROW_AN_EXISTING_MARKER = (
+    "Nothing else changed: the marker still records the right digest, and this boot correctly "
+    "skipped validation. What did not happen is the narrowing — it is still readable by anything "
+    "with this volume mounted, and it records a digest of the file holding the SMTP password.")
+
+
+def _write_marker(marker: Path, digest: str, *, consequence: str) -> None:
     """Record the digest of the config that was VALIDATED, in the app's own read-write directory.
 
     ⭐ ONE LINE, `sha256:<hex>`, AND NOTHING ELSE. The marker used to be empty and its whole
@@ -985,10 +1051,8 @@ def _write_marker(marker: Path, digest: str) -> None:
         os.replace(tmp, marker)
     except OSError as exc:
         _discard(tmp)
-        log.warning("alerting: could not write the validation marker %s (%s) — the configuration "
-                    "is valid and was announced, but every boot will re-validate and re-announce "
-                    "until this directory is writable. It is the CONFIG_PATH variable.",
-                    marker, type(exc).__name__)
+        log.warning("alerting: could not write the validation marker %s (%s). %s It is the "
+                    "%s variable.", marker, type(exc).__name__, consequence, CONFIG_PATH_VAR)
         return
     exposed = _exposed_bits(marker)
     if exposed:
@@ -998,3 +1062,12 @@ def _write_marker(marker: Path, digest: str) -> None:
                     "A filesystem that ignores these bits (vfat, most CIFS mounts) reads like "
                     "this, and on such a mount the config file itself is just as readable.",
                     marker, oct(exposed))
+    if not _owner_can_read(marker):
+        # ⭐⭐ THE FAILURE THAT IS OTHERWISE SILENT. Nothing here can repair it — the mode asked for
+        # was 0600 and the filesystem narrowed it further — so the only thing to do is say so, and
+        # saying so is the entire difference between a diagnosable fleet and a service that
+        # re-announces every boot while every check reports success.
+        log.warning("alerting: the validation marker %s is not readable by the user that wrote it. "
+                    "Nothing can match it, so this service will re-validate and send its "
+                    "confirmation alert on EVERY boot. A umask that removes the owner's read bit, "
+                    "or a mount whose file_mode does, reads like this.", marker)

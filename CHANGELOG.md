@@ -70,9 +70,18 @@ reproduces, and two of which this project had introduced itself one release earl
 - **A missing MOUNT and a missing FILE now say different things on the sequence the setup document
   prescribes.** `validate_boot` has always carried a mount-specific refusal, and on that sequence
   it never fired: the loader calls `read_config` first, so both cases arrived as one
-  undifferentiated "does not exist". Measured both ways by the first adopter. `read_config` now
-  answers it from the config file's own directory, which is the cheapest place the claim can be
-  made true.
+  undifferentiated "does not exist". Measured both ways by the first adopter.
+  `load_alert_settings_from_env` now asks the mount question BEFORE the read, and it asks it of
+  `SHARED_ROOT`.
+
+  ⛔ **It is not asked of the config file's own path, and the first attempt at this release did
+  exactly that and was wrong in both directions.** The config lives at
+  `<shared root>/configs/alerting.env`, so its own directory is one level BELOW the mount: a
+  correctly mounted volume whose `configs/` had not been created yet — the ordinary state between
+  steps 1 and 2 of the setup document — was told its volume was missing, and a `configs/` baked
+  into an image at the mountpoint with no volume over it was told the volume was fine and to go
+  and create the file, which it would then have created in the disposable layer. Only the
+  `SHARED_ROOT` value can answer the question, and it is now asked of that.
 
 ### Adopters
 
@@ -83,8 +92,12 @@ somebody happened to edit the shared config. So the first boot after this upgrad
 marker in place: **same contents, narrower mode, no re-validation and no duplicate confirmation
 alert.** One `INFO` line says it happened.
 
-A service on a uid-mismatched volume will also start seeing a warning per alert about the error
-log's permissions. That condition was already there; this is the release that stops hiding it.
+A service on a uid-mismatched volume will also start seeing warnings about the error log's
+permissions — **two on the first WARN or ERROR alert and three on every one after**, because the
+record path narrows the directory, then the file before the write, then the file again after it,
+and each refusal is now reported. Measured, not estimated. That condition was already there; this
+is the release that stops hiding it, and the volume of it is the honest measure of how often it
+was happening in silence.
 
 ## [1.3.0] - 2026-09-03
 
@@ -627,6 +640,7 @@ every service runs the same code instead of a copy that drifts.
   default" — `Alerter.read_errors()` passes the settings' value, so the reader and the roller
   cannot disagree. Calling the function directly with `backups=None` raises; see issue #5.
 
+[1.4.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.4.0
 [1.3.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.3.0
 [1.2.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.2.0
 [1.1.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.1.0

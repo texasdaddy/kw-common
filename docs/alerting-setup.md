@@ -61,14 +61,14 @@ and downloads the template beside it; neither runs anything it downloaded.
 
 ```powershell
 New-Item -ItemType Directory -Force -Path .\configs
-Invoke-WebRequest -Uri https://raw.githubusercontent.com/texasdaddy/kw-common/v1.3.0/alerting.env.template -OutFile .\configs\alerting.env
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/texasdaddy/kw-common/v1.4.0/alerting.env.template -OutFile .\configs\alerting.env
 ```
 
 ### macOS and Linux
 
 ```sh
 mkdir -p ./configs
-curl -fLo ./configs/alerting.env https://raw.githubusercontent.com/texasdaddy/kw-common/v1.3.0/alerting.env.template
+curl -fLo ./configs/alerting.env https://raw.githubusercontent.com/texasdaddy/kw-common/v1.4.0/alerting.env.template
 ```
 
 `-f` makes `curl` fail on an HTTP error rather than writing the error page into your config file —
@@ -149,7 +149,9 @@ validate_boot_from_env(settings, alerter=alerter)
 ```
 
 `load_alert_settings_from_env` reads `SHARED_ROOT` and `DEPLOY_ENV` and raises `AlertEnvError` if
-either is unset. `validate_boot_from_env` additionally reads `CONFIG_PATH` and checks:
+either is unset — and if `SHARED_ROOT` is not a directory it says so in those terms, because a
+missing **mount** and a missing **file** send you to different places and the mount is the one you
+check first. `validate_boot_from_env` additionally reads `CONFIG_PATH` and checks:
 
 * the shared root is mounted and carries `configs/`;
 * the file reads and is UTF-8;

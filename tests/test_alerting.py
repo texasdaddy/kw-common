@@ -2091,6 +2091,36 @@ def test_an_absent_log_directory_under_a_writable_parent_is_not_a_problem(
     assert Alerter(settings).error_log_problem() == ""
 
 
+def test_a_relative_error_log_is_resolved_against_the_working_directory(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """⭐⭐ A FALSE ALARM THAT ONLY FIRED ON LINUX, WHICH IS THE ONLY PLACE IT MATTERS.
+
+    For a relative `error_log` with one directory component, `os.path.dirname("logs")` is `""`, and
+    the old `or os.sep` fallback then made the parent the FILESYSTEM ROOT rather than the process's
+    own working directory. `/` is not writable by any non-root uid, so the check reported a
+    perfectly healthy sink as broken — on exactly the unprivileged containers the check was written
+    for, and invisibly on this workstation, where the root of the current drive IS writable.
+
+    `os.access` is given POSIX root semantics here rather than the platform's, because the defect
+    is a property of the path arithmetic and the platform is what hid it.
+    """
+    monkeypatch.chdir(tmp_path)
+    real_access = os.access
+    monkeypatch.setattr(
+        alerting.os, "access",
+        lambda path, mode, *a, **k: False if str(path) in ("/", "\\", os.sep)
+        else real_access(path, mode, *a, **k))
+
+    settings = AlertSettings(service="svc", error_log="logs/errors.log")
+    assert Alerter(settings).error_log_problem() == "", (
+        "a healthy relative path was reported broken because its parent resolved to the "
+        "filesystem root")
+
+    # And the sink really does work, so the "" above is the right answer rather than a lucky one.
+    Alerter(settings).notify(ERROR, "svc: down", "no route to host")
+    assert (tmp_path / "logs" / "errors.log").is_file()
+
+
 def test_a_healthy_error_log_directory_is_not_a_problem(tmp_path: Path) -> None:
     """The plainest correct configuration there is: the directory exists and is writable."""
     directory = tmp_path / "logs"

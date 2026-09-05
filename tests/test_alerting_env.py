@@ -1050,7 +1050,7 @@ def test_a_digest_that_is_not_a_sha256_LINE_writes_no_marker_and_says_so(
 
     marker = tmp_path / "app" / marker_name("prod")
     with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
-        _write_marker(marker, digest)
+        _write_marker(marker, digest, consequence="<the caller's own consequence>")
 
     assert not marker.exists(), (
         f"a marker was written for {digest!r}, which `_marker_matches` can never match — every "
@@ -1600,47 +1600,191 @@ def test_a_missing_config_in_a_directory_that_exists_blames_the_file(tmp_path: P
     assert "MOUNT" not in message
 
 
-def test_a_missing_config_whose_directory_is_absent_blames_the_mount(tmp_path: Path) -> None:
-    """⭐⭐ THE CLAIM THE FIRST ADOPTER MEASURED FALSE. The standard says a missing MOUNT and a
-    missing FILE send an operator to different places, and `validate_boot._check_layout` does draw
-    that distinction — but on the sequence the setup document prescribes it never runs, because
-    the loader reads the config BEFORE validation does anything. Both cases arrived as one
-    undifferentiated "does not exist". Now the reader itself answers it."""
-    path = config_file_for(tmp_path / "never-mounted")
-    with pytest.raises(AlertEnvError) as excinfo:
-        read_config(path)
-    message = str(excinfo.value)
-    assert "MOUNT" in message
-    assert CONFIG_RELPATH in message
+def test_a_marker_the_service_cannot_read_back_is_reported(
+        tmp_path: Path, channels: dict[str, Spy], monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐⭐ THE FAILURE THAT IS OTHERWISE COMPLETELY SILENT, AND IT IS THE ACCEPTANCE CRITERION'S
+    OWN "OBVIOUS WRONG FIX" ARRIVED AT FROM THE OTHER SIDE.
+
+    Checking only that nobody ELSE can read the marker verifies the property this release wanted
+    and not the property it needs. A umask of `0477`, or a mount with `file_mode=0200`, turns the
+    0600 that was asked for into 0200: no group or other bits, so the exposure check is satisfied —
+    and nothing can then match the marker, so the service validates and ANNOUNCES on every single
+    boot, forever, with nothing logged at all. Measured that way before this check existed.
+
+    The second boot is the assertion that matters: it proves the state really is the runaway one,
+    rather than proving only that a warning string was formatted.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    monkeypatch.setattr(alerting_env, "_exposed_bits", lambda _path: 0)
+    monkeypatch.setattr(alerting_env, "_owner_can_read", lambda _path: False)
+
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert str(marker) in caplog.text
+    assert "every boot" in caplog.text.lower()
+
+
+def test_the_upgrade_repair_cannot_raise_out_of_validate_boot(
+        tmp_path: Path, channels: dict[str, Spy], monkeypatch: pytest.MonkeyPatch) -> None:
+    """⛔ `AlertEnvError` IS THE ONLY EXCEPTION THIS MODULE RAISES ON PURPOSE, and the repair read
+    the marker with a STRICT decode. `UnicodeDecodeError` is a `ValueError`, not an `OSError`, so
+    it would have travelled straight out of `validate_boot` and turned a cosmetic permission fix
+    into a boot crash. The two readers of this file now decode it the same way.
+
+    Reached by planting bytes rather than by patching the decode, so it is the real call under
+    test. Nothing here asserts a warning: the point is only that the boot survives.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker.write_bytes(b"sha256:" + b"\xff\xfe\x80" * 8 + b"\n")
+    monkeypatch.setattr(alerting_env, "_exposed_bits", lambda _path: 0o044)
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+
+
+def test_owner_can_read_reads_the_owner_bit(tmp_path: Path,
+                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both directions against the SAME file, so it cannot pass by accident of that file's mode;
+    and the platform gate, for the same reason `_exposed_bits` has one."""
+    path = tmp_path / "marker"
+    path.write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(os, "name", "posix")
+    assert alerting_env._owner_can_read(path) is True
+
+    monkeypatch.setattr(alerting_env.stat, "S_IMODE", lambda _mode: 0o200)
+    assert alerting_env._owner_can_read(path) is False
+
+    monkeypatch.setattr(os, "name", "nt")
+    assert alerting_env._owner_can_read(path) is True
+
+
+def test_a_failed_marker_write_says_what_actually_follows_from_it(
+        tmp_path: Path, channels: dict[str, Spy], monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐⭐ ONE MESSAGE FOR TWO CALLERS WAS FALSE FOR ONE OF THEM.
+
+    `_write_marker`'s failure line was written for the validation path — "the configuration is
+    valid and was announced, but every boot will re-validate and re-announce". The upgrade repair
+    reused it verbatim, and every clause was wrong there: nothing was announced on that boot, and
+    no later boot re-validates, because the marker still matches and the skip keeps firing. What
+    was true — the marker could not be narrowed and is still readable — went unsaid, so an
+    operator was sent looking for duplicate alerts that would never arrive while the exposure the
+    release exists to close stayed open.
+
+    Asserted as the two consequences being DIFFERENT and each naming its own outcome, not as two
+    fixed strings: what matters is that the caller's situation reaches the operator.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    blocked = tmp_path / "not-a-directory"
+    blocked.write_text("a file where the marker directory would have to go\n", encoding="utf-8")
+
+    # (1) the validation path: no marker was written, so the next boot really will do it again.
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        assert validate_boot(settings, "prod", blocked / "app",
+                             alerter=Alerter(settings)) is True
+    validating = caplog.text
+    assert "re-validate" in validating
+    assert "still readable" not in validating
+
+    # (2) the repair path: the marker is fine and matching, only the narrowing failed.
+    caplog.clear()
+    reset(channels)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    monkeypatch.setattr(alerting_env, "_exposed_bits", lambda _path: 0o044)
+    monkeypatch.setattr(alerting_env, "_discard", lambda _path: None)
+
+    def refuse(*_a: object, **_k: object) -> int:
+        raise PermissionError("not yours")
+
+    monkeypatch.setattr(alerting_env.os, "open", refuse)
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False
+    repairing = caplog.text
+    assert "readable" in repairing, "the exposure that is still open was not stated"
+    assert "re-validate and re-announce" not in repairing, (
+        "the operator was told to expect alerts that will never arrive")
+    assert marker.is_file()
+
+
+def test_read_config_does_not_try_to_diagnose_the_mount(tmp_path: Path) -> None:
+    """⛔ THE VERSION OF THIS RELEASE THAT ANSWERED THE MOUNT QUESTION HERE WAS WRONG BOTH WAYS.
+
+    `read_config` is given a config path and nothing else, and the config lives at
+    `<shared root>/configs/alerting.env` — so its own directory is one level BELOW the mount.
+    Deciding the mount from it accused a correctly mounted volume whose `configs/` did not exist
+    yet, which is the ordinary state between steps 1 and 2 of the setup document. The reader says
+    what it knows: the file is not there.
+    """
+    absent_mount = config_file_for(tmp_path / "never-mounted")
+    mounted_no_structure = config_file_for(tmp_path)          # the root exists; configs/ does not
+    for path in (absent_mount, mounted_no_structure):
+        with pytest.raises(AlertEnvError) as excinfo:
+            read_config(path)
+        assert "MOUNT" not in str(excinfo.value)
+        assert str(path) in str(excinfo.value)
 
 
 def test_the_mount_diagnosis_is_reachable_through_the_prescribed_loader(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """⭐ ASKED THROUGH THE DOCUMENTED CALL SEQUENCE, WHICH IS WHERE IT WAS UNREACHABLE.
+    """⭐⭐ THE CLAIM THE FIRST ADOPTER MEASURED FALSE, ASKED THROUGH THE DOCUMENTED SEQUENCE.
 
-    `read_config` having the right answer is not the claim; an operator whose volume is missing
-    seeing it is. So this goes in the front door — the three variables and
-    `load_alert_settings_from_env` — rather than calling the reader directly.
+    The standard says a missing MOUNT and a missing FILE send an operator to different places, and
+    `validate_boot._check_layout` does draw that distinction — but on the sequence the setup
+    document prescribes it never runs, because the loader reads the config BEFORE validation does
+    anything. Both cases arrived as one undifferentiated "does not exist".
+
+    So the question is asked in the loader, and asked of `SHARED_ROOT`, which is the only value
+    that can answer it. Going in the front door is the point: `read_config` having the right answer
+    would not be the claim — an operator whose volume is missing seeing it is.
     """
     monkeypatch.setenv(SHARED_ROOT_VAR, str(tmp_path / "never-mounted"))
     monkeypatch.setenv(CONFIG_PATH_VAR, str(tmp_path / "app"))
     monkeypatch.setenv(DEPLOY_ENV_VAR, "prod")
     with pytest.raises(AlertEnvError) as excinfo:
         load_alert_settings_from_env("feed-poller")
-    assert "MOUNT" in str(excinfo.value)
+    message = str(excinfo.value)
+    assert "MOUNT" in message
+    assert SHARED_ROOT_VAR in message, "the operator has to be told which variable to look at"
 
 
-def test_the_prescribed_loader_still_blames_the_file_when_the_mount_is_there(
+def test_the_prescribed_loader_blames_the_file_when_the_volume_is_mounted(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The other direction, and the one that makes the test above mean something: a diagnosis that
-    said MOUNT for every missing file would be no more use than the one it replaced."""
-    config_file_for(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    """⭐ THE DIRECTION THAT MAKES THE TEST ABOVE MEAN ANYTHING, AND THE CASE AN EARLIER VERSION OF
+    THIS RELEASE GOT WRONG.
+
+    Both sub-cases are asserted, because the wrong version passed one of them: the volume is
+    mounted and `configs/` exists but the file does not, AND the volume is mounted and `configs/`
+    has not been created yet. The second is the ordinary state between steps 1 and 2 of the setup
+    document, and a test that pre-created `configs/` — as the first draft of this one did — would
+    never have caught the accusation.
+    """
+    monkeypatch.setenv(CONFIG_PATH_VAR, str(tmp_path / "app"))
+    monkeypatch.setenv(DEPLOY_ENV_VAR, "prod")
+
+    structure_missing = tmp_path / "mounted-bare"
+    structure_missing.mkdir()
+    with_structure = tmp_path / "mounted-with-configs"
+    config_file_for(with_structure).parent.mkdir(parents=True)
+
+    for root in (structure_missing, with_structure):
+        monkeypatch.setenv(SHARED_ROOT_VAR, str(root))
+        with pytest.raises(AlertEnvError) as excinfo:
+            load_alert_settings_from_env("feed-poller")
+        assert "MOUNT" not in str(excinfo.value), f"a mounted volume was accused, for {root.name}"
+
+
+def test_the_loader_does_not_refuse_a_mounted_volume(tmp_path: Path,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """The guard must not fail a correct tree: with the volume mounted and the file present, the
+    new check has to be invisible."""
+    write_shared(tmp_path)
     monkeypatch.setenv(SHARED_ROOT_VAR, str(tmp_path))
     monkeypatch.setenv(CONFIG_PATH_VAR, str(tmp_path / "app"))
     monkeypatch.setenv(DEPLOY_ENV_VAR, "prod")
-    with pytest.raises(AlertEnvError) as excinfo:
-        load_alert_settings_from_env("feed-poller")
-    assert "MOUNT" not in str(excinfo.value)
+    settings = load_alert_settings_from_env("feed-poller")
+    assert settings.ntfy_url == GOOD_CONFIG["NTFY_URL_PROD"]
 
 
 def test_the_validation_alert_names_no_value_from_the_config_file(
