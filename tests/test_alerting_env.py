@@ -1625,22 +1625,29 @@ def test_a_marker_the_service_cannot_read_back_is_reported(
     assert "every boot" in caplog.text.lower()
 
 
-def test_the_upgrade_repair_cannot_raise_out_of_validate_boot(
-        tmp_path: Path, channels: dict[str, Spy], monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_upgrade_repair_cannot_raise_on_a_marker_it_cannot_decode(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """⛔ `AlertEnvError` IS THE ONLY EXCEPTION THIS MODULE RAISES ON PURPOSE, and the repair read
     the marker with a STRICT decode. `UnicodeDecodeError` is a `ValueError`, not an `OSError`, so
-    it would have travelled straight out of `validate_boot` and turned a cosmetic permission fix
-    into a boot crash. The two readers of this file now decode it the same way.
+    it would have escaped `_reharden`, escaped `validate_boot`, and turned a cosmetic permission
+    fix into a boot crash. The two readers of this file now decode it the same way.
 
-    Reached by planting bytes rather than by patching the decode, so it is the real call under
-    test. Nothing here asserts a warning: the point is only that the boot survives.
+    ⭐⭐ ASKED OF `_reharden` DIRECTLY, AND THE FIRST VERSION OF THIS TEST WENT THROUGH
+    `validate_boot` AND PROVED NOTHING — the mutation harness caught it surviving. The repair only
+    runs on the SKIP path, and reaching the skip requires `_marker_matches` to have decoded the
+    same file to exactly `sha256:<hex>`, which forces it to be pure ASCII. So the composed path
+    cannot deliver undecodable bytes to this function, and a test that went in the front door
+    silently exercised the validation path instead while asserting a `True` that meant something
+    else entirely. The unit is reachable even though the composition is not, and the contract is
+    about the unit: nothing in here may raise anything but `AlertEnvError`.
     """
-    settings, marker_dir, marker = _validated(tmp_path)
-    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker = tmp_path / "app" / marker_name("prod")
+    marker.parent.mkdir(parents=True)
     marker.write_bytes(b"sha256:" + b"\xff\xfe\x80" * 8 + b"\n")
     monkeypatch.setattr(alerting_env, "_exposed_bits", lambda _path: 0o044)
 
-    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    alerting_env._reharden(marker)          # must not raise
+    assert marker.is_file(), "the marker was destroyed by a repair it could not perform"
 
 
 def test_owner_can_read_reads_the_owner_bit(tmp_path: Path,
