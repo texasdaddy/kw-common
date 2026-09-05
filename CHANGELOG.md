@@ -9,6 +9,115 @@ exported symbol that changed. ⛔ It does NOT name the consumers that need a cod
 repository is public, and honouring that older promise would publish the fleet's inventory at
 exactly the moment the release notes are read most widely.
 
+## [1.4.0] - 2026-09-04
+
+What the first adopter found. Every item here came out of this library meeting a real bind mount,
+a real uid mismatch and a real shared volume — none of which a unit test on a developer machine
+reproduces, and two of which this project had introduced itself one release earlier.
+
+### Security
+
+- **The validation marker is created `0600` (#20).** Its contents are a sha256 of the shared
+  config, and that file holds `SMTP_PASSWORD`. Written `0644` into a shared appdata volume, that
+  is an **offline verification oracle**: anything with the volume mounted can confirm a guess at
+  the file's contents against the digest, at no rate limit, with no connection to the mail
+  provider and no log line anywhere. 1.3.0 introduced it — the empty marker it replaced had
+  nothing to leak — which makes it the most direct kind of regression: a security property traded
+  away to buy a correctness one, without anyone noticing the trade.
+
+  The write is now `os.open(..., 0o600)` into a temporary file and `os.replace` into position,
+  **not a `chmod`**, and the difference is load-bearing rather than stylistic. A `chmod` is
+  exactly the call that fails on a uid-mismatched bind mount (#21 below), so the obvious fix would
+  have narrowed nothing on the deployments that need it most while every test went green.
+  `os.replace` needs only the directory to be writable — and it must be, or there would be no
+  marker at all — so a `0644` marker an earlier version left behind is replaced rather than
+  adjusted in place. Where the filesystem cannot express the mode (vfat, most CIFS mounts) the
+  boot log says so and the marker is KEPT: deleting it would fail open into re-validating and
+  re-announcing on every boot, and on such a mount `alerting.env` itself is equally readable and
+  holds the password in the clear rather than a digest of it.
+
+  ⛔ **An HMAC instead of a digest does not solve this**, and the reasoning is in the code so it is
+  not re-opened as an improvement: a keyed MAC only helps if the reader cannot obtain the key, and
+  every candidate key lives in the same volume as the marker. A salt defeats precomputation, not
+  guessing. Only the marker's own unreadability removes the oracle.
+
+- **A refused `chmod` is reported instead of swallowed (#21).** `_restrict()` was
+  `except OSError: pass`. On a bind mount whose uid does not match the container's user — the
+  ordinary case for host-managed appdata — the call raises `EPERM` and the failure was discarded,
+  so a no-op was indistinguishable from a hardening and the code, its docstrings and the fleet
+  standard all claimed a file was `0600` that was `0644`. It now logs a warning naming the path,
+  the mode it was trying to reach and the errno; the success path stays silent, because a
+  permission helper that spoke on every call would be filtered out and the signal would be worth
+  nothing. It warns rather than raising: every call site is inside the error-log append, whose
+  contract is that recording an alert never raises, so the failure is loud and the alert still
+  lands.
+
+  The test that covered this was named `test_restrict_is_silent_when_chmod_refuses`. It asserted
+  only that nothing raised, but its name recorded the swallowed failure as the intended behaviour
+  — so the defect had a test that read like an endorsement. Not raising and saying nothing are two
+  claims, and they are now made separately.
+
+### Fixed
+
+- **`error_log_problem()` no longer reports healthy for the one condition it exists to catch
+  (#22).** When the log's directory was absent under a parent that exists but cannot be written,
+  it returned `""` — no problem — which is precisely the state in which the sink cannot be
+  written. So the sink failed and its own detector agreed nothing was wrong: **both operator
+  signals gone at once, for the same underlying cause.** That is worse than having no detector,
+  because it stops the operator looking. The three states are now distinguished — checked and
+  fine, checked and broken, could not check — and an uncreatable directory is the second.
+
+- **A missing MOUNT and a missing FILE now say different things on the sequence the setup document
+  prescribes.** `validate_boot` has always carried a mount-specific refusal, and on that sequence
+  it never fired: the loader calls `read_config` first, so both cases arrived as one
+  undifferentiated "does not exist". Measured both ways by the first adopter.
+  `load_alert_settings_from_env` now asks the mount question BEFORE the read, and it asks it of
+  `SHARED_ROOT`.
+
+  ⛔ **It is not asked of the config file's own path, and the first attempt at this release did
+  exactly that and was wrong in both directions.** The config lives at
+  `<shared root>/configs/alerting.env`, so its own directory is one level BELOW the mount: a
+  correctly mounted volume whose `configs/` had not been created yet — the ordinary state between
+  steps 1 and 2 of the setup document — was told its volume was missing, and a `configs/` baked
+  into an image at the mountpoint with no volume over it was told the volume was fine and to go
+  and create the file, which it would then have created in the disposable layer. Only the
+  `SHARED_ROOT` value can answer the question, and it is now asked of that.
+
+### Adopters
+
+A service already running 1.3.0 has a marker that records the CORRECT digest at the wrong mode, so
+it matches and validation skips — and the write that narrows it would never run. Narrowing only
+the write path would have fixed new installations and left every existing one exposed until
+somebody happened to edit the shared config. So the first boot after this upgrade rewrites the
+marker in place: **same contents, narrower mode, no re-validation and no duplicate confirmation
+alert.** One `INFO` line says it happened.
+
+A service on a uid-mismatched volume will also start seeing warnings about the error log's
+permissions. The rule, rather than a number: **one warning per refused `chmod`, and a WARN or
+ERROR alert attempts up to three** — the log directory, the log file before the write, and the log
+file again after it. Two things decide how many of those are refused, and it is worth knowing both
+before reading the count as a new fault:
+
+- **which paths this process does not own.** A file it created itself it can always `chmod`; one
+  the host owns, or that an earlier container created as another uid, it cannot.
+- **whether the log file exists yet.** The pre-write narrowing is silent on a path that is not
+  there, so the FIRST alert against a fresh log is always one lower than the steady state.
+
+Measured against the real record path — first alert, then steady state:
+
+| state | warnings |
+|---|---|
+| the container created the directory and the log file | 0, then 0 |
+| the host owns the log directory only | 1, then 1 |
+| the host owns the directory and the log file already exists | 3, then 3 |
+| the host owns the directory and the log file is not there yet | 2, then 3 |
+| a filesystem that refuses every `chmod` (vfat, most CIFS), log file present | 3, then 3 |
+| the same, against a fresh log | 2, then 3 |
+
+An `error_log` with no directory component attempts two rather than three, since there is no
+directory to create or narrow. The condition was already there; this is the release that stops
+hiding it, and the volume is the honest measure of how often it was happening in silence.
+
 ## [1.3.0] - 2026-09-03
 
 A check that shipped inside the thing it was checking, and a marker that recorded the wrong fact.
@@ -550,6 +659,7 @@ every service runs the same code instead of a copy that drifts.
   default" — `Alerter.read_errors()` passes the settings' value, so the reader and the roller
   cannot disagree. Calling the function directly with `backups=None` raises; see issue #5.
 
+[1.4.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.4.0
 [1.3.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.3.0
 [1.2.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.2.0
 [1.1.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.1.0

@@ -26,6 +26,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -1049,7 +1050,7 @@ def test_a_digest_that_is_not_a_sha256_LINE_writes_no_marker_and_says_so(
 
     marker = tmp_path / "app" / marker_name("prod")
     with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
-        _write_marker(marker, digest)
+        _write_marker(marker, digest, consequence="<the caller's own consequence>")
 
     assert not marker.exists(), (
         f"a marker was written for {digest!r}, which `_marker_matches` can never match — every "
@@ -1060,6 +1061,15 @@ def test_a_digest_that_is_not_a_sha256_LINE_writes_no_marker_and_says_so(
     assert caplog.text.strip(), "it happened silently"
     assert str(marker) in caplog.text, "the warning does not say which marker was not written"
     assert repr(digest) in caplog.text, "the warning does not say what it was handed"
+    # ⭐ AND IT MUST NOT ASSERT THE VALIDATION PATH'S STORY, because BOTH callers reach this
+    # branch. It said "the configuration is valid and was announced, but the next boot will
+    # validate and announce again" — true after validation, false in every clause for the upgrade
+    # repair, which announces nothing and whose next boot goes on skipping. The mutation harness
+    # found this line unpinned: reverting the wording left the whole suite green.
+    assert "was announced" not in caplog.text, (
+        "the branch both callers reach asserts that an announcement happened")
+    assert "re-announce" not in caplog.text and "announce again" not in caplog.text, (
+        "the branch both callers reach promises alerts the repair path will never send")
 
 
 def test_an_alert_that_never_left_does_not_mark_the_boot_validated(tmp_path: Path) -> None:
@@ -1267,25 +1277,631 @@ def test_the_boot_after_an_alerter_is_installed_does_announce(
 
 
 def test_an_unwritable_marker_directory_costs_a_warning_and_not_the_boot(
-        tmp_path: Path, channels: dict[str, Spy], monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path, channels: dict[str, Spy],
         caplog: pytest.LogCaptureFixture) -> None:
     """⭐ THE CONFIGURATION IS VALID AND HAS BEEN ANNOUNCED. Refusing to start over a marker would
     turn a missing read-write volume into an outage of the service itself — the failure direction
-    is a duplicate alert per boot, which is noise."""
-    settings, marker_dir, _ = _validated(tmp_path)
+    is a duplicate alert per boot, which is noise.
 
-    def refuse(*args: object, **kwargs: object) -> None:
-        raise OSError("read-only file system")
+    ⭐⭐ THE FAILURE IS PLANTED, NOT PATCHED, AND THAT IS THE THIRD SPELLING OF THIS TEST. It
+    patched `Path.write_bytes` while the marker was empty; when the marker gained content the
+    patch silently stopped intercepting and the test asserted a warning nothing was going to log.
+    Re-pointing it at `write_text` fixed that instance and left the class: the write is now
+    `os.open` + `os.replace`, and a fourth name would have gone the same way. A monkeypatched
+    method name is an assertion about HOW the marker is written, and the test is about what
+    happens when it CANNOT be. So the condition is real — the marker directory's own parent is a
+    regular file, so no directory of that name can exist — and it will keep being real whatever
+    the write is made of.
+    """
+    settings, _, _ = _validated(tmp_path)
+    blocked = tmp_path / "not-a-directory"
+    blocked.write_text("a file where the marker directory would have to go\n", encoding="utf-8")
+    marker_dir = blocked / "app"
 
-    # ⚠️ `write_text`, because that is what records the digest. This patched `write_bytes` while
-    # the marker was empty, and when the marker gained content the patch silently stopped
-    # intercepting anything — the test then asserted a warning that was never going to be logged.
-    monkeypatch.setattr(Path, "write_text", refuse)
     with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
         assert validate_boot(settings, "prod", marker_dir,
                              alerter=Alerter(settings)) is True
     assert CONFIG_PATH_VAR in caplog.text
+    assert not marker_dir.exists()
     assert len(channels["ntfy"].calls) == 1
+
+
+# ============================== #20: the marker is a digest of the file holding the SMTP password
+posix_only = pytest.mark.skipif(
+    os.name != "posix",
+    reason="POSIX permission bits. Windows synthesises st_mode from the read-only attribute, so a "
+           "mode assertion there measures nothing; CI runs ubuntu-latest, which is also what the "
+           "fleet deploys to.")
+
+
+@posix_only
+def test_the_marker_is_created_unreadable_to_anyone_but_the_service(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐⭐ #20. THE MARKER'S CONTENT IS A DIGEST OF THE FILE THAT HOLDS `SMTP_PASSWORD`.
+
+    v1.3.0 wrote it 0644 into a shared appdata volume, which makes it an offline verification
+    oracle: a party who can guess the rest of that file can confirm a candidate password against
+    the digest with no rate limit, no SMTP connection and no log line. The empty marker it
+    replaced had nothing to leak, so this was introduced by the fix for #15 — a security property
+    traded for a correctness one without noticing the trade.
+
+    Group and other bits are asserted as EXACTLY zero rather than "not world-readable": a marker
+    readable by the volume's group is readable by every other container mounting it, which is the
+    same oracle with one more step.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert marker.is_file()
+    mode = stat.S_IMODE(marker.stat().st_mode)
+    # ⚠️ THE PROPERTY, NOT THE NUMBER. `umask` subtracts from a creation mode and never adds to it,
+    # so a runner with a hardened umask would produce 0o400 — still correct, and `== 0o600` would
+    # call it a regression. What must hold is that nobody else can read it and that the service
+    # itself still can, which is what these two assertions say.
+    assert mode & 0o077 == 0, f"the marker is readable beyond its owner ({oct(mode)})"
+    assert mode & stat.S_IRUSR, "the service could not read back its own marker"
+
+
+@posix_only
+def test_a_marker_an_earlier_version_left_wide_open_is_replaced_not_chmodded(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐⭐ THE UPGRADE PATH, AND THE REASON THE WRITE IS `os.replace` RATHER THAN A `chmod`.
+
+    Every service that ran v1.3.0 already has a 0644 marker sitting in its config directory. A
+    `chmod` is the obvious way to narrow it and it is the wrong one: on a uid-mismatched bind
+    mount — the ordinary case for host-managed appdata, and the whole of #21 — that call fails,
+    and before #21 it failed silently. Creating a NEW file 0600 and renaming it over the old one
+    needs only the directory to be writable, which it must already be or there would be no marker.
+
+    The inode is what makes this a test of the mechanism rather than of the outcome: a `chmod` in
+    place would satisfy the mode assertion and fail the identity one.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker.write_text("", encoding="utf-8")          # the shape v1.2.0 wrote
+    os.chmod(marker, 0o644)
+    before = marker.stat().st_ino
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert stat.S_IMODE(marker.stat().st_mode) & 0o077 == 0
+    assert marker.stat().st_ino != before, "the marker was chmodded in place, not replaced"
+    assert marker.read_text(encoding="utf-8").startswith("sha256:")
+
+
+def test_the_marker_is_replaced_rather_than_written_in_place(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐ THE MECHANISM BEHIND #20's FIX, ASKED WHERE PERMISSION BITS ARE NOT AVAILABLE.
+
+    Rewriting a file keeps its identity; creating a new one and renaming it over the old one does
+    not. That identity is exactly what makes the narrowing survive a mount where a `chmod` would
+    be refused — the new file carries the mode it was created with, and the rename only needs the
+    directory. It is observable on any filesystem that numbers its files, so the mechanism can be
+    pinned here rather than only in the POSIX-gated mode assertions that CI runs.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"sha256:{'0' * 64}\n", encoding="utf-8")   # a stale, non-matching digest
+    before = marker.stat().st_ino
+    if not before:
+        pytest.skip("this filesystem does not number its files, so identity cannot be observed")
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert marker.stat().st_ino != before, "the marker was written in place, not replaced"
+
+
+def test_an_already_restricted_marker_is_not_rewritten_on_every_boot(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """The other half of the upgrade repair: it has to stop. A rewrite on every skip would put a
+    write into the boot path of every service forever to fix a state that only exists once."""
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    before = marker.stat().st_ino
+    if not before:
+        pytest.skip("this filesystem does not number its files, so identity cannot be observed")
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False
+    assert marker.stat().st_ino == before, "a marker that was already restricted was rewritten"
+
+
+def test_exposed_bits_reads_the_group_and_other_permissions(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """⭐ THE PLATFORM GATE, ASSERTED IN BOTH DIRECTIONS ON WHICHEVER PLATFORM RUNS IT.
+
+    The helper answers `0` off POSIX on purpose — Windows synthesises `st_mode` from the read-only
+    attribute, so every ordinary file reads as 0o666 and a check that trusted it would warn about
+    an exposure on every single write while the real access control went unexamined. A guard that
+    fires on a correct system is one an operator switches off.
+
+    Both directions are measured against the SAME file, so this cannot pass by the file happening
+    to have no group or other bits: the only thing that differs between the two assertions is the
+    platform the helper thinks it is on.
+    """
+    path = tmp_path / "marker"
+    path.write_text("x", encoding="utf-8")
+
+    monkeypatch.setattr(os, "name", "posix")
+    assert alerting_env._exposed_bits(path) != 0, (
+        "the premise failed: this file has no group or other permission bits to find")
+
+    monkeypatch.setattr(os, "name", "nt")
+    assert alerting_env._exposed_bits(path) == 0
+
+
+def test_a_marker_reported_exposed_is_kept_warned_about_and_still_suppresses(
+        tmp_path: Path, channels: dict[str, Spy], monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ THE `KEEP IT` DECISION, ASKED ON EVERY PLATFORM. Deleting a marker whose mode could not
+    be applied would fail open into re-validating and re-announcing on every boot — a duplicate
+    confirmation per service per restart, which trains an operator to ignore the one message this
+    whole mechanism exists to send. So the exposure is reported and the marker stays.
+
+    `_exposed_bits` is stubbed rather than the filesystem coerced, because what is under test here
+    is the CALLER's decision. What the helper itself answers is measured one test up, and the
+    unstubbed end-to-end version runs on POSIX in CI.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    monkeypatch.setattr(alerting_env, "_exposed_bits", lambda _path: 0o044)
+
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert marker.is_file(), "the marker was deleted, which fails open into permanent revalidation"
+    assert str(marker) in caplog.text
+    contents = marker.read_text(encoding="utf-8")
+
+    reset(channels)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False
+    assert silence(channels) == []
+    assert marker.read_text(encoding="utf-8") == contents
+
+
+def test_the_upgrade_repair_rewrites_the_marker_without_revalidating(
+        tmp_path: Path, channels: dict[str, Spy], monkeypatch: pytest.MonkeyPatch) -> None:
+    """⭐⭐ THE SKIP PATH REWRITE, ASKED ON EVERY PLATFORM (the POSIX end-to-end twin is below).
+
+    A marker that MATCHES never reaches the write, so the repair has to happen where the skip
+    happens. The identity change is what proves it ran; the unchanged contents and the silent
+    channels are what prove it cost nothing.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    contents = marker.read_text(encoding="utf-8")
+    before = marker.stat().st_ino
+    if not before:
+        pytest.skip("this filesystem does not number its files, so identity cannot be observed")
+    reset(channels)
+
+    monkeypatch.setattr(alerting_env, "_exposed_bits", lambda _path: 0o044)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False
+    assert marker.stat().st_ino != before, "the wide-open marker was left exactly as it was"
+    assert marker.read_text(encoding="utf-8") == contents
+    assert silence(channels) == []
+
+
+@posix_only
+def test_a_matching_marker_left_wide_open_by_1_3_0_is_narrowed_without_revalidating(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐⭐ THE UPGRADE PATH THAT THE WRITE PATH ALONE DOES NOT REACH, AND THE ONE EVERY DEPLOYED
+    SERVICE TAKES.
+
+    A service already running the previous release has a marker recording the CORRECT digest at
+    the wrong mode. So it matches, validation skips, and `_write_marker` is never called —
+    narrowing only the write would have fixed new installations and left every existing one
+    exposed until somebody happened to edit the shared config. Fixing the instance, not the class.
+
+    The other half of the assertion is that the repair is free: the marker's contents are
+    unchanged, the boot still returns `False`, and no confirmation alert is sent. A repair that
+    re-validated would page every service in the fleet once on upgrade.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    contents = marker.read_text(encoding="utf-8")
+    os.chmod(marker, 0o644)
+    reset(channels)
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False
+    assert stat.S_IMODE(marker.stat().st_mode) & 0o077 == 0
+    assert marker.read_text(encoding="utf-8") == contents
+    assert silence(channels) == []
+
+
+def test_the_restricted_marker_is_still_the_thing_that_suppresses_the_next_boot(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐ THE OBVIOUS WRONG FIX, ASKED DIRECTLY. A marker the service itself cannot read back
+    would fail open into re-validating and re-announcing on every boot — a duplicate alert per
+    service per restart, which trains an operator to ignore the one message this mechanism exists
+    to send. So the narrowing has to leave the skip working, and that is asserted rather than
+    assumed from the mode."""
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    reset(channels)
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False
+    assert silence(channels) == []
+    expected = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
+    assert marker.read_text(encoding="utf-8").strip() == f"sha256:{expected}"
+
+
+def test_a_successful_marker_write_says_nothing(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
+    """The direction that decides whether the warnings below are worth anything. A boot that went
+    correctly must produce no warning at all, or the ones that matter get filtered out."""
+    settings, marker_dir, _ = _validated(tmp_path)
+    with caplog.at_level(logging.DEBUG, logger="kw_common.alerting_env"):
+        assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_a_stale_temporary_file_is_not_reused_as_the_marker(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐ THE TEMPORARY FILE IS REMOVED BEFORE IT IS CREATED, AND `O_EXCL` IS WHY THAT MATTERS.
+
+    A process killed between the write and the rename leaves a temp behind. Opening that with
+    `O_TRUNC` would reuse ITS mode — so a stale 0644 temp would be renamed into place as the
+    marker, with 0600 asked for and never applied: the same defect one layer down, and invisible.
+    Removing it first and demanding `O_EXCL` makes that impossible instead of unlikely.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    stale = marker_dir / f"{marker.name}.tmp"
+    stale.write_text(f"sha256:{'0' * 64}\n", encoding="utf-8")
+    if os.name == "posix":
+        os.chmod(stale, 0o644)
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    expected = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
+    assert marker.read_text(encoding="utf-8").strip() == f"sha256:{expected}"
+    assert list(marker_dir.glob("*.tmp")) == [], "a temporary file survived the write"
+    if os.name == "posix":
+        assert stat.S_IMODE(marker.stat().st_mode) & 0o077 == 0
+
+
+@posix_only
+def test_a_marker_that_lands_readable_anyway_is_reported_and_kept(
+        tmp_path: Path, channels: dict[str, Spy], monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ WHERE THE MODE CANNOT BE APPLIED THE MARKER IS KEPT, AND THE EXPOSURE IS STATED.
+
+    A filesystem that does not model these bits — vfat, most CIFS mounts — hands back whatever its
+    mount options say regardless of what was asked for. Deleting the marker there would fail open
+    into re-validating and re-announcing forever, so it warns and keeps it: on such a mount
+    `alerting.env` itself is equally readable and holds the password in the clear, so the marker
+    is not the weak link. Simulated by forcing the creation mode wide, which is exactly the
+    outcome those mounts produce.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    real_open = os.open
+
+    def wide(path: object, flags: int, mode: int = 0o777, **kwargs: object) -> int:
+        # Only the CREATE is widened. `alerting_env.os` IS the process-wide `os`, so a wrapper
+        # that rewrote the mode on every call would reach far past the one write under test.
+        if flags & os.O_CREAT:
+            mode = 0o644
+        return real_open(path, flags, mode, **kwargs)   # type: ignore[arg-type]
+
+    # ⚠️ `umask` SUBTRACTS from a creation mode and never adds to it, so on a runner whose umask is
+    # 0o077 the widened mode would come back 0o600 and this test would quietly stop exercising the
+    # branch it is named for — passing, while proving nothing. Zeroed here and restored after.
+    previous_umask = os.umask(0)
+    monkeypatch.setattr(alerting_env.os, "open", wide)
+    try:
+        with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+            assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    finally:
+        os.umask(previous_umask)
+
+    assert marker.is_file(), "the marker was deleted, which fails open into permanent revalidation"
+    assert str(marker) in caplog.text
+    assert stat.S_IMODE(marker.stat().st_mode) & 0o077, "the premise of this test no longer holds"
+    reset(channels)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False
+    assert silence(channels) == []
+
+
+def test_a_shared_root_that_cannot_be_checked_refuses_in_this_modules_own_terms(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐⭐ `Path.is_dir()` IS NOT THE TOTAL PREDICATE IT LOOKS LIKE, and the mount check was
+    written as though it were.
+
+    `pathlib` swallows `ENOENT`, `ENOTDIR`, `EBADF` and `ELOOP` and RE-RAISES everything else — so
+    a shared root under a directory this process may not traverse, a stale NFS handle, or an
+    unreachable share turned the mount check into a bare `PermissionError` escaping a function
+    whose contract is that `AlertEnvError` is the only exception it raises on purpose, with no
+    refusal logged anywhere. Before the check existed, the same condition arrived from
+    `read_config` as a logged, catchable refusal naming the file.
+
+    Both halves of the contract are asserted, because either alone would have passed while the
+    defect was live: the TYPE the caller catches, and the log line `_refuse` promises. And "could
+    not be checked" must not read as "is not there" — they send an operator to different places.
+    """
+    def refuse(*_a: object, **_k: object) -> bool:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setenv(SHARED_ROOT_VAR, str(tmp_path / "unreachable"))
+    monkeypatch.setenv(CONFIG_PATH_VAR, str(tmp_path / "app"))
+    monkeypatch.setenv(DEPLOY_ENV_VAR, "prod")
+    monkeypatch.setattr(Path, "is_dir", refuse)
+
+    with caplog.at_level(logging.ERROR, logger="kw_common.alerting_env"), \
+            pytest.raises(AlertEnvError) as excinfo:
+        load_alert_settings_from_env("feed-poller")
+    message = str(excinfo.value)
+    assert "could not be checked" in message
+    assert "PermissionError" in message
+    assert "refusing to boot" in caplog.text, "a refusal that logs nothing breaks the contract"
+
+
+@pytest.mark.parametrize("which", ["the shared root", "the config's own directory"])
+def test_every_layout_check_refuses_in_this_modules_own_terms(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, which: str) -> None:
+    """⭐ ALL THREE CALL SITES, NOT THE ONE THE FRONT DOOR REACHES.
+
+    `_check_layout` asks the same question twice, and the loader's test above only ever exercises
+    the loader's call — so both of these could have been reverted to a bare `is_dir()` with the
+    suite still green, which is the "fixed the instance, not the class" shape. This is the path a
+    caller takes when it builds settings some other way and validates afterwards, which the
+    `validate_boot` docstring names as the reason that check still exists.
+
+    The two arms differ only in WHICH path is made unaskable, so neither can pass on the other's
+    behalf.
+    """
+    root = tmp_path / "root"
+    (root / "configs").mkdir(parents=True)
+    config = config_file_for(root)
+    unaskable = str(root) if which == "the shared root" else str(config.parent)
+    real_is_dir = Path.is_dir
+
+    def is_dir(self: Path) -> bool:
+        if str(self) == unaskable:
+            raise PermissionError(13, "Permission denied")
+        return real_is_dir(self)
+
+    monkeypatch.setattr(Path, "is_dir", is_dir)
+    with pytest.raises(AlertEnvError) as excinfo:
+        alerting_env._check_layout(config, root)
+    assert "could not be checked" in str(excinfo.value)
+    assert unaskable in str(excinfo.value)
+
+
+# =========================== a missing MOUNT and a missing FILE go to different places (#3b claim)
+def test_a_missing_config_in_a_directory_that_exists_blames_the_file(tmp_path: Path) -> None:
+    """The file was deleted, mistyped, or never created — the volume is fine and the message must
+    not send an operator to the template's volume list."""
+    path = write_shared(tmp_path)
+    path.unlink()
+    with pytest.raises(AlertEnvError) as excinfo:
+        read_config(path)
+    message = str(excinfo.value)
+    # ⚠️ THE FULL PATH, NOT ITS PARENT. Asserting `str(path.parent) in message` was vacuous once
+    # the mount split was reverted: the parent is a PREFIX of the file path the message already
+    # prints, so the assertion could no longer fail while any path was named at all.
+    assert str(path) in message
+    assert "MOUNT" not in message
+
+
+def test_a_marker_the_service_cannot_read_back_is_reported(
+        tmp_path: Path, channels: dict[str, Spy], monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐⭐ THE FAILURE THAT IS OTHERWISE COMPLETELY SILENT, AND IT IS THE ACCEPTANCE CRITERION'S
+    OWN "OBVIOUS WRONG FIX" ARRIVED AT FROM THE OTHER SIDE.
+
+    Checking only that nobody ELSE can read the marker verifies the property this release wanted
+    and not the property it needs. A umask of `0477`, or a mount with `file_mode=0200`, turns the
+    0600 that was asked for into 0200: no group or other bits, so the exposure check is satisfied —
+    and nothing can then match the marker, so the service validates and ANNOUNCES on every single
+    boot, forever, with nothing logged at all. Measured that way before this check existed.
+
+    The second boot is the assertion that matters: it proves the state really is the runaway one,
+    rather than proving only that a warning string was formatted.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    monkeypatch.setattr(alerting_env, "_exposed_bits", lambda _path: 0)
+    monkeypatch.setattr(alerting_env, "_can_be_read_back", lambda _path: False)
+
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert str(marker) in caplog.text
+    assert "every boot" in caplog.text.lower()
+
+
+def test_the_upgrade_repair_cannot_raise_on_a_marker_it_cannot_decode(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """⛔ `AlertEnvError` IS THE ONLY EXCEPTION THIS MODULE RAISES ON PURPOSE, and the repair read
+    the marker with a STRICT decode. `UnicodeDecodeError` is a `ValueError`, not an `OSError`, so
+    it would have escaped `_reharden`, escaped `validate_boot`, and turned a cosmetic permission
+    fix into a boot crash. The two readers of this file now decode it the same way.
+
+    ⭐⭐ ASKED OF `_reharden` DIRECTLY, AND THE FIRST VERSION OF THIS TEST WENT THROUGH
+    `validate_boot` AND PROVED NOTHING — the mutation harness caught it surviving. The repair only
+    runs on the SKIP path, and reaching the skip requires `_marker_matches` to have decoded the
+    same file to exactly `sha256:<hex>`, which forces it to be pure ASCII. So the composed path
+    cannot deliver undecodable bytes to this function, and a test that went in the front door
+    silently exercised the validation path instead while asserting a `True` that meant something
+    else entirely. The unit is reachable even though the composition is not, and the contract is
+    about the unit: nothing in here may raise anything but `AlertEnvError`.
+    """
+    marker = tmp_path / "app" / marker_name("prod")
+    marker.parent.mkdir(parents=True)
+    marker.write_bytes(b"sha256:" + b"\xff\xfe\x80" * 8 + b"\n")
+    monkeypatch.setattr(alerting_env, "_exposed_bits", lambda _path: 0o044)
+
+    alerting_env._reharden(marker)          # must not raise
+    assert marker.is_file(), "the marker was destroyed by a repair it could not perform"
+
+
+def test_the_readback_check_asks_whether_this_process_can_read_it(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """⭐⭐ THE QUESTION, NOT THE MODE BIT — AND ASKING THE MODE BIT WAS WRONG IN BOTH DIRECTIONS.
+
+    The first version of this check read `S_IRUSR`. That is a fact about the FILE; being able to
+    read it is a fact about the file AND this process, and the two diverge each way. A container
+    running as root reads a 0200 marker perfectly well, so the bit says "unreadable" while the skip
+    works and every clause of the warning would be false. On a uid-mismatched mount a 0600 marker
+    owned by somebody else has the owner bit SET while this process is "other" and the read is
+    denied — the silent runaway, which the bit misses entirely.
+
+    So this is asserted against `os.access`, which is the same question `_marker_matches` asks on
+    the next boot, and both directions are measured against the SAME file so neither can pass by
+    accident of that file's permissions.
+    """
+    path = tmp_path / "marker"
+    path.write_text("x", encoding="utf-8")
+    assert alerting_env._can_be_read_back(path) is True
+
+    # A marker that is not there cannot be read back, and nothing will match it — so this is a
+    # real answer rather than an unaskable question, and it is asserted with the file genuinely
+    # absent rather than with the read stubbed.
+    path.unlink()
+    assert alerting_env._can_be_read_back(path) is False
+
+
+@posix_only
+def test_the_readback_check_is_the_read_and_not_a_proxy_for_it(tmp_path: Path) -> None:
+    """⭐⭐ THE CASE BOTH PROXIES GOT WRONG, PLANTED FOR REAL ON THE PLATFORM THAT HAS IT.
+
+    A marker with no owner-read bit is what a `umask` of `0477` or a mount with `file_mode=0200`
+    produces. `S_IRUSR` calls it unreadable; performing the read is the only thing that answers
+    for THIS process — and root, which several of these containers run as, reads it perfectly
+    well. So the two answers differ, and only one of them is the answer `_marker_matches` will get.
+
+    Skipped for root rather than asserted for both, because the correct answer differs by who is
+    running: this pins the unprivileged case, which is the one that must warn.
+    """
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root reads a 0200 file, so this case cannot be planted here")
+    path = tmp_path / "marker"
+    path.write_text("sha256:x\n", encoding="utf-8")
+    os.chmod(path, 0o200)
+    try:
+        assert alerting_env._can_be_read_back(path) is False
+    finally:
+        os.chmod(path, 0o600)
+
+
+def test_a_failed_marker_write_says_what_actually_follows_from_it(
+        tmp_path: Path, channels: dict[str, Spy], monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐⭐ ONE MESSAGE FOR TWO CALLERS WAS FALSE FOR ONE OF THEM.
+
+    `_write_marker`'s failure line was written for the validation path — "the configuration is
+    valid and was announced, but every boot will re-validate and re-announce". The upgrade repair
+    reused it verbatim, and every clause was wrong there: nothing was announced on that boot, and
+    no later boot re-validates, because the marker still matches and the skip keeps firing. What
+    was true — the marker could not be narrowed and is still readable — went unsaid, so an
+    operator was sent looking for duplicate alerts that would never arrive while the exposure the
+    release exists to close stayed open.
+
+    Asserted as the two consequences being DIFFERENT and each naming its own outcome, not as two
+    fixed strings: what matters is that the caller's situation reaches the operator.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    blocked = tmp_path / "not-a-directory"
+    blocked.write_text("a file where the marker directory would have to go\n", encoding="utf-8")
+
+    # (1) the validation path: no marker was written, so the next boot really will do it again.
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        assert validate_boot(settings, "prod", blocked / "app",
+                             alerter=Alerter(settings)) is True
+    validating = caplog.text
+    assert "re-validate" in validating
+    assert "still readable" not in validating
+
+    # (2) the repair path: the marker is fine and matching, only the narrowing failed.
+    caplog.clear()
+    reset(channels)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    monkeypatch.setattr(alerting_env, "_exposed_bits", lambda _path: 0o044)
+    monkeypatch.setattr(alerting_env, "_discard", lambda _path: None)
+
+    def refuse(*_a: object, **_k: object) -> int:
+        raise PermissionError("not yours")
+
+    monkeypatch.setattr(alerting_env.os, "open", refuse)
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False
+    repairing = caplog.text
+    assert "readable" in repairing, "the exposure that is still open was not stated"
+    assert "re-validate and re-announce" not in repairing, (
+        "the operator was told to expect alerts that will never arrive")
+    assert marker.is_file()
+
+
+def test_read_config_does_not_try_to_diagnose_the_mount(tmp_path: Path) -> None:
+    """⛔ THE VERSION OF THIS RELEASE THAT ANSWERED THE MOUNT QUESTION HERE WAS WRONG BOTH WAYS.
+
+    `read_config` is given a config path and nothing else, and the config lives at
+    `<shared root>/configs/alerting.env` — so its own directory is one level BELOW the mount.
+    Deciding the mount from it accused a correctly mounted volume whose `configs/` did not exist
+    yet, which is the ordinary state between steps 1 and 2 of the setup document. The reader says
+    what it knows: the file is not there.
+    """
+    absent_mount = config_file_for(tmp_path / "never-mounted")
+    mounted_no_structure = config_file_for(tmp_path)          # the root exists; configs/ does not
+    for path in (absent_mount, mounted_no_structure):
+        with pytest.raises(AlertEnvError) as excinfo:
+            read_config(path)
+        assert "MOUNT" not in str(excinfo.value)
+        assert str(path) in str(excinfo.value)
+
+
+def test_the_mount_diagnosis_is_reachable_through_the_prescribed_loader(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """⭐⭐ THE CLAIM THE FIRST ADOPTER MEASURED FALSE, ASKED THROUGH THE DOCUMENTED SEQUENCE.
+
+    The standard says a missing MOUNT and a missing FILE send an operator to different places, and
+    `validate_boot._check_layout` does draw that distinction — but on the sequence the setup
+    document prescribes it never runs, because the loader reads the config BEFORE validation does
+    anything. Both cases arrived as one undifferentiated "does not exist".
+
+    So the question is asked in the loader, and asked of `SHARED_ROOT`, which is the only value
+    that can answer it. Going in the front door is the point: `read_config` having the right answer
+    would not be the claim — an operator whose volume is missing seeing it is.
+    """
+    monkeypatch.setenv(SHARED_ROOT_VAR, str(tmp_path / "never-mounted"))
+    monkeypatch.setenv(CONFIG_PATH_VAR, str(tmp_path / "app"))
+    monkeypatch.setenv(DEPLOY_ENV_VAR, "prod")
+    with pytest.raises(AlertEnvError) as excinfo:
+        load_alert_settings_from_env("feed-poller")
+    message = str(excinfo.value)
+    assert "MOUNT" in message
+    assert SHARED_ROOT_VAR in message, "the operator has to be told which variable to look at"
+
+
+def test_the_prescribed_loader_blames_the_file_when_the_volume_is_mounted(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """⭐ THE DIRECTION THAT MAKES THE TEST ABOVE MEAN ANYTHING, AND THE CASE AN EARLIER VERSION OF
+    THIS RELEASE GOT WRONG.
+
+    Both sub-cases are asserted, because the wrong version passed one of them: the volume is
+    mounted and `configs/` exists but the file does not, AND the volume is mounted and `configs/`
+    has not been created yet. The second is the ordinary state between steps 1 and 2 of the setup
+    document, and a test that pre-created `configs/` — as the first draft of this one did — would
+    never have caught the accusation.
+    """
+    monkeypatch.setenv(CONFIG_PATH_VAR, str(tmp_path / "app"))
+    monkeypatch.setenv(DEPLOY_ENV_VAR, "prod")
+
+    structure_missing = tmp_path / "mounted-bare"
+    structure_missing.mkdir()
+    with_structure = tmp_path / "mounted-with-configs"
+    config_file_for(with_structure).parent.mkdir(parents=True)
+
+    for root in (structure_missing, with_structure):
+        monkeypatch.setenv(SHARED_ROOT_VAR, str(root))
+        with pytest.raises(AlertEnvError) as excinfo:
+            load_alert_settings_from_env("feed-poller")
+        assert "MOUNT" not in str(excinfo.value), f"a mounted volume was accused, for {root.name}"
+
+
+def test_the_loader_does_not_refuse_a_mounted_volume(tmp_path: Path,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """The guard must not fail a correct tree: with the volume mounted and the file present, the
+    new check has to be invisible."""
+    write_shared(tmp_path)
+    monkeypatch.setenv(SHARED_ROOT_VAR, str(tmp_path))
+    monkeypatch.setenv(CONFIG_PATH_VAR, str(tmp_path / "app"))
+    monkeypatch.setenv(DEPLOY_ENV_VAR, "prod")
+    settings = load_alert_settings_from_env("feed-poller")
+    assert settings.ntfy_url == GOOD_CONFIG["NTFY_URL_PROD"]
 
 
 def test_the_validation_alert_names_no_value_from_the_config_file(

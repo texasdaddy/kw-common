@@ -61,14 +61,14 @@ and downloads the template beside it; neither runs anything it downloaded.
 
 ```powershell
 New-Item -ItemType Directory -Force -Path .\configs
-Invoke-WebRequest -Uri https://raw.githubusercontent.com/texasdaddy/kw-common/v1.3.0/alerting.env.template -OutFile .\configs\alerting.env
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/texasdaddy/kw-common/v1.4.0/alerting.env.template -OutFile .\configs\alerting.env
 ```
 
 ### macOS and Linux
 
 ```sh
 mkdir -p ./configs
-curl -fLo ./configs/alerting.env https://raw.githubusercontent.com/texasdaddy/kw-common/v1.3.0/alerting.env.template
+curl -fLo ./configs/alerting.env https://raw.githubusercontent.com/texasdaddy/kw-common/v1.4.0/alerting.env.template
 ```
 
 `-f` makes `curl` fail on an HTTP error rather than writing the error page into your config file —
@@ -149,7 +149,9 @@ validate_boot_from_env(settings, alerter=alerter)
 ```
 
 `load_alert_settings_from_env` reads `SHARED_ROOT` and `DEPLOY_ENV` and raises `AlertEnvError` if
-either is unset. `validate_boot_from_env` additionally reads `CONFIG_PATH` and checks:
+either is unset — and if `SHARED_ROOT` is not a directory it says so in those terms, because a
+missing **mount** and a missing **file** send you to different places and the mount is the one you
+check first. `validate_boot_from_env` additionally reads `CONFIG_PATH` and checks:
 
 * the shared root is mounted and carries `configs/`;
 * the file reads and is UTF-8;
@@ -166,6 +168,16 @@ still matches, so any edit to the file is what makes the next boot re-validate. 
 shared file did not change.
 
 To force a re-check without editing the file, delete the marker: `CONFIG_PATH/.alerting-validated-<env>`.
+
+⭐ **The marker is created `0600`, and that is a security property rather than tidiness.** Its
+contents are a digest of `alerting.env`, and that file holds the SMTP password — so a marker
+anything else on the volume can read is an offline oracle: whoever has it can test guesses at the
+config's contents with no rate limit, no connection to your mail provider and no log line. It is
+written as a new file and renamed into place rather than `chmod`ed, so a marker left behind by an
+older version is narrowed too, and so the narrowing cannot half-succeed on a bind mount whose uid
+does not match the account the service runs as. If the volume cannot express the mode at all —
+vfat, most CIFS mounts — the process log says so at boot and the marker is kept; on those mounts
+`alerting.env` itself is equally readable, so that is the thing to fix.
 
 `state_file` and `error_log` are the app's own paths under its own volume, not fleet settings, so
 they are not in the shared file and the loader has nothing to say about them — hence the

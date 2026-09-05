@@ -16,13 +16,13 @@ no port, no alignment audit, and no "which copy is the good one" question to ans
 Consumers install from git at an **exact tag** — never a branch:
 
 ```
-pip install git+https://github.com/texasdaddy/kw-common@v1.3.0
+pip install git+https://github.com/texasdaddy/kw-common@v1.4.0
 ```
 
 In a `requirements.in` / `requirements.txt`:
 
 ```
-kw-common @ git+https://github.com/texasdaddy/kw-common@v1.3.0
+kw-common @ git+https://github.com/texasdaddy/kw-common@v1.4.0
 ```
 
 ⛔ **Never pin a branch.** `@main` makes every rebuild of every consumer a silent, unreviewed
@@ -148,7 +148,20 @@ the marker, so the confirmation is not lost to a boot that could not send it.
 preserve mtime, so a config restored at an older timestamp was never re-checked: a broken file
 booted clean and the service came up alerting nobody. A digest answers that whatever the clock
 says, in both directions — a restore with different bytes re-validates, an identical one does not.
-Upgrading from a version that wrote an empty marker costs exactly one re-validation, silently.
+Upgrading from a version that wrote an empty marker costs exactly one re-validation — **and one
+confirmation alert per service**, since a re-validation announces. That is not silent: an operator
+upgrading a fleet should expect that alert to arrive on every channel the service has configured,
+so one email and one push per service rather than none.
+
+⭐ **And the marker is created `0600`, because contents that decide are contents somebody can
+read.** The digest is taken over the file holding the SMTP password, so a marker the rest of a
+shared volume can read lets anyone who has it test guesses at that file offline — no rate limit,
+no connection to the mail provider, no log line. The first release that gave the marker contents
+also gave it that exposure. It is written as a new file and renamed into place rather than
+narrowed with `chmod`, so an existing wide-open marker is fixed on the next boot and the narrowing
+cannot half-succeed on a bind mount whose uid does not match the service's; where the filesystem
+cannot express the mode, the boot log says so and keeps the marker, because deleting it would
+re-validate and re-announce on every boot forever.
 
 📄 **Setup — the folder structure, the template and per-OS commands: [`docs/alerting-setup.md`](docs/alerting-setup.md).**
 A consumer README carries a short prerequisite block and a **link** to that page, never a copy; a

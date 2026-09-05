@@ -167,13 +167,18 @@ THE RETRIEVABLE ERROR LOG (`error_log=`)
     fetched off the box and read by tooling. Whatever a caller puts in a message now has that
     lifetime. Do not put a credential, a token, or an OAuth callback URL with its query string
     into a title or a message — sanitise at the raise site, where the value is understood. The
-    file is created 0o600 in a 0o700 directory AND an existing one is narrowed to the same on
-    every write, because a mode passed at creation does nothing for a path that already exists.
-    Treat it as operator-confidential, not as safe to hand around.
+    file is created 0o600 in a 0o700 directory, and narrowing an existing one to the same is
+    ATTEMPTED on every write, because a mode passed at creation does nothing for a path that
+    already exists. ⚠️ Attempted, not guaranteed: on a bind mount whose uid does not match this
+    process the `chmod` is refused, and then the file keeps whatever mode it had — a WARNING says
+    so, naming the path and the errno, which is the whole of #21. Treat it as
+    operator-confidential, not as safe to hand around, and read the boot log before believing the
+    mode is what this paragraph asks for.
 """
 
 from __future__ import annotations
 
+import errno
 import http.client
 import json
 import logging
@@ -1395,20 +1400,43 @@ _CHANNELS: tuple[tuple[str, Callable[[AlertConfig, SeveritySpec, str, str], None
 
 # --- error-log helpers (pure; the Alerter supplies the paths) ----------------------------------
 def _restrict(path: str, mode: int) -> None:
-    """Narrow an EXISTING path's permissions. Silent when it does not exist or cannot be changed.
+    """Narrow an EXISTING path's permissions. Silent on success; WARNS when it cannot.
 
     The `mode=` arguments to `os.makedirs` and `os.open` apply only when the thing is CREATED —
     `open(2)` ignores the mode for an existing file, and `makedirs(exist_ok=True)` never chmods.
     So on any upgrade path they achieve nothing: a build that wrote this file 0644, or a
     directory an operator made over SMB, stays wide open forever while the docs claim otherwise.
+
+    ⭐⭐ THE FAILURE IS REPORTED, AND IT USED TO BE `except OSError: pass`. On a bind mount whose
+    uid does not match the container's user — the ordinary case for host-managed appdata — `chmod`
+    raises `EPERM` and the swallowed exception made a no-op indistinguishable from success. The
+    caller, the docstrings and the standard all then claimed a file was 0600 that was 0644, which
+    is worse than not narrowing it at all: a hardening nobody can rely on is one nobody checks.
+    The first adopter hit the identical shape in its own code on the same volume and escalated it
+    from `debug` to a warning for this reason.
+
+    ⚠️ IT WARNS RATHER THAN RAISING, deliberately. Every call site is inside `_append_error_record`,
+    whose contract is that recording an alert never raises — a `chmod` that fails must not cost the
+    record it was trying to protect. So the failure is loud and the alert still lands. The cost is
+    one warning per failed call on a service that alerts often; that is proportional to alerts
+    rather than to time, and it stops the moment the mount is fixed.
+
+    A path that does not exist is NOT a failure and stays silent: this function narrows what is
+    already there, and every caller creates the thing separately.
     """
     try:
         if os.path.exists(path):
             os.chmod(path, mode)
-    except OSError:
-        # A filesystem that does not model these bits, or a file owned by someone else. Not worth
-        # failing an alert over, and never worth raising from here.
-        pass
+    except OSError as exc:
+        # A filesystem that does not model these bits, or a file owned by someone else. Named
+        # rather than swallowed: `errno` is the difference between "this volume cannot do
+        # permissions" (EPERM/EOPNOTSUPP) and "this path is wrong" (ENOENT), and an operator can
+        # act on the first two immediately.
+        log.warning("alerting: could not restrict %s to %s (%s) — it keeps whatever permissions "
+                    "it already had, so treat it as readable by anything with this volume "
+                    "mounted. On a bind mount this is usually a uid mismatch between the host "
+                    "directory and the user this process runs as.",
+                    path, oct(mode), errno.errorcode.get(exc.errno or 0, exc.errno))
 
 
 def _roll_error_log(path: str, max_bytes: int, backups: int) -> None:
@@ -1788,12 +1816,35 @@ class Alerter:
                 if not os.access(directory, os.W_OK):
                     return f"error_log points into {directory!r}, which is not writable"
                 return ""
-            parent = os.path.dirname(directory.rstrip("/\\")) or os.sep
+            # ⚠️ `abspath` FIRST, AND THE REASON IS A FALSE ALARM THAT ONLY FIRES ON LINUX. For a
+            # RELATIVE `error_log` with one directory component — `logs/errors.log` — `dirname`
+            # of `logs` is `""`, and the old `or os.sep` fallback then made the parent the
+            # FILESYSTEM ROOT rather than the process's own working directory. `/` is not writable
+            # by any non-root uid, so the writability check below reported a perfectly healthy sink
+            # as broken, on exactly the containers this check was written for. `abspath` resolves
+            # a relative directory against the cwd, which is what the line above already does with
+            # its `or "."`, and is a no-op for the absolute paths the standard prescribes.
+            parent = os.path.dirname(os.path.abspath(directory))
             if not os.path.isdir(parent):
                 return (f"error_log points into {directory!r}, and even its parent {parent!r} "
                         f"does not exist — in a container that usually means the volume is not "
                         f"mounted, so these records would be written into the disposable layer "
                         f"and could not be read from the host")
+            # ⭐⭐ AN ABSENT DIRECTORY UNDER AN UNWRITABLE PARENT IS A PROBLEM, NOT THE ABSENCE OF
+            # ONE. This arm used to fall through to "" — so the one state in which the sink
+            # provably cannot be written was the state this reported healthy. The sink fails and
+            # its own detector says fine, for the same underlying cause, and an operator reading
+            # this to find out why alerting is quiet is told to look elsewhere. That is worse than
+            # having no detector, which is why it is a defect and not a missing nicety.
+            #
+            # The three states this function distinguishes are: checked and fine (""), checked and
+            # broken (this and the arms above), and could not check (the `except` below). The
+            # third is not the first, and this arm was collapsing the second into the first.
+            if not os.access(parent, os.W_OK):
+                return (f"error_log points into {directory!r}, which does not exist and cannot be "
+                        f"created: its parent {parent!r} is not writable by this process. The "
+                        f"sink will fail on the first WARN or ERROR alert — in a container this "
+                        f"is usually a uid mismatch on a bind-mounted volume")
         except Exception as exc:  # noqa: BLE001 — a diagnostic must not become the failure
             return f"error_log could not be checked ({type(exc).__name__})"
         return ""

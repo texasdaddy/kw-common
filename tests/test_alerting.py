@@ -11,6 +11,7 @@ is asked, or a test that asserts only that a call happened, proves nothing.
 from __future__ import annotations
 
 import contextlib
+import errno
 import http.client
 import http.server
 import json
@@ -43,8 +44,17 @@ from kw_common.alerting import (
     smtp_port_fault,
 )
 
-
 # --------------------------------------------------------------------------- fixtures / helpers
+# ⭐ POSIX permission bits are real on the platform the fleet deploys to and near-inert on the one
+# this suite is usually written on: Windows synthesises `st_mode` from the read-only attribute, so
+# a mode assertion there measures nothing. CI runs `ubuntu-latest`, where every one of these is
+# exact — so these are SKIPPED on Windows rather than weakened into something that passes
+# everywhere and proves nothing. Defined here rather than beside the first block that uses it,
+# because a decorator is evaluated when the module loads and two sections now need it.
+posix_only = pytest.mark.skipif(
+    os.name != "posix", reason="POSIX permission bits; Windows chmod cannot express them")
+
+
 @pytest.fixture
 def settings(tmp_path: Path) -> AlertSettings:
     """A fully-configured service. Every path is inside `tmp_path`; nothing is assumed."""
@@ -2014,6 +2024,133 @@ def test_a_blank_error_log_that_dodged_the_constructor_is_still_reported(blank: 
     assert "OFF" in problem
 
 
+# ================================ #22: the detector and the sink must not fail for one reason
+def test_an_absent_log_directory_under_an_unwritable_parent_is_a_problem(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """⭐⭐ #22. THE ONE STATE THIS FUNCTION EXISTS TO CATCH WAS THE ONE IT REPORTED HEALTHY.
+
+    The directory is absent and its parent cannot be written, so `os.makedirs` will fail on the
+    first WARN or ERROR alert — the sink is broken. The old code checked only whether the parent
+    EXISTED, and fell through to `""` when it did. So the sink went silent and the function whose
+    whole job is to say the sink went silent agreed that nothing was wrong: both operator signals
+    dead, for one cause, which is strictly worse than having no detector because it stops the
+    operator looking.
+
+    `os.access` is patched rather than the mode changed, so this runs on both platforms —
+    Windows models directory writability with an ACL that `chmod` cannot express, and the
+    POSIX-only test below plants the real condition with real permission bits.
+    """
+    parent = tmp_path / "mounted"
+    parent.mkdir()
+    settings = AlertSettings(service="svc", error_log=str(parent / "logs" / "errors.log"))
+
+    real_access = os.access
+    monkeypatch.setattr(
+        alerting.os, "access",
+        lambda path, mode, *a, **k: False if str(path) == str(parent) else real_access(
+            path, mode, *a, **k))
+
+    problem = Alerter(settings).error_log_problem()
+    assert problem != "", "an uncreatable log directory was reported as no problem at all"
+    # ⚠️ `repr`, because the message renders the path with `!r` and a Windows `repr` doubles every
+    # separator — so a bare `str(parent) in problem` fails on this workstation while the message is
+    # perfectly correct. Both sides compute the same repr, so this is portable rather than pinned.
+    assert repr(str(parent)) in problem, "the message must name the directory to fix"
+
+
+@posix_only
+def test_an_absent_log_directory_under_a_really_unwritable_parent_is_a_problem(
+        tmp_path: Path) -> None:
+    """The same claim with the real condition planted rather than `os.access` patched — real mode
+    bits, and the kernel's own answer. Root ignores the bits, so this skips there rather than
+    passing vacuously; CI runs unprivileged."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root is not refused by permission bits, so this cannot be planted here")
+    parent = tmp_path / "mounted"
+    parent.mkdir()
+    settings = AlertSettings(service="svc", error_log=str(parent / "logs" / "errors.log"))
+    os.chmod(parent, 0o500)
+    try:
+        assert not os.access(parent, os.W_OK), "the planted condition did not take"
+        problem = Alerter(settings).error_log_problem()
+    finally:
+        os.chmod(parent, 0o700)
+    assert problem != ""
+    assert repr(str(parent)) in problem
+
+
+def test_an_absent_log_directory_under_a_writable_parent_is_not_a_problem(
+        tmp_path: Path) -> None:
+    """⭐ THE DIRECTION THAT DECIDES WHETHER THE FIX IS USABLE. A detector that reddens a correct
+    configuration gets switched off, and then it protects nothing. The fresh-container case — the
+    volume is mounted, the log directory has simply not been created yet — is `makedirs`' job on
+    the first alert and must stay silent."""
+    parent = tmp_path / "mounted"
+    parent.mkdir()
+    settings = AlertSettings(service="svc", error_log=str(parent / "logs" / "errors.log"))
+    assert Alerter(settings).error_log_problem() == ""
+
+
+def test_a_relative_error_log_is_resolved_against_the_working_directory(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """⭐⭐ A FALSE ALARM THAT ONLY FIRED ON LINUX, WHICH IS THE ONLY PLACE IT MATTERS.
+
+    For a relative `error_log` with one directory component, `os.path.dirname("logs")` is `""`, and
+    the old `or os.sep` fallback then made the parent the FILESYSTEM ROOT rather than the process's
+    own working directory. `/` is not writable by any non-root uid, so the check reported a
+    perfectly healthy sink as broken — on exactly the unprivileged containers the check was written
+    for, and invisibly on this workstation, where the root of the current drive IS writable.
+
+    `os.access` is given POSIX root semantics here rather than the platform's, because the defect
+    is a property of the path arithmetic and the platform is what hid it.
+    """
+    monkeypatch.chdir(tmp_path)
+    real_access = os.access
+    monkeypatch.setattr(
+        alerting.os, "access",
+        lambda path, mode, *a, **k: False if str(path) in ("/", "\\", os.sep)
+        else real_access(path, mode, *a, **k))
+
+    settings = AlertSettings(service="svc", error_log="logs/errors.log")
+    assert Alerter(settings).error_log_problem() == "", (
+        "a healthy relative path was reported broken because its parent resolved to the "
+        "filesystem root")
+
+    # And the sink really does work, so the "" above is the right answer rather than a lucky one.
+    Alerter(settings).notify(ERROR, "svc: down", "no route to host")
+    assert (tmp_path / "logs" / "errors.log").is_file()
+
+
+def test_a_healthy_error_log_directory_is_not_a_problem(tmp_path: Path) -> None:
+    """The plainest correct configuration there is: the directory exists and is writable."""
+    directory = tmp_path / "logs"
+    directory.mkdir()
+    settings = AlertSettings(service="svc", error_log=str(directory / "errors.log"))
+    assert Alerter(settings).error_log_problem() == ""
+
+
+def test_the_uncreatable_log_directory_reaches_the_boot_report(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """Asked of the boot report, because a diagnosis nothing prints is not a diagnosis. This is
+    the line an operator reads when alerting has gone quiet."""
+    parent = tmp_path / "mounted"
+    parent.mkdir()
+    settings = AlertSettings(service="svc", error_log=str(parent / "logs" / "errors.log"),
+                             ntfy_url="https://ntfy.example.com/svc")
+
+    real_access = os.access
+    monkeypatch.setattr(
+        alerting.os, "access",
+        lambda path, mode, *a, **k: False if str(path) == str(parent) else real_access(
+            path, mode, *a, **k))
+
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        Alerter(settings).warn_if_unconfigured()
+    assert "ALERTING ERROR LOG for svc" in caplog.text
+    assert repr(str(parent)) in caplog.text
+
+
 def test_the_boot_report_surfaces_a_blank_path_that_dodged_the_constructor(
         caplog: pytest.LogCaptureFixture) -> None:
     """The half that an operator actually sees: the backstop has to reach the boot warning, not
@@ -2293,8 +2430,7 @@ def test_the_ntfy_opener_has_no_redirect_handler_that_follows() -> None:
 # survived a 127-mutation sweep, and so did removing the deliberately redundant post-write call.
 # It is untestable on the Windows dev box, where `chmod` is near-inert — but CI runs
 # `ubuntu-latest`, where it is exact. Skipped rather than weakened, so the assertions stay real.
-posix_only = pytest.mark.skipif(
-    os.name != "posix", reason="POSIX permission bits; Windows chmod cannot express them")
+# (`posix_only` itself now lives at the top of the file — the #22 block above needs it too.)
 
 
 @pytest.fixture
@@ -2361,10 +2497,16 @@ def test_restrict_does_not_even_try_to_chmod_a_path_that_is_not_there(
     assert attempts == [(str(real), 0o600)]
 
 
-def test_restrict_is_silent_when_chmod_refuses(
+def test_restrict_does_not_raise_when_chmod_refuses(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A filesystem that does not model these bits, or a file owned by someone else. Never worth
-    failing an alert over — and `notify()` must not learn to raise here."""
+    failing an alert over — and `notify()` must not learn to raise here.
+
+    ⚠️ THIS TEST WAS CALLED `..._is_silent_when_chmod_refuses` AND THE NAME WAS THE BUG (#21). It
+    only ever asserted that nothing raised, but its name recorded the swallowed failure as the
+    intended behaviour — so the defect had a test that looked like it endorsed it. Not raising and
+    saying nothing are two claims; this file now makes them separately, here and below.
+    """
     path = tmp_path / "errors.log"
     path.write_text("x", encoding="utf-8")
 
@@ -2373,6 +2515,163 @@ def test_restrict_is_silent_when_chmod_refuses(
 
     monkeypatch.setattr(alerting.os, "chmod", refuse)
     alerting._restrict(str(path), 0o600)  # must not raise
+
+
+# ============================================================ #21: a refused chmod is not silent
+def test_restrict_reports_a_refused_chmod(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐⭐ #21. `except OSError: pass` made a no-op indistinguishable from a hardening.
+
+    The condition planted here is the exact one a uid-mismatched bind mount produces — the `chmod`
+    raises `PermissionError` with `errno.EPERM` — because a second uid cannot be planted by an
+    unprivileged test on either platform this suite runs on. What that costs is stated rather than
+    implied: this proves the SIGNAL, and `test_restrict_narrows_a_file_that_already_exists` above
+    proves the real call actually narrows a real file on POSIX. Between them the success and
+    failure paths are both measured; neither is inferred from the other.
+
+    The message has to carry what an operator acts on: WHICH path, and WHY it was refused. `EPERM`
+    ("this file is not yours") and `EROFS` ("this mount is read-only") lead to different fixes, so
+    the errno is named rather than folded into "could not".
+    """
+    path = tmp_path / "errors.log"
+    path.write_text("x", encoding="utf-8")
+
+    def refuse(*_a: object, **_k: object) -> None:
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(alerting.os, "chmod", refuse)
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        alerting._restrict(str(path), 0o600)
+
+    assert caplog.records, "a refused chmod produced no operator-visible signal at all"
+    assert caplog.records[0].levelno >= logging.WARNING
+    assert str(path) in caplog.text
+    assert "EPERM" in caplog.text
+    assert oct(0o600) in caplog.text
+
+
+def test_restrict_says_nothing_when_it_succeeds(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ THE OTHER HALF OF #21, and the half that decides whether the first one survives. A
+    permission helper that logged on every call would be turned off by the first operator who read
+    a normal boot, and the signal would be worth nothing. The success path is measured for real —
+    an actual file, an actual `chmod` — not with the call stubbed out."""
+    path = tmp_path / "errors.log"
+    path.write_text("x", encoding="utf-8")
+    with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
+        alerting._restrict(str(path), 0o600)
+    assert caplog.text == ""
+
+
+def test_restrict_says_nothing_about_a_path_that_is_not_there(
+        tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    """Absence is not a failure: this helper narrows what already exists, and every caller creates
+    the thing separately. Warning here would fire on every fresh container's first alert."""
+    with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
+        alerting._restrict(str(tmp_path / "nope" / "errors.log"), 0o600)
+    assert caplog.text == ""
+
+
+@posix_only
+def test_restrict_reports_a_permission_failure_the_kernel_actually_raised(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ THE SAME CLAIM WITHOUT A STUB, on the only unprivileged refusal a test can obtain here.
+
+    `procfs` refuses `chmod` for every user including root, so this exercises the real `os.chmod`
+    against the real errno path rather than a monkeypatched raise — the difference between proving
+    the code reports a `PermissionError` someone handed it and proving it reports one the kernel
+    produced. Both the absence of `/proc` and (impossibly) a chmod that SUCCEEDS there skip rather
+    than fail, so this can never become a test that damages the machine it runs on.
+    """
+    victim = "/proc/self/status"
+    if not os.path.exists(victim):
+        pytest.skip("no procfs on this host")
+    try:
+        os.chmod(victim, 0o600)
+    except OSError:
+        pass
+    else:
+        pytest.skip("this host permitted a chmod under /proc; no real refusal to observe")
+
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        alerting._restrict(victim, 0o600)
+    assert victim in caplog.text
+
+
+def test_the_number_of_permission_warnings_per_alert_is_the_number_published(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ THE RELEASE NOTES QUOTE THIS COUNT, SO THE COUNT IS PINNED HERE.
+
+    An operator uses it to decide whether what they are seeing is normal, and the first number
+    published for it was wrong: it was measured under a filesystem that refuses every `chmod` and
+    then written into a paragraph about uid mismatches, where the answer is different because a
+    file this process CREATED is one it can chmod. A number in a document that nothing re-measures
+    is a number that drifts.
+
+    EVERY row of the published table is pinned, and the first version of this test pinned two of
+    them — which left the row that was actually WRONG unpinned. Two variables decide the count and
+    the table now names both: which paths this process cannot `chmod`, and whether the log file
+    exists yet (the pre-write narrowing is silent on a path that is not there, so a fresh log is
+    always one lower on its first alert).
+    """
+    def counted(foreign: set[str], *, precreate: bool) -> tuple[int, int]:
+        tag = f"{'-'.join(sorted(foreign)) or 'none'}-{'old' if precreate else 'new'}"
+        directory = tmp_path / f"logs-{tag}"
+        path = directory / "errors.log"
+        if precreate:
+            directory.mkdir(parents=True)
+            path.write_text("{}\n", encoding="utf-8")
+        real_chmod = os.chmod
+
+        def chmod(target: object, mode: int, *a: object, **k: object) -> None:
+            if "all" in foreign or ("dir" in foreign and str(target) == str(directory)) or (
+                    "file" in foreign and str(target) == str(path)):
+                raise PermissionError(errno.EPERM, "Operation not permitted")
+            real_chmod(target, mode, *a, **k)       # type: ignore[arg-type]
+
+        monkeypatch.setattr(alerting.os, "chmod", chmod)
+        alerter = Alerter(AlertSettings(service="svc", error_log=str(path)))
+        counts = []
+        for _ in range(2):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+                alerter.notify(ERROR, "svc: down", "no route to host")
+            counts.append(sum("could not restrict" in r.getMessage() for r in caplog.records))
+        monkeypatch.undo()
+        return counts[0], counts[1]
+
+    assert counted(set(), precreate=True) == (0, 0), "a correct volume must be silent"
+    assert counted({"dir"}, precreate=True) == (1, 1)
+    assert counted({"dir", "file"}, precreate=True) == (3, 3)
+    assert counted({"dir", "file"}, precreate=False) == (2, 3)
+    assert counted({"all"}, precreate=True) == (3, 3)
+    assert counted({"all"}, precreate=False) == (2, 3)
+
+
+def test_a_refused_chmod_surfaces_from_the_alerting_path_and_costs_nothing(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ ASKED OF `notify()`, NOT OF THE HELPER — the call sites are what an operator experiences.
+
+    Two things at once, and the second is why the fix warns rather than raising: the failure
+    reaches the log, AND the alert it was protecting is still recorded. A `_restrict` that raised
+    would take `_append_error_record` with it and trade a permission warning for a lost error.
+    """
+    directory = tmp_path / "logs"
+    settings = AlertSettings(service="svc", error_log=str(directory / "errors.log"))
+
+    def refuse(*_a: object, **_k: object) -> None:
+        raise PermissionError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(alerting.os, "chmod", refuse)
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        Alerter(settings).notify(ERROR, "svc: down", "no route to host")
+
+    assert "EPERM" in caplog.text
+    records = alerting.read_jsonl_tail(str(directory / "errors.log"), 10)
+    assert [r["title"] for r in records] == ["svc: down"]
 
 
 @posix_only
