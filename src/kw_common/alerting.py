@@ -932,9 +932,14 @@ class AlertConfig:
         boot-config-dump standard prints credentials as set/unset; this does the same, and every
         other field stays readable because they are what an operator needs to see.
         """
-        email = None if self.email is None else {
-            key: (("<set>" if value else "<unset>") if key == "SMTP_PASSWORD" else value)
-            for key, value in self.email.items()}
+        # ⚠️ A NON-MAPPING `email` (a hand-built config; the send path tolerates any falsy value
+        # via `cfg.email or {}`) is shown as it is rather than raising: a repr that raises turns
+        # a `%r` log line into "--- Logging error ---" on stderr and drops the record. There is
+        # nothing to mask in a value that has no `SMTP_PASSWORD` key.
+        email: object = self.email
+        if isinstance(email, dict):
+            email = {key: (("<set>" if value else "<unset>") if key == "SMTP_PASSWORD" else value)
+                     for key, value in email.items()}
         return (f"AlertConfig(ntfy_url={self.ntfy_url!r}, email={email!r}, "
                 f"config_file={self.config_file!r}, "
                 f"allow_cleartext_ntfy={self.allow_cleartext_ntfy!r})")
@@ -1346,15 +1351,20 @@ def _send_email(cfg: AlertConfig, spec: SeveritySpec, title: str, message: str) 
         smtp.starttls(context=ssl.create_default_context())
         smtp.login(email["SMTP_USER"], email["SMTP_PASSWORD"])
         refused = smtp.send_message(msg)
-    if refused:
+    # `isinstance`, not truthiness: `send_message` returns the refused-recipient DICT on every
+    # interpreter this supports, but a consumer's own test that replaces `smtplib.SMTP` with a
+    # `MagicMock` gets a truthy mock back, and this line would then warn on every mocked send
+    # (the gate measured "refused 0 of 1"). A real server never hands back anything else.
+    if isinstance(refused, dict) and refused:
         # ⭐ A PARTIAL REFUSAL IS THE QUIETEST WAY TO LOSE A RECIPIENT. `send_message` raises only
         # when EVERY recipient is refused; when some are, it returns them and the send counts as
         # delivered — so the operator who was dropped simply never hears from this service again,
-        # and nothing said so (measured). The COUNT, never the addresses: the line repeats per
-        # alert and is the one that gets pasted into a bug report.
-        log.warning("email alert delivered to some recipients only — the server refused %d of "
-                    "%d. Check EMAIL_TO against the server's recipient policy.",
-                    len(refused), len(_RECIPIENT_SEPARATORS.split(msg["To"])))
+        # and nothing said so (measured). The refused COUNT only — never the addresses (the line
+        # repeats per alert and is the one that gets pasted into a bug report), and not a total
+        # either: counting the header's separators over-counted a quoted display name.
+        log.warning("email alert delivered to some recipients only — the server refused %d "
+                    "recipient(s). Check EMAIL_TO against the server's recipient policy.",
+                    len(refused))
 
 
 class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
@@ -1844,11 +1854,20 @@ def _sink_problem(path: str, *, label: str, creates_directories: bool,
         if parent == probe:
             break
         probe, missing = parent, missing + 1
-    if not os.path.lexists(probe) or (missing and os.path.dirname(probe) == probe):
-        # Nothing on the way exists but the filesystem (or drive) root. On the containers this
-        # library ships to that is a volume that was never mounted: `makedirs` would then succeed
-        # inside the disposable layer, which is the retrieval failure this sink exists to fix,
-        # arriving disguised as success.
+    # The "not mounted" diagnosis belongs to the writer that would CREATE the chain: for the
+    # state file a missing directory is "does not exist" whatever lies above it (the gate found
+    # the root arm replacing that accurate answer with a guess about mounts).
+    at_root = missing and creates_directories and os.path.dirname(probe) == probe
+    if not os.path.lexists(probe) or (at_root and os.name == "posix"):
+        # Nothing on the way exists but the filesystem root. On the Linux containers this
+        # library ships to, `/` is never a mounted volume, so that is a volume that was never
+        # mounted: `makedirs` would then succeed inside the disposable layer, which is the
+        # retrieval failure this sink exists to fix, arriving disguised as success.
+        #
+        # ⚠️ POSIX ONLY, and the gate is what found the need: on Windows a DRIVE ROOT is a
+        # volume — `C:\svc-logs\errors.log` is an ordinary, host-reachable place to write — and
+        # this arm reddened it while the sink wrote there perfectly well (measured). Off POSIX
+        # the walk falls through to the writability check below, which is the honest answer.
         return (f"{label} points into {directory!r}, and nothing on the way to it exists except "
                 f"the filesystem root — in a container that usually means the volume is not "
                 f"mounted, so these records would be written into the disposable layer and "
@@ -2153,8 +2172,12 @@ class Alerter:
             # content earns, so a firing condition re-paged once and the file was quietly
             # overwritten with nothing in the log to explain it.
             log.warning("alert state %s holds a JSON %s, not an object — treating every "
-                        "condition as new, so this alert goes out, and the file will be "
-                        "rewritten", path, type(data).__name__)
+                        "condition as new, so this alert goes out, and the file is being "
+                        "rewritten empty", path, type(data).__name__)
+            # ⭐ REWRITTEN HERE, so the line fires ONCE. An OK never writes the state file unless
+            # it clears something, so a service that only ever sends heartbeats would have read
+            # the same list and warned on every notification forever (the gate measured it).
+            self._write_state({})
             return {}
         return data
 
@@ -2212,14 +2235,19 @@ class Alerter:
             # REMOVED FIRST, THEN `O_EXCL`: a temp left behind by a killed process would
             # otherwise lend its own mode to the marker-style rename. And removed again on
             # failure, so a read-only mount does not accumulate a `.tmp` beside every boot.
-            with contextlib.suppress(OSError):
+            # `ValueError` as well as `OSError`, BOTH times: a NUL in `state_file` raises it from
+            # `unlink`, and in the cleanup arm below that escaped the `except` — so the one
+            # function documented as never letting a failure reach its caller raised, and
+            # `notify()`'s fail-open guard then logged an ERROR with a traceback per alert
+            # (the gate measured it; 1.4.0 logged one WARNING).
+            with contextlib.suppress(OSError, ValueError):
                 os.unlink(tmp)
             fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(self._prune(state), fh)
             os.replace(tmp, path)
         except Exception as exc:  # noqa: BLE001 — a read-only mount must not break alerting
-            with contextlib.suppress(OSError):
+            with contextlib.suppress(OSError, ValueError):
                 os.unlink(tmp)
             log.warning("could not save alert state to %s (%s) — recurring conditions will "
                         "re-alert", path, type(exc).__name__)

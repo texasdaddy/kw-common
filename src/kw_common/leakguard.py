@@ -2743,6 +2743,24 @@ def parse_args(argv: list[str]) -> Args:
     return Args(selftest, rev_range, repo, want_help, staged, config)
 
 
+def _link_text(path: Path) -> bytes:
+    """The bytes git PUBLISHES for a symlink entry: its link text, forward-slashed.
+
+    ⛔ NOT A BARE `os.readlink`. Git for Windows writes a link's reparse point with BACKSLASHES
+    and its own `readlink` turns them back into `/` before storing the blob — so on a Windows
+    checkout under `core.symlinks=true` Python's `readlink` returns `\\mnt\\user\\appdata\\svc`
+    for a blob git holds as `/mnt/user/appdata/svc`. Measured by the gate: the tree scan passed
+    that link while `--staged` and `--range` on the same repository reported it, because the
+    pool-path pattern is separator-sensitive. Normalised the way git normalises, on the one
+    platform that needs it; a POSIX link text is stored verbatim and may legitimately contain a
+    backslash, so it is left alone there.
+    """
+    text = os.readlink(path)
+    if os.name == "nt":
+        text = text.replace("\\", "/")
+    return os.fsencode(text)
+
+
 def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
     findings: list[str] = []
     undecodable: list[str] = []
@@ -2810,7 +2828,7 @@ def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
             # `except UnicodeDecodeError` here could not ask that. `read_bytes` still raises the
             # same FileNotFoundError and OSError subclasses (a checked-out submodule is still
             # IsADirectoryError / PermissionError), which is all this `try` ever needed to cover.
-            raw = os.fsencode(os.readlink(path)) if is_link else path.read_bytes()
+            raw = _link_text(path) if is_link else path.read_bytes()
         except FileNotFoundError:
             # ⚠️ NOT SILENT, and not `continue`. A tracked file missing from the worktree is
             # STAGED-BUT-DELETED (or mid-rebase): its content is still in the INDEX and still goes
@@ -3138,7 +3156,8 @@ def _scan_commits(root: Path, rev_range: str,
               "scanner skips (" + " ".join(SKIP_SUFFIXES) + "); otherwise commit the file as "
               "UTF-8 text. A file that DECODES but carries a NUL byte is refused here too - "
               "BOM-less UTF-16/UTF-32 is valid UTF-8 and would scan as nothing, so it is not "
-              "cleared.\n")
+              "cleared. A `<tag object>` entry is a TAG git could not read - none of the above "
+              "applies; re-fetch it, or re-cut it with `git tag -a -f`, and re-run.\n")
     if result.findings:
         # ⚠️ `_ascii` HERE TOO. This is the line that ANNOUNCES a real leak, and with a non-ASCII
         # branch name in `rev_range` it died mid-sentence under a hook's cp1252 stdout — the guard
@@ -3198,10 +3217,14 @@ def repo_root(start: str | None) -> Path:
         out = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=start,
                              capture_output=True, check=True, timeout=_GIT_TIMEOUT_S)
     except subprocess.CalledProcessError as exc:
-        where = start if start is not None else os.getcwd()
+        # "Has no working tree" rather than "is not a repository": a bare repository and the
+        # inside of a `.git` directory ARE repositories, and git's own sentence (kept below)
+        # says which. And the flag is named only when it was given.
+        named = (f"--repo {start!r}" if start is not None
+                 else f"the current directory {os.getcwd()!r}")
         said = exc.stderr.decode("utf-8", errors="replace").strip()
         raise UsageError(
-            f"--repo {where!r} is not inside a git repository, so there is nothing to scan"
+            f"{named} has no git working tree to scan"
             + (f" (git said: {said})" if said else "")) from None
     return Path(out.stdout.decode("utf-8", errors="replace").strip())
 

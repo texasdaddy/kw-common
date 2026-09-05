@@ -1599,7 +1599,8 @@ def test_a_marker_that_lands_readable_anyway_is_reported_and_kept(
 def test_a_nul_in_the_config_path_is_refused_in_this_modules_own_terms(tmp_path: Path) -> None:
     """`_config_digest` caught `OSError` only, and an embedded NUL raises `ValueError` from
     `open` — so it travelled out of `validate_boot` as a bare exception with no refusal logged,
-    past the `except AlertEnvError` the setup document tells an adopter to write. The same
+    outside the `AlertEnvError` contract the setup document describes ("let it stop the
+    process" presumes it is the exception that arrives). The same
     "a predicate that looks total is not" class `_checked_is_dir` closes (measured by the
     audit). It is `read_config`'s own NUL arm that names it now."""
     from dataclasses import replace

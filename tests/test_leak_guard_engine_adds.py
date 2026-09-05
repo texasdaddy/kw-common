@@ -233,6 +233,23 @@ def test_a_tracked_symlink_is_scanned_as_its_link_text_not_its_target(tmp_path: 
     assert res.returncode == 0, f"foreign content behind a clean link was scanned:\n{_out(res)}"
 
 
+def test_a_symlink_whose_text_is_a_pool_path_is_found_however_the_platform_spells_it(
+        tmp_path: Path) -> None:
+    """⛔ THE GATE'S FINDING INSIDE THE SYMLINK FIX. Git for Windows stores a link's reparse point
+    with BACKSLASHES and turns them back to `/` when it reads the blob, so `os.readlink` on a
+    Windows `core.symlinks=true` checkout answered a backslashed pool path for a blob git
+    publishes forward-slashed — and the pool-path pattern, which is separator-sensitive, went
+    blind in the tree scan while `--staged` reported it. The link here is built from a `Path`, so
+    on Windows its text is backslashed exactly as git makes it; on POSIX it is forward-slashed
+    either way. (The pool path itself is assembled from fragments, as this file's rule says.)"""
+    repo = tmp_path / "poollink"
+    _seeded(repo)
+    _link(repo, "appdata", Path("..") / _MNT_USER.lstrip("/") / "appdata" / "svc")
+    res = _cli(repo)
+    assert res.returncode == 1, _out(res)
+    assert "appdata:1: unraid pool path" in _out(res), _out(res)
+
+
 def test_a_regular_file_the_index_calls_a_symlink_is_still_read(tmp_path: Path) -> None:
     """Fail-closed on a SPOOFED mode. `update-index --cacheinfo 120000,…` marks any path as a
     link while the file goes on sitting in the worktree, readable and published — and on

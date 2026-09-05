@@ -136,6 +136,11 @@ def test_no_shipped_file_pins_a_version_this_package_is_not() -> None:
     # guard's own test file. Both halves are needed: the fragments keep the marker out of any
     # OTHER matcher, and the skip keeps this file out of its own results.
     marker = "github.com/texasdaddy/" + "kw-common@"
+    # ⭐ AND THE RAW-ASSET FORM. The setup document fetches the template by tag from
+    # `raw.githubusercontent.com/<owner>/<repo>/vX.Y.Z/…` — no `@` — and those two pins were
+    # outside this scan (the gate found them drifting silently at the next bump).
+    raw_marker = "raw.githubusercontent.com/texasdaddy/" + "kw-common/"
+    raw_expected = f"{raw_marker}v{kw_common.__version__}/"
     root = Path(__file__).resolve().parents[1]
     stale: list[str] = []
     checked = 0
@@ -148,6 +153,12 @@ def test_no_shipped_file_pins_a_version_this_package_is_not() -> None:
                         ".pytest_cache"} for part in path.parts):
             continue
         for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if raw_marker in line:
+                after = line.split(raw_marker, 1)[1]
+                if after.startswith("v") and after[1:2].isdigit():
+                    checked += 1
+                    if raw_expected not in line:
+                        stale.append(f"{path.relative_to(root)}:{n}: {line.strip()}")
             if marker not in line:
                 continue
             # Only a CONCRETE pin — `@v` followed by a digit. A documented placeholder like
@@ -159,7 +170,7 @@ def test_no_shipped_file_pins_a_version_this_package_is_not() -> None:
             checked += 1
             if expected not in line:
                 stale.append(f"{path.relative_to(root)}:{n}: {line.strip()}")
-    assert checked >= 2, (
+    assert checked >= 4, (
         f"only {checked} install line(s) found — this test is no longer looking where the "
         f"install examples live")
     assert stale == [], (

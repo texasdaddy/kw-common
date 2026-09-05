@@ -28,8 +28,10 @@ again). Every fix carries the test that would have caught it.
   when `makedirs` handles it on the first alert. One walk to the first existing ancestor now
   serves both `error_log_problem()` and `state_file_problem()`, asked the way each writer
   writes (the error log `makedirs`; the state file does not), and the "not mounted" diagnosis
-  fires only when nothing on the way exists except the filesystem root — which no volume ever
-  is. `state_file_problem()` also stops saying "does not exist" about a file that is in the way,
+  fires only when nothing on the way exists except the filesystem root — which, on the Linux
+  containers this ships to, no volume ever is. It does not fire off POSIX: a Windows DRIVE ROOT is
+  a volume, and the gate measured the arm reddening `C:\svc-logs\errors.log` while the sink wrote
+  there. `state_file_problem()` also stops saying "does not exist" about a file that is in the way,
   and both detectors now ask about the leaf. The test asserts the detector AGREES WITH THE SINK,
   by running the sink's own sequence for every planted state, in both directions.
 - **`read_jsonl_tail(backups=None)` is accepted again (#5).** The reference implementation spelled
@@ -69,14 +71,22 @@ again). Every fix carries the test that would have caught it.
 - **`email_ready()` refuses the credential the send path refuses.** A non-ASCII `SMTP_USER` or
   `SMTP_PASSWORD` was rejected by `_send_email` (before smtplib could quote the character) and
   reported READY by the readiness check — so the boot report and `validate_boot` called usable a
-  channel that then failed every send. Key name in the log, never the value.
+  channel that then failed every send. Key name in the log, never the value. ⚠️ **This is a new
+  boot refusal**: a deployment that booted on 1.4.0 with such a credential (email failing on
+  every send, ntfy delivering) is refused by `validate_boot` on its next re-validation — a fresh
+  install, an edited config, or a deleted marker; a matching marker still skips. `notify()`'s
+  email result for that configuration changes from `"failed"` to `"skipped"`, and the boot
+  report names the key at ERROR instead of listing email as ready.
 - **A partial recipient refusal is reported.** `send_message` raises only when every recipient
   is refused; when some are it returns them, and the send counted as delivered — the operator who
   was dropped never heard from the service again and nothing said so. The count is logged, never
   the addresses.
-- **A NUL in `SHARED_ROOT` or `CONFIG_PATH` is a refusal or a warning, not a traceback.** Five
-  `except OSError` arms around path operations let the `ValueError` a NUL raises escape
-  `validate_boot` bare — the class `_checked_is_dir` closed in 1.4.0, one exception type over.
+- **A NUL in `SHARED_ROOT` or `CONFIG_PATH` is a refusal or a warning, not a traceback.** The
+  `except OSError` arms around every path operation on the two paths let the `ValueError` a NUL
+  raises escape `validate_boot` bare — four of them reachably (the digest, the marker read, the
+  marker write and its temp discard; the three post-write arms are widened for the same class
+  and are not reachable by a NUL, since no marker is written) — the class `_checked_is_dir`
+  closed in 1.4.0, one exception type over.
 
 ### Security
 
@@ -84,7 +94,8 @@ again). Every fix carries the test that would have caught it.
   repr prints every field, and `Alerter.config()` hands this object to any adopter — so
   `repr(alerter.config())` in a debug line or a boot-time settings dump was the shared file's
   password in the process log. The same class of escape as 1.4.0's marker digest, through a
-  different door. Every other field stays readable.
+  different door. Every other field stays readable; `dataclasses.asdict()` and pickling still
+  carry the value, as they must — the repr is the one that lands in a log by accident.
 - **The de-duplication state file is created `0600`, the same way the marker and the error log
   are.** It was written by a bare `open()` at the umask's mode — `0644` into a shared appdata
   volume — and it persists every firing condition's title. `os.open(…, 0o600)` into a temporary
@@ -94,7 +105,9 @@ again). Every fix carries the test that would have caught it.
 
 ### Tests
 
-- **The generic-code contract is enforced for every module (#12).** `tests/test_isolation.py`
+- **The generic-code contract is enforced for every module (#12)** — its six testable clauses;
+  the seventh, "tests travel with the module", is what the packaging job proves by unpacking the
+  sdist and running its suite, not something a test can assert about itself. `tests/test_isolation.py`
   bound one `MODULE_PATH` — `alerting.py` — so its checks measured that module and no other while
   the README said the contract held for all of them. It is parametrised over `src/kw_common/*.py`
   now: isolation, stdlib-only, no environment read (the environment layer's reads are pinned to
@@ -103,14 +116,17 @@ again). Every fix carries the test that would have caught it.
   `alerting`) asserted in both directions — as data, so a new edge is a deliberate edit.
 - **The v1.0.0 mutation survivors are pinned (#6, items 2–11).** Measured first: 20 of 27
   mutations survived the suite. Each has the test that catches it now — the restore branch of a
-  failed delivery, the two snapshot guards removed together, the opt-out gates (planted with a
-  file literally named `None`), every default sizing constant, WARN's log level, `_prune`'s
+  failed delivery, the two snapshot guards removed together, two of the three opt-out gates
+  (planted with a file literally named `None`; `notify`'s own is uncatchable by construction,
+  the other two make it a no-op), every default sizing constant, WARN's log level and both
+  channels' ntfy tag and priority, `_prune`'s
   ordering and junk key, `read_jsonl_tail`'s `limit=None`, non-object records and `keep`
   predicate, the `since` boundary and both naive-timestamp branches, and the missing-file path
   that must not warn.
 - **The editable install in both leak-guard CI jobs is pinned (#13).** `pip install -e .` is what
   keeps the guard's own synthetic corpus out of a range scan of this repository's history; a
-  comment at each install step says so, and a test fails if either job stops installing editable.
+  comment at each install step says so, and a test fails if either job's install line stops being
+  editable or a non-editable install of the package follows it.
 
 ### Changed
 

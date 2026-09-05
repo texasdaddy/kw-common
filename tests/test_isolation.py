@@ -306,8 +306,8 @@ def _environment_reads(tree: ast.Module) -> list[str]:
         elif isinstance(node, ast.ImportFrom) and node.module == "os":
             # ⭐ THE ALIASED SPELLING. `from os import environ as _ambient` binds the mapping to a
             # name the two arms above never see, and every later `_ambient.get(...)` walked past
-            # this guard — measured by the audit: the aliased form survived on both modules the
-            # walk is run over. An import is where the environment enters a module, so the
+            # this guard — measured by the audit: the aliased form survived on every module the
+            # walk was run over. An import is where the environment enters a module, so the
             # import is what is flagged, whatever it is called afterwards.
             for alias in node.names:
                 if alias.name in _ENVIRONMENT_NAMES:
@@ -356,10 +356,20 @@ def test_the_environment_layer_reads_exactly_the_three_declared_variables(
             seen.add(key)
             return super().get(key, default)
 
+    # ⚠️ A REAL, COMPLETE shared root, so the loader runs to its END rather than refusing at the
+    # first check — a fourth read placed AFTER an early refusal was invisible to this test
+    # (the gate planted one and stayed green). The values are the suite's synthetic ones.
+    config = alerting_env.config_file_for(tmp_path)
+    config.parent.mkdir(parents=True)
+    config.write_text(
+        "EMAIL_TO=ops@example.com\nEMAIL_FROM=svc@example.com\nSMTP_HOST=smtp.example.com\n"
+        "SMTP_PORT=587\nSMTP_PASSWORD=not-a-real-password\n"
+        "NTFY_URL_DEV=https://ntfy.example.com/dev\nNTFY_URL_PROD=https://ntfy.example.com/prod\n",
+        encoding="utf-8")
     monkeypatch.setattr(os, "environ", Recording(
         SHARED_ROOT=str(tmp_path), CONFIG_PATH=str(tmp_path / "cfg"), DEPLOY_ENV="dev"))
-    with contextlib.suppress(alerting_env.AlertEnvError):
-        alerting_env.load_alert_settings_from_env("svc")
+    settings = alerting_env.load_alert_settings_from_env("svc")   # must complete, no refusal
+    assert settings.config_file == str(config)
     with contextlib.suppress(alerting_env.AlertEnvError):
         alerting_env.validate_boot_from_env(
             AlertSettings(service="svc", config_file=str(tmp_path / "alerting.env")))

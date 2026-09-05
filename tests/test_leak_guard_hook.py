@@ -860,9 +860,14 @@ def test_the_PUBLISHING_workflow_carries_every_packaging_assertion_the_PR_workfl
     # `vendor/tests/conftest.py` for `/tests/conftest.py` (measured by the audit). A shell step
     # cannot be driven from here, so the anchor itself is pinned.
     for name, text in (("ci.yml", ci), ("release.yml", rel)):
-        assert 'grep -q "^[^/]*${required}\\$"' in text, (
-            f"{name}: the sdist roll-call grep is no longer anchored to the tarball's top "
-            f"directory, so a nested copy of a required file satisfies it")
+        # Comments stripped first: the gate kept the anchored form in a `# was:` comment and
+        # left the live line unanchored, and a raw-text search was satisfied.
+        live = "\n".join(ln for ln in text.splitlines() if not ln.strip().startswith("#"))
+        roll_calls = [ln.strip() for ln in live.splitlines()
+                      if "${required}" in ln and "grep" in ln]
+        assert roll_calls == ['echo "$names" | grep -q "^[^/]*${required}\\$" || {'], (
+            f"{name}: the sdist roll-call grep is no longer the anchored, fail-closed form: "
+            f"{roll_calls}")
     assert ci_required == rel_required, (
         f"the two sdist checks require different files. Only in ci.yml: "
         f"{sorted(ci_required - rel_required)}; only in release.yml: "
@@ -903,16 +908,35 @@ def test_the_leak_guard_job_cannot_be_made_advisory(workflow: Path) -> None:
     job = text[text.index("  no-internal-info:"):text.index("\n  test:")]
     code = "\n".join(ln for ln in job.splitlines() if not ln.strip().startswith("#"))
     assert "continue-on-error" not in code, f"{workflow.name}: the leak-guard job is advisory"
+    assert not re.search(r"^\s+if:", code, re.MULTILINE), (
+        f"{workflow.name}: the leak-guard job or a step in it is conditional — a skipped "
+        f"required check satisfies branch protection")
     invocations = [ln for ln in code.splitlines() if "kw-leak-guard" in ln]
     assert len(invocations) >= 3, f"{workflow.name}: the guard is no longer invoked: {invocations}"
     for line in invocations:
-        assert "|| true" not in line and "|| :" not in line and "|| echo" not in line, (
-            f"{workflow.name}: a guard invocation has its exit status discarded: {line.strip()}")
-    # The range step's own script — from its `run: |` to the invocation — must begin `set -eu`,
-    # or a failed `git rev-list` inside a substitution scans an empty range as clean.
+        # The invocation must BE the statement: not `if guard; then`, not `guard | tee`, not
+        # `guard || true` — each of which the gate planted and the previous form of this test
+        # accepted. A bare command in a `set -e` script is the only shape whose exit status is
+        # the step's.
+        stripped = line.strip()
+        # The console script bare, or the throwaway venv's copy of it by path.
+        assert re.match(r"^(?:\S*/)?kw-leak-guard\b", stripped), (
+            f"{workflow.name}: a guard invocation is wrapped in something: {stripped}")
+        assert "|" not in stripped and ";" not in stripped and "&&" not in stripped, (
+            f"{workflow.name}: a guard invocation is piped or chained: {stripped}")
+    # No `set +e` anywhere in the job, and the range step's own script — from its `run: |` to
+    # the invocation — must begin `set -eu`, or a failed `git rev-list` inside a substitution
+    # scans an empty range as clean.
+    assert "set +e" not in code, f"{workflow.name}: errexit is switched off inside the job"
     call = code.index("kw-leak-guard --range")
     step = code[code.rfind("run: |", 0, call):call]
     assert "set -eu" in step, f"{workflow.name}: the range step no longer runs `set -eu`"
+    # #13 again: nothing may install the package NON-editable after the editable install, and the
+    # pinned tools may not be re-installed unpinned afterwards.
+    assert not re.search(r"pip install (?!.*-e)(?:[^\n]*\s)?\.{1,2}/?\s*$", code, re.MULTILINE), (
+        f"{workflow.name}: a non-editable install of the package in the leak-guard job")
+    assert not re.search(r"pip install --upgrade (?!pip\b)", code), (
+        f"{workflow.name}: a tool is upgraded past its pin inside the leak-guard job")
 
 
 def test_the_required_status_check_names_are_the_jobs_own_names_not_comment_text() -> None:

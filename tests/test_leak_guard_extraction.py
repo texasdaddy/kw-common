@@ -206,8 +206,15 @@ def test_a_repo_path_outside_any_repository_is_a_usage_error_not_a_traceback(
     res = _run(plain)
     assert res.returncode == 2, f"a non-repository must be a usage error (exit 2):\n{_out(res)}"
     assert "Traceback" not in _out(res), f"a usage error must not print a traceback:\n{_out(res)}"
-    assert "not inside a git repository" in _out(res), _out(res)
+    assert "has no git working tree to scan" in _out(res), _out(res)
     assert "usage:" in _out(res), "the usage text is what tells the operator which flag to fix"
+    # A BARE repository IS a repository, so the sentence must not say otherwise — git's own
+    # reason is carried, which is what tells a bare repo and a plain directory apart.
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True, timeout=60)
+    res = _run(bare)
+    assert res.returncode == 2 and "has no git working tree" in _out(res), _out(res)
+    assert "git said:" in _out(res), "git's own reason must be carried for the bare case"
 
     absent = _run(tmp_path / "does-not-exist")
     assert absent.returncode == 2 and "Traceback" not in _out(absent), _out(absent)
