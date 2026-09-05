@@ -150,6 +150,16 @@ booted clean and the service came up alerting nobody. A digest answers that what
 says, in both directions — a restore with different bytes re-validates, an identical one does not.
 Upgrading from a version that wrote an empty marker costs exactly one re-validation, silently.
 
+⭐ **And the marker is created `0600`, because contents that decide are contents somebody can
+read.** The digest is taken over the file holding the SMTP password, so a marker the rest of a
+shared volume can read lets anyone who has it test guesses at that file offline — no rate limit,
+no connection to the mail provider, no log line. The first release that gave the marker contents
+also gave it that exposure. It is written as a new file and renamed into place rather than
+narrowed with `chmod`, so an existing wide-open marker is fixed on the next boot and the narrowing
+cannot half-succeed on a bind mount whose uid does not match the service's; where the filesystem
+cannot express the mode, the boot log says so and keeps the marker, because deleting it would
+re-validate and re-announce on every boot forever.
+
 📄 **Setup — the folder structure, the template and per-OS commands: [`docs/alerting-setup.md`](docs/alerting-setup.md).**
 A consumer README carries a short prerequisite block and a **link** to that page, never a copy; a
 prose copy per consumer is the same duplication problem relocated into documentation.

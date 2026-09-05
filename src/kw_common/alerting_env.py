@@ -74,10 +74,12 @@ raises on purpose.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import os
 import re
+import stat
 from pathlib import Path
 
 from .alerting import (
@@ -313,9 +315,24 @@ def read_config(config_path: str | os.PathLike[str]) -> dict[str, str]:
         with open(path, encoding="utf-8", newline="") as fh:
             raw = fh.read()
     except FileNotFoundError as exc:
+        # ⭐⭐ THE MOUNT AND THE FILE ARE SEPARATED HERE, not only in `_check_layout`. The standard
+        # claims a missing MOUNT and a missing FILE send an operator to different places, and
+        # `validate_boot` does carry that split — but on the sequence the setup document
+        # prescribes it never fires, because the loader calls THIS function before validation
+        # runs, so both cases arrived as one undifferentiated "does not exist". The first adopter
+        # measured it both ways. The claim is cheaper to make true than to retract: the file's own
+        # directory answers the question, and it is one `is_dir()` away.
+        if path.parent.is_dir():
+            raise _refuse(
+                f"the shared alerting config {path} does not exist, although the directory "
+                f"{path.parent} it belongs in does — so the volume is mounted and the file is "
+                f"missing. See the setup document for how to create it.") from exc
         raise _refuse(
-            f"the shared alerting config {path} does not exist. It is the file every service in "
-            f"the fleet reads; see the setup document for how to create it.") from exc
+            f"the shared alerting config {path} does not exist, and neither does {path.parent}, "
+            f"the directory it lives in. In a container that is the MOUNT rather than the file: "
+            f"the volume was never added to the template, was added with a host path that does "
+            f"not exist, or points at somewhere that does not contain {CONFIG_RELPATH!r}. Check "
+            f"the volume before looking for the file.") from exc
     except OSError as exc:
         raise _refuse(
             f"the shared alerting config {path} could not be read ({type(exc).__name__}: {exc}). "
@@ -553,6 +570,14 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
     there" question, and it is worth asking separately because a missing MOUNT and a missing FILE
     send an operator to different places.
 
+    ⚠️ THIS CHECK IS NOT WHERE MOST CALLERS MEET THAT DISTINCTION, and for a while it was where
+    nobody met it. On the sequence the setup document prescribes, `load_alert_settings_from_env`
+    reads the config BEFORE this function runs, so a missing mount surfaced from `read_config` as
+    an undifferentiated "does not exist" and this refusal never fired — measured both ways by the
+    first adopter. `read_config` now draws the same distinction from the file's own directory, so
+    the diagnosis arrives whichever of the two runs first. This one still earns its place: it is
+    the only check that can name the SHARED_ROOT the caller actually passed.
+
     `alerter` is the `Alerter` the success notification goes through; `None` uses the process
     default installed by `alerting.configure()`. With NO alerter available the marker is NOT
     written, so the confirmation is not lost — see `_announce`.
@@ -581,6 +606,14 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
                  "digest of %s); skipping. Any edit to the config file forces a re-check; delete "
                  "the marker to force one without editing it.",
                  env, marker, config)
+        # ⭐⭐ THE SKIP PATH IS WHERE AN UPGRADE ARRIVES, WHICH IS WHY THE NARROWING HAPPENS HERE
+        # TOO. Every service already running the previous release has a matching marker sitting in
+        # its config directory at 0644 — so the marker MATCHES, this returns, and `_write_marker`
+        # is never reached. Fixing only the write path would have left every deployed marker
+        # exposed until somebody happened to edit the shared config, which is the "fixed the
+        # instance, not the class" shape: the release notes would have been true about new
+        # installations and false about every existing one.
+        _reharden(marker)
         return False
 
     _check_layout(config, shared_root)
@@ -809,6 +842,66 @@ def _announce(settings: AlertSettings, env: str, values: dict[str, str], config:
     return True
 
 
+def _discard(path: Path) -> None:
+    """Remove a scratch path if it is there. Never raises, never reports — it is housekeeping.
+
+    Already gone is the common case and is not worth a line. Anything else — a directory of that
+    name, a permission fault — surfaces one statement later as the `O_EXCL` failure, which IS
+    reported, so a warning here would only ever be the same news said twice.
+    """
+    with contextlib.suppress(OSError):
+        path.unlink()
+
+
+def _exposed_bits(path: Path) -> int:
+    """The group/other permission bits this path actually carries; `0` when it carries none.
+
+    ⚠️ ANSWERS `0` OFF POSIX ON PURPOSE, rather than reporting what `os.stat` invents. Windows
+    synthesises `st_mode` from the read-only attribute alone — every ordinary file reads as 0o666 —
+    so a check that trusted it would warn about an exposure on every write while the actual access
+    control (the ACL) went unexamined. A guard that fires on a correct system is one an operator
+    switches off, and this one is here to be believed on the platform the fleet deploys to.
+    """
+    if os.name != "posix":
+        return 0
+    try:
+        return stat.S_IMODE(path.stat().st_mode) & 0o077
+    except OSError:
+        # The mode of a file we have just written and cannot now stat is not a question worth
+        # failing a boot over, and the caller has already logged anything that went wrong.
+        return 0
+
+
+def _reharden(marker: Path) -> None:
+    """Re-write an already-correct marker that is readable beyond its owner, keeping its contents.
+
+    This is the upgrade path and nothing else. A marker written by an earlier release records the
+    right digest at the wrong mode, so it MATCHES and validation skips — and the write that would
+    narrow it never runs. Rewriting it here costs one file write on the first boot after the
+    upgrade, changes nothing about what the marker says, and does not re-validate or re-announce.
+
+    Does nothing at all when the marker is already restricted, which is every boot after the
+    first, and on every platform where these bits are not the access-control mechanism.
+
+    ⚠️ ON A FILESYSTEM THAT IGNORES THE MODE this runs on every boot and `_write_marker` warns
+    every time. That is the correct outcome rather than a loop worth suppressing: the exposure is
+    real and unresolved, and the alternative — remembering the failure — would need state on the
+    same volume that cannot hold a permission bit.
+    """
+    if not _exposed_bits(marker):
+        return
+    try:
+        recorded = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        # It was readable a moment ago, in `_marker_matches`. If it is not now, the next boot
+        # re-validates, which is the safe direction and needs no announcement here.
+        return
+    log.info("alerting: narrowing the validation marker %s, which an earlier release created "
+             "readable by anything with this volume mounted. Its contents do not change and this "
+             "boot is not re-validated.", marker)
+    _write_marker(marker, recorded)
+
+
 def _write_marker(marker: Path, digest: str) -> None:
     """Record the digest of the config that was VALIDATED, in the app's own read-write directory.
 
@@ -835,6 +928,39 @@ def _write_marker(marker: Path, digest: str) -> None:
     established and announced. An unwritable `CONFIG_PATH` costs one redundant validation and one
     duplicate alert per boot, which is noise; refusing to start over it would turn a
     missing-read-write-volume into an outage of the service itself.
+
+    ⭐⭐ THE MARKER IS CREATED 0600, AND THE MODE DOES NOT COME FROM A `chmod`. Its content is a
+    digest of the shared config, and that file holds `SMTP_PASSWORD` — so a world-readable marker
+    inside a shared volume is an OFFLINE VERIFICATION ORACLE: a party who can guess the rest of the
+    file can confirm a candidate password against the digest with no rate limit, no SMTP
+    connection and no log line anywhere. v1.3.0 introduced that when it gave the marker contents;
+    the empty marker it replaced had nothing to leak.
+
+    The write is temp-then-`os.replace`, and the temp is created by `os.open` with mode 0600, for
+    two reasons that a `chmod` afterwards does not cover:
+
+    * a `chmod` on a marker some EARLIER version wrote is exactly the call that fails silently on a
+      uid-mismatched bind mount. `os.replace` needs only the DIRECTORY to be writable, and this
+      directory is `CONFIG_PATH` — the app's own read-write directory, which it must already be
+      able to write or there would be no marker at all. So the narrowing cannot half-happen.
+    * it is atomic, so a concurrent reader never sees a half-written digest and treats a truncated
+      one as a mismatch.
+
+    A umask cannot widen this: `os.open` masks the mode it is given, so the result is always a
+    subset of 0600.
+
+    ⛔ AN HMAC INSTEAD OF A DIGEST DOES NOT SOLVE THIS, and the reason is written down so it is not
+    re-opened as an improvement. A keyed MAC only helps if the reader cannot obtain the key, and
+    every candidate key lives in the same volume as the marker — a key file beside it, a salt
+    inside it, or the config's own bytes. A salt defeats precomputation, not guessing. The only
+    property that removes the oracle is the marker's own unreadability, which is what this does.
+
+    ⚠️ AND WHERE THE MODE CANNOT BE APPLIED THE MARKER IS STILL KEPT, deliberately. Deleting it
+    would fail open into re-validating and re-announcing on EVERY boot, which is the loud wrong
+    answer to a quiet problem. It warns instead — and on a filesystem that does not model these
+    bits at all (vfat, most CIFS mounts) the marker is not the weak link anyway: `alerting.env`
+    itself is equally readable there, and it holds the password in the clear rather than a digest
+    of it.
     """
     if not digest.startswith("sha256:"):
         # Empty means the CONFIG could not be read when the digest was taken, one statement before
@@ -846,11 +972,29 @@ def _write_marker(marker: Path, digest: str) -> None:
                     "the next boot will validate and announce again. An empty digest means the "
                     "shared config could not be read at the moment it was hashed.", digest, marker)
         return
+    tmp = marker.with_name(marker.name + ".tmp")
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(digest + "\n", encoding="utf-8")
+        # ⚠️ REMOVED FIRST, THEN `O_EXCL`. `O_TRUNC` onto a temp left behind by a killed process
+        # would reuse THAT file's mode — so a stale 0644 temp would be renamed into place as the
+        # marker, 0600 asked for and not applied, which is the whole defect one layer down.
+        _discard(tmp)
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(digest + "\n")
+        os.replace(tmp, marker)
     except OSError as exc:
+        _discard(tmp)
         log.warning("alerting: could not write the validation marker %s (%s) — the configuration "
                     "is valid and was announced, but every boot will re-validate and re-announce "
                     "until this directory is writable. It is the CONFIG_PATH variable.",
                     marker, type(exc).__name__)
+        return
+    exposed = _exposed_bits(marker)
+    if exposed:
+        log.warning("alerting: the validation marker %s ended up with group/other permission bits "
+                    "%s instead of none. It records a digest of the shared alerting config, so "
+                    "anything that can read it can test guesses at that file's contents offline. "
+                    "A filesystem that ignores these bits (vfat, most CIFS mounts) reads like "
+                    "this, and on such a mount the config file itself is just as readable.",
+                    marker, oct(exposed))
