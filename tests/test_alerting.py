@@ -2610,34 +2610,44 @@ def test_the_number_of_permission_warnings_per_alert_is_the_number_published(
     file this process CREATED is one it can chmod. A number in a document that nothing re-measures
     is a number that drifts.
 
-    Two ends of the published table, which between them fix the shape: nothing foreign is silent,
-    and both the directory and the log file foreign is three — the directory, the file before the
-    write, and the file again after it.
+    EVERY row of the published table is pinned, and the first version of this test pinned two of
+    them — which left the row that was actually WRONG unpinned. Two variables decide the count and
+    the table now names both: which paths this process cannot `chmod`, and whether the log file
+    exists yet (the pre-write narrowing is silent on a path that is not there, so a fresh log is
+    always one lower on its first alert).
     """
-    def counted(foreign: set[str]) -> int:
-        directory = tmp_path / f"logs-{'-'.join(sorted(foreign)) or 'none'}"
+    def counted(foreign: set[str], *, precreate: bool) -> tuple[int, int]:
+        tag = f"{'-'.join(sorted(foreign)) or 'none'}-{'old' if precreate else 'new'}"
+        directory = tmp_path / f"logs-{tag}"
         path = directory / "errors.log"
-        if "file" in foreign:                        # a log file the host left behind
+        if precreate:
             directory.mkdir(parents=True)
             path.write_text("{}\n", encoding="utf-8")
         real_chmod = os.chmod
 
         def chmod(target: object, mode: int, *a: object, **k: object) -> None:
-            if ("dir" in foreign and str(target) == str(directory)) or (
+            if "all" in foreign or ("dir" in foreign and str(target) == str(directory)) or (
                     "file" in foreign and str(target) == str(path)):
                 raise PermissionError(errno.EPERM, "Operation not permitted")
             real_chmod(target, mode, *a, **k)       # type: ignore[arg-type]
 
         monkeypatch.setattr(alerting.os, "chmod", chmod)
-        caplog.clear()
-        with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
-            Alerter(AlertSettings(service="svc", error_log=str(path))).notify(
-                ERROR, "svc: down", "no route to host")
+        alerter = Alerter(AlertSettings(service="svc", error_log=str(path)))
+        counts = []
+        for _ in range(2):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+                alerter.notify(ERROR, "svc: down", "no route to host")
+            counts.append(sum("could not restrict" in r.getMessage() for r in caplog.records))
         monkeypatch.undo()
-        return sum("could not restrict" in r.getMessage() for r in caplog.records)
+        return counts[0], counts[1]
 
-    assert counted(set()) == 0, "a correct volume must produce no permission warnings at all"
-    assert counted({"dir", "file"}) == 3
+    assert counted(set(), precreate=True) == (0, 0), "a correct volume must be silent"
+    assert counted({"dir"}, precreate=True) == (1, 1)
+    assert counted({"dir", "file"}, precreate=True) == (3, 3)
+    assert counted({"dir", "file"}, precreate=False) == (2, 3)
+    assert counted({"all"}, precreate=True) == (3, 3)
+    assert counted({"all"}, precreate=False) == (2, 3)
 
 
 def test_a_refused_chmod_surfaces_from_the_alerting_path_and_costs_nothing(

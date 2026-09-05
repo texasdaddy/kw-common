@@ -1061,6 +1061,15 @@ def test_a_digest_that_is_not_a_sha256_LINE_writes_no_marker_and_says_so(
     assert caplog.text.strip(), "it happened silently"
     assert str(marker) in caplog.text, "the warning does not say which marker was not written"
     assert repr(digest) in caplog.text, "the warning does not say what it was handed"
+    # ⭐ AND IT MUST NOT ASSERT THE VALIDATION PATH'S STORY, because BOTH callers reach this
+    # branch. It said "the configuration is valid and was announced, but the next boot will
+    # validate and announce again" — true after validation, false in every clause for the upgrade
+    # repair, which announces nothing and whose next boot goes on skipping. The mutation harness
+    # found this line unpinned: reverting the wording left the whole suite green.
+    assert "was announced" not in caplog.text, (
+        "the branch both callers reach asserts that an announcement happened")
+    assert "re-announce" not in caplog.text and "announce again" not in caplog.text, (
+        "the branch both callers reach promises alerts the repair path will never send")
 
 
 def test_an_alert_that_never_left_does_not_mark_the_boot_validated(tmp_path: Path) -> None:
@@ -1621,6 +1630,38 @@ def test_a_shared_root_that_cannot_be_checked_refuses_in_this_modules_own_terms(
     assert "refusing to boot" in caplog.text, "a refusal that logs nothing breaks the contract"
 
 
+@pytest.mark.parametrize("which", ["the shared root", "the config's own directory"])
+def test_every_layout_check_refuses_in_this_modules_own_terms(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, which: str) -> None:
+    """⭐ ALL THREE CALL SITES, NOT THE ONE THE FRONT DOOR REACHES.
+
+    `_check_layout` asks the same question twice, and the loader's test above only ever exercises
+    the loader's call — so both of these could have been reverted to a bare `is_dir()` with the
+    suite still green, which is the "fixed the instance, not the class" shape. This is the path a
+    caller takes when it builds settings some other way and validates afterwards, which the
+    `validate_boot` docstring names as the reason that check still exists.
+
+    The two arms differ only in WHICH path is made unaskable, so neither can pass on the other's
+    behalf.
+    """
+    root = tmp_path / "root"
+    (root / "configs").mkdir(parents=True)
+    config = config_file_for(root)
+    unaskable = str(root) if which == "the shared root" else str(config.parent)
+    real_is_dir = Path.is_dir
+
+    def is_dir(self: Path) -> bool:
+        if str(self) == unaskable:
+            raise PermissionError(13, "Permission denied")
+        return real_is_dir(self)
+
+    monkeypatch.setattr(Path, "is_dir", is_dir)
+    with pytest.raises(AlertEnvError) as excinfo:
+        alerting_env._check_layout(config, root)
+    assert "could not be checked" in str(excinfo.value)
+    assert unaskable in str(excinfo.value)
+
+
 # =========================== a missing MOUNT and a missing FILE go to different places (#3b claim)
 def test_a_missing_config_in_a_directory_that_exists_blames_the_file(tmp_path: Path) -> None:
     """The file was deleted, mistyped, or never created — the volume is fine and the message must
@@ -1706,22 +1747,34 @@ def test_the_readback_check_asks_whether_this_process_can_read_it(
     path.write_text("x", encoding="utf-8")
     assert alerting_env._can_be_read_back(path) is True
 
-    real_access = os.access
-    monkeypatch.setattr(
-        alerting_env.os, "access",
-        lambda p, mode, *a, **k: False if str(p) == str(path) else real_access(p, mode, *a, **k))
+    # A marker that is not there cannot be read back, and nothing will match it — so this is a
+    # real answer rather than an unaskable question, and it is asserted with the file genuinely
+    # absent rather than with the read stubbed.
+    path.unlink()
     assert alerting_env._can_be_read_back(path) is False
 
 
-def test_the_readback_check_does_not_become_the_failure(
-        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A check that cannot be asked is not evidence of a fault. It answers "readable" so a boot is
-    never failed, and never warned about, on the strength of a question that could not be put."""
-    def refuse(*_a: object, **_k: object) -> bool:
-        raise OSError("cannot be asked")
+@posix_only
+def test_the_readback_check_is_the_read_and_not_a_proxy_for_it(tmp_path: Path) -> None:
+    """⭐⭐ THE CASE BOTH PROXIES GOT WRONG, PLANTED FOR REAL ON THE PLATFORM THAT HAS IT.
 
-    monkeypatch.setattr(alerting_env.os, "access", refuse)
-    assert alerting_env._can_be_read_back(tmp_path / "marker") is True
+    A marker with no owner-read bit is what a `umask` of `0477` or a mount with `file_mode=0200`
+    produces. `S_IRUSR` calls it unreadable; performing the read is the only thing that answers
+    for THIS process — and root, which several of these containers run as, reads it perfectly
+    well. So the two answers differ, and only one of them is the answer `_marker_matches` will get.
+
+    Skipped for root rather than asserted for both, because the correct answer differs by who is
+    running: this pins the unprivileged case, which is the one that must warn.
+    """
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root reads a 0200 file, so this case cannot be planted here")
+    path = tmp_path / "marker"
+    path.write_text("sha256:x\n", encoding="utf-8")
+    os.chmod(path, 0o200)
+    try:
+        assert alerting_env._can_be_read_back(path) is False
+    finally:
+        os.chmod(path, 0o600)
 
 
 def test_a_failed_marker_write_says_what_actually_follows_from_it(

@@ -713,8 +713,9 @@ def _refuse(message: str) -> AlertEnvError:
 def _checked_is_dir(path: Path, description: str) -> bool:
     """`path.is_dir()`, but it cannot raise anything except `AlertEnvError` out of this module.
 
-    ⭐⭐ `Path.is_dir()` IS NOT THE TOTAL PREDICATE IT LOOKS LIKE. `pathlib` swallows only
-    `ENOENT`, `ENOTDIR`, `EBADF` and `ELOOP`; `EACCES`, `EPERM` and `ESTALE` are re-raised. So a
+    ⭐⭐ `Path.is_dir()` IS NOT THE TOTAL PREDICATE IT LOOKS LIKE. On the interpreters this package
+    supports it swallows `ENOENT`, `ENOTDIR`, `EBADF` and `ELOOP` (plus three Windows error codes,
+    and `ValueError` in its own body); `EACCES`, `EPERM` and `ESTALE` are re-raised. So a
     shared root under a directory this process may not traverse — `/mnt` at 0700, a stale NFS
     handle, an unreachable SMB share — turns a mount CHECK into a bare `OSError` escaping a
     function whose contract is that `AlertEnvError` is the only exception it raises on purpose,
@@ -727,11 +728,18 @@ def _checked_is_dir(path: Path, description: str) -> bool:
     """
     try:
         return path.is_dir()
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
+        # ⚠️ `ValueError` TOO, and not because it is reachable today. An embedded NUL in the path
+        # raises it, and `pathlib` currently absorbs that in `is_dir`'s own body — so on 3.10 and
+        # 3.12 this arm is belt over braces. It is here because the defect being closed is "a
+        # predicate that looks total is not", and catching only the errors that happen to escape
+        # THIS interpreter would leave the same class open the next time the standard library
+        # changes its mind about which ones those are.
         raise _refuse(
             f"{description} {path} could not be checked ({type(exc).__name__}: {exc}). That is not "
-            f"the same as it being absent: something on the way to it refused this process. Check "
-            f"the permissions on the directories above it, and whether the mount is still alive."
+            f"the same as it being absent: something on the way to it either refused this process "
+            f"or could not answer. The exception above says which — a permission on a directory "
+            f"leading to it, a mount that is no longer alive, or the path itself being unusable."
         ) from exc
 
 
@@ -742,8 +750,9 @@ def _check_layout(config: Path, shared_root: str | os.PathLike[str] | None) -> N
         if not _checked_is_dir(root, "the shared root"):
             raise _refuse(
                 f"the shared root {root} is not a directory. In a container this is a MOUNT: it "
-                f"reads like this when the volume was never added to the template, or was added "
-                f"with a host path that does not exist.")
+                f"reads like this when the volume was never added to the template, was added with "
+                f"a host path that does not exist, or the value names something that is not a "
+                f"directory at all.")
     parent = config.parent
     if not _checked_is_dir(parent, "the shared config directory"):
         raise _refuse(
@@ -932,24 +941,30 @@ def _can_be_read_back(path: Path) -> bool:
     logged. That is the "obvious wrong fix" outcome arrived at from the opposite side, and
     silently, which is worse than the exposure it was guarding.
 
-    ⚠️ IT ASKS `os.access`, NOT THE OWNER BIT, AND THE FIRST VERSION OF THIS ASKED THE OWNER BIT.
-    `S_IRUSR` is a fact about the file; being able to read it is a fact about the file AND this
-    process, and the two diverge in BOTH directions — each of which this check exists to get
-    right. A container running as root reads a 0200 marker perfectly well, so the bit says
-    "unreadable" while the skip works and the warning would be false in every clause. And on a
-    `uid=`-mismatched mount a 0600 marker owned by somebody else has the owner bit SET while this
-    process is "other" and the read is denied — the silent runaway, which the bit misses. Both
-    measured. `os.access` answers exactly the question `_marker_matches` will ask on the next boot.
+    ⚠️ IT PERFORMS THE READ. It does not consult `S_IRUSR`, and it does not ask `os.access`; both
+    were tried and both are PROXIES that disagree with the real thing in exactly the cases this
+    check exists for.
 
-    `True` when the question cannot be asked at all, for the same reason `_exposed_bits` answers
-    `0`: a check that cannot see is not evidence of a fault, and warning on it would fire
-    everywhere. No platform gate is needed — on Windows `os.access` reports an existing file as
-    readable, which is the right answer there rather than a synthesised one.
+    * `S_IRUSR` is a fact about the FILE, when the question is about the file AND this process. It
+      is wrong in both directions: a container running as root reads a 0200 marker perfectly well,
+      so the bit says "unreadable" while the skip works and every clause of the warning is false;
+      and on a `uid=`-mismatched mount a 0600 marker owned by somebody else has the owner bit SET
+      while this process is "other" and the read is denied — the silent runaway, missed entirely.
+    * `os.access` uses the REAL uid and gid, not the effective ones, so a process that dropped
+      privilege with `seteuid` alone gets `True` where the open will fail — the runaway again,
+      unreported. CPython's own documentation warns that `access` and `open` can disagree
+      "particularly on network filesystems", which is the CIFS/NFS class this check was written
+      for in the first place.
+
+    A 72-byte read is cheaper than either argument, runs once per boot, and is not a proxy at all:
+    it is the same operation `_marker_matches` will perform on the next boot, so it cannot answer
+    differently. No platform gate is needed — reading a file means the same thing everywhere.
     """
     try:
-        return os.access(path, os.R_OK)
+        path.read_bytes()
     except OSError:
-        return True
+        return False
+    return True
 
 
 def _reharden(marker: Path) -> None:

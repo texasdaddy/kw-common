@@ -93,21 +93,30 @@ marker in place: **same contents, narrower mode, no re-validation and no duplica
 alert.** One `INFO` line says it happened.
 
 A service on a uid-mismatched volume will also start seeing warnings about the error log's
-permissions. **One per refused `chmod`, and the record path attempts three per alert** — the log
-directory, then the file before the write, then the file again after it. How many you actually see
-depends on which of those this process owns, and it is worth knowing before you read it as a new
-fault:
+permissions. The rule, rather than a number: **one warning per refused `chmod`, and a WARN or
+ERROR alert attempts up to three** — the log directory, the log file before the write, and the log
+file again after it. Two things decide how many of those are refused, and it is worth knowing both
+before reading the count as a new fault:
 
-| what the host owns | warnings per WARN/ERROR alert |
+- **which paths this process does not own.** A file it created itself it can always `chmod`; one
+  the host owns, or that an earlier container created as another uid, it cannot.
+- **whether the log file exists yet.** The pre-write narrowing is silent on a path that is not
+  there, so the FIRST alert against a fresh log is always one lower than the steady state.
+
+Measured against the real record path — first alert, then steady state:
+
+| state | warnings |
 |---|---|
-| the container created both the directory and the log file | **0** |
-| the log directory only (the log file is the container's) | **1** |
-| the directory and the log file (the ordinary state after an upgrade) | **3** |
-| a filesystem that refuses every `chmod` (vfat, most CIFS) | **2** on the first alert, then 3 |
+| the container created the directory and the log file | 0, then 0 |
+| the host owns the log directory only | 1, then 1 |
+| the host owns the directory and the log file already exists | 3, then 3 |
+| the host owns the directory and the log file is not there yet | 2, then 3 |
+| a filesystem that refuses every `chmod` (vfat, most CIFS), log file present | 3, then 3 |
+| the same, against a fresh log | 2, then 3 |
 
-Measured against the real record path in each of those four states, not estimated from the call
-count. The condition was already there; this is the release that stops hiding it, and the volume
-is the honest measure of how often it was happening in silence.
+An `error_log` with no directory component attempts two rather than three, since there is no
+directory to create or narrow. The condition was already there; this is the release that stops
+hiding it, and the volume is the honest measure of how often it was happening in silence.
 
 ## [1.3.0] - 2026-09-03
 
