@@ -2599,6 +2599,47 @@ def test_restrict_reports_a_permission_failure_the_kernel_actually_raised(
     assert victim in caplog.text
 
 
+def test_the_number_of_permission_warnings_per_alert_is_the_number_published(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ THE RELEASE NOTES QUOTE THIS COUNT, SO THE COUNT IS PINNED HERE.
+
+    An operator uses it to decide whether what they are seeing is normal, and the first number
+    published for it was wrong: it was measured under a filesystem that refuses every `chmod` and
+    then written into a paragraph about uid mismatches, where the answer is different because a
+    file this process CREATED is one it can chmod. A number in a document that nothing re-measures
+    is a number that drifts.
+
+    Two ends of the published table, which between them fix the shape: nothing foreign is silent,
+    and both the directory and the log file foreign is three — the directory, the file before the
+    write, and the file again after it.
+    """
+    def counted(foreign: set[str]) -> int:
+        directory = tmp_path / f"logs-{'-'.join(sorted(foreign)) or 'none'}"
+        path = directory / "errors.log"
+        if "file" in foreign:                        # a log file the host left behind
+            directory.mkdir(parents=True)
+            path.write_text("{}\n", encoding="utf-8")
+        real_chmod = os.chmod
+
+        def chmod(target: object, mode: int, *a: object, **k: object) -> None:
+            if ("dir" in foreign and str(target) == str(directory)) or (
+                    "file" in foreign and str(target) == str(path)):
+                raise PermissionError(errno.EPERM, "Operation not permitted")
+            real_chmod(target, mode, *a, **k)       # type: ignore[arg-type]
+
+        monkeypatch.setattr(alerting.os, "chmod", chmod)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+            Alerter(AlertSettings(service="svc", error_log=str(path))).notify(
+                ERROR, "svc: down", "no route to host")
+        monkeypatch.undo()
+        return sum("could not restrict" in r.getMessage() for r in caplog.records)
+
+    assert counted(set()) == 0, "a correct volume must produce no permission warnings at all"
+    assert counted({"dir", "file"}) == 3
+
+
 def test_a_refused_chmod_surfaces_from_the_alerting_path_and_costs_nothing(
         tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture) -> None:

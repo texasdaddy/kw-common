@@ -487,11 +487,12 @@ def load_alert_settings_from_env(service: str) -> AlertSettings:
     """
     shared_root = _require_env(SHARED_ROOT_VAR)
     deploy_env = _require_env(DEPLOY_ENV_VAR)
-    if not Path(shared_root).is_dir():
+    if not _checked_is_dir(Path(shared_root), "the shared root"):
         raise _refuse(
             f"the shared root {shared_root} is not a directory, so there is no configuration to "
-            f"read. In a container this is the MOUNT rather than the file: the volume was never "
-            f"added to the template, or was added with a host path that does not exist. It is the "
+            f"read. In a container this is the MOUNT rather than the file: it reads like this when "
+            f"the volume was never added to the template, was added with a host path that does not "
+            f"exist, or the value names something that is not a directory at all. It is the "
             f"{SHARED_ROOT_VAR} variable.")
     return load_alert_settings(config_file_for(shared_root), deploy_env, service)
 
@@ -596,9 +597,11 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
     nobody met it. On the sequence the setup document prescribes, `load_alert_settings_from_env`
     reads the config BEFORE this function runs, so a missing mount surfaced from `read_config` as
     an undifferentiated "does not exist" and this refusal never fired — measured both ways by the
-    first adopter. `read_config` now draws the same distinction from the file's own directory, so
-    the diagnosis arrives whichever of the two runs first. This one still earns its place: it is
-    the only check that can name the SHARED_ROOT the caller actually passed.
+    first adopter. That loader now asks the mount question itself, of `SHARED_ROOT`, before the
+    read. `read_config` does NOT: it is given a config path and nothing else, and the mount cannot
+    be decided from that (see the note there). So the diagnosis arrives when the loader runs first,
+    and this check is what answers it for a caller that builds settings some other way and reaches
+    validation with a `shared_root` of its own.
 
     `alerter` is the `Alerter` the success notification goes through; `None` uses the process
     default installed by `alerting.configure()`. With NO alerter available the marker is NOT
@@ -707,17 +710,42 @@ def _refuse(message: str) -> AlertEnvError:
     return AlertEnvError(message)
 
 
+def _checked_is_dir(path: Path, description: str) -> bool:
+    """`path.is_dir()`, but it cannot raise anything except `AlertEnvError` out of this module.
+
+    ⭐⭐ `Path.is_dir()` IS NOT THE TOTAL PREDICATE IT LOOKS LIKE. `pathlib` swallows only
+    `ENOENT`, `ENOTDIR`, `EBADF` and `ELOOP`; `EACCES`, `EPERM` and `ESTALE` are re-raised. So a
+    shared root under a directory this process may not traverse — `/mnt` at 0700, a stale NFS
+    handle, an unreachable SMB share — turns a mount CHECK into a bare `OSError` escaping a
+    function whose contract is that `AlertEnvError` is the only exception it raises on purpose,
+    with no refusal logged anywhere. Measured: the same condition used to arrive as a logged,
+    catchable `AlertEnvError` naming the file, and became an unlogged traceback.
+
+    "Could not check" is reported as its own refusal rather than folded into "is not a directory",
+    because they send an operator to different places — one is a missing volume, the other is a
+    permission on the path leading to it.
+    """
+    try:
+        return path.is_dir()
+    except OSError as exc:
+        raise _refuse(
+            f"{description} {path} could not be checked ({type(exc).__name__}: {exc}). That is not "
+            f"the same as it being absent: something on the way to it refused this process. Check "
+            f"the permissions on the directories above it, and whether the mount is still alive."
+        ) from exc
+
+
 def _check_layout(config: Path, shared_root: str | os.PathLike[str] | None) -> None:
     """The mount and the structure, asked as separate questions from "is the file readable"."""
     if shared_root is not None:
         root = Path(shared_root)
-        if not root.is_dir():
+        if not _checked_is_dir(root, "the shared root"):
             raise _refuse(
                 f"the shared root {root} is not a directory. In a container this is a MOUNT: it "
                 f"reads like this when the volume was never added to the template, or was added "
                 f"with a host path that does not exist.")
     parent = config.parent
-    if not parent.is_dir():
+    if not _checked_is_dir(parent, "the shared config directory"):
         raise _refuse(
             f"{parent} does not exist, so the shared root is mounted but its structure is not "
             f"there. The shared root must contain {CONFIG_RELPATH!r} — see the setup document.")
@@ -894,24 +922,32 @@ def _exposed_bits(path: Path) -> int:
         return 0
 
 
-def _owner_can_read(path: Path) -> bool:
-    """Whether the user that just wrote this marker can read it BACK.
+def _can_be_read_back(path: Path) -> bool:
+    """Whether THIS PROCESS can read the marker it has just written.
 
     ⭐⭐ THE OTHER HALF OF THE MODE, AND THE ONE WITH THE WORSE FAILURE. Checking only that nobody
     else can read the marker verifies the property this release wanted and not the property it
-    needs. A `umask` of `0477`, or a CIFS mount with `file_mode=0200`, turns the 0600 that was
-    asked for into 0200: no group or other bits, so the exposure check is satisfied — and
-    `_marker_matches` can then never read it, so the service validates and ANNOUNCES on every
-    single boot, forever, with nothing logged. That is the "obvious wrong fix" outcome arrived at
-    from the opposite side, and silently, which is worse than the exposure it was guarding.
+    needs. A `umask` of `0477`, or a CIFS mount with `file_mode=0200`, produces a marker nothing
+    can match — so the service validates and ANNOUNCES on every single boot, forever, with nothing
+    logged. That is the "obvious wrong fix" outcome arrived at from the opposite side, and
+    silently, which is worse than the exposure it was guarding.
 
-    `True` when the mode cannot be inspected, for the same reason `_exposed_bits` answers `0`: a
-    check that cannot see is not evidence of a fault, and warning on it would fire everywhere.
+    ⚠️ IT ASKS `os.access`, NOT THE OWNER BIT, AND THE FIRST VERSION OF THIS ASKED THE OWNER BIT.
+    `S_IRUSR` is a fact about the file; being able to read it is a fact about the file AND this
+    process, and the two diverge in BOTH directions — each of which this check exists to get
+    right. A container running as root reads a 0200 marker perfectly well, so the bit says
+    "unreadable" while the skip works and the warning would be false in every clause. And on a
+    `uid=`-mismatched mount a 0600 marker owned by somebody else has the owner bit SET while this
+    process is "other" and the read is denied — the silent runaway, which the bit misses. Both
+    measured. `os.access` answers exactly the question `_marker_matches` will ask on the next boot.
+
+    `True` when the question cannot be asked at all, for the same reason `_exposed_bits` answers
+    `0`: a check that cannot see is not evidence of a fault, and warning on it would fire
+    everywhere. No platform gate is needed — on Windows `os.access` reports an existing file as
+    readable, which is the right answer there rather than a synthesised one.
     """
-    if os.name != "posix":
-        return True
     try:
-        return bool(stat.S_IMODE(path.stat().st_mode) & stat.S_IRUSR)
+        return os.access(path, os.R_OK)
     except OSError:
         return True
 
@@ -969,7 +1005,7 @@ _COULD_NOT_NARROW_AN_EXISTING_MARKER = (
 
 
 def _write_marker(marker: Path, digest: str, *, consequence: str) -> None:
-    """Record the digest of the config that was VALIDATED, in the app's own read-write directory.
+    """Record a config digest in the app's own read-write directory, restricted to this process.
 
     ⭐ ONE LINE, `sha256:<hex>`, AND NOTHING ELSE. The marker used to be empty and its whole
     meaning lived in its modification time; it now carries the answer itself, so nothing about the
@@ -990,10 +1026,14 @@ def _write_marker(marker: Path, digest: str, *, consequence: str) -> None:
     a marker that re-validates and re-announces on EVERY boot, silently, which is precisely the
     failure the deleted `_outrank` existed to prevent. So it is checked here rather than trusted.
 
-    ⚠️ A FAILURE HERE IS NOT A BOOT FAILURE. The configuration IS valid — that has already been
-    established and announced. An unwritable `CONFIG_PATH` costs one redundant validation and one
-    duplicate alert per boot, which is noise; refusing to start over it would turn a
-    missing-read-write-volume into an outage of the service itself.
+    ⚠️ A FAILURE HERE IS NOT A BOOT FAILURE. Refusing to start over a marker would turn a
+    missing read-write volume into an outage of the service itself, which is a far worse trade
+    than the noise a missing marker costs. ⛔ WHAT that noise IS depends on WHO CALLED, which is
+    why the failure message takes `consequence` from the caller rather than asserting one: after
+    validation an unwritable `CONFIG_PATH` costs one redundant validation and one duplicate alert
+    per boot, while for the upgrade repair it costs nothing at all — the marker still matches, the
+    skip keeps working, and the only thing lost is the narrowing. Stating the first for both was a
+    message that was false in every clause for one of them.
 
     ⭐⭐ THE MARKER IS CREATED 0600, AND THE MODE DOES NOT COME FROM A `chmod`. Its content is a
     digest of the shared config, and that file holds `SMTP_PASSWORD` — so a world-readable marker
@@ -1034,9 +1074,10 @@ def _write_marker(marker: Path, digest: str, *, consequence: str) -> None:
         # caller passed a shape this file does not write. Both end the same way: no marker, one
         # more validation on the next boot, and a line saying so rather than silence.
         log.warning("alerting: the digest taken for this boot is unusable (%r), so no validation "
-                    "marker was written to %s — the configuration is valid and was announced, but "
-                    "the next boot will validate and announce again. An empty digest means the "
-                    "shared config could not be read at the moment it was hashed.", digest, marker)
+                    "marker was written to %s. Whatever the marker held before is unchanged, so "
+                    "the next boot decides for itself whether to validate. An empty digest means "
+                    "the shared config could not be read at the moment it was hashed; anything "
+                    "else is a caller passing a shape this file does not write.", digest, marker)
         return
     tmp = marker.with_name(marker.name + ".tmp")
     try:
@@ -1062,12 +1103,12 @@ def _write_marker(marker: Path, digest: str, *, consequence: str) -> None:
                     "A filesystem that ignores these bits (vfat, most CIFS mounts) reads like "
                     "this, and on such a mount the config file itself is just as readable.",
                     marker, oct(exposed))
-    if not _owner_can_read(marker):
+    if not _can_be_read_back(marker):
         # ⭐⭐ THE FAILURE THAT IS OTHERWISE SILENT. Nothing here can repair it — the mode asked for
         # was 0600 and the filesystem narrowed it further — so the only thing to do is say so, and
         # saying so is the entire difference between a diagnosable fleet and a service that
         # re-announces every boot while every check reports success.
-        log.warning("alerting: the validation marker %s is not readable by the user that wrote it. "
+        log.warning("alerting: the validation marker %s cannot be read back by this process. "
                     "Nothing can match it, so this service will re-validate and send its "
                     "confirmation alert on EVERY boot. A umask that removes the owner's read bit, "
                     "or a mount whose file_mode does, reads like this.", marker)

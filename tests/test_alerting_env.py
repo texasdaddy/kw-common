@@ -1587,6 +1587,40 @@ def test_a_marker_that_lands_readable_anyway_is_reported_and_kept(
     assert silence(channels) == []
 
 
+def test_a_shared_root_that_cannot_be_checked_refuses_in_this_modules_own_terms(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐⭐ `Path.is_dir()` IS NOT THE TOTAL PREDICATE IT LOOKS LIKE, and the mount check was
+    written as though it were.
+
+    `pathlib` swallows `ENOENT`, `ENOTDIR`, `EBADF` and `ELOOP` and RE-RAISES everything else — so
+    a shared root under a directory this process may not traverse, a stale NFS handle, or an
+    unreachable share turned the mount check into a bare `PermissionError` escaping a function
+    whose contract is that `AlertEnvError` is the only exception it raises on purpose, with no
+    refusal logged anywhere. Before the check existed, the same condition arrived from
+    `read_config` as a logged, catchable refusal naming the file.
+
+    Both halves of the contract are asserted, because either alone would have passed while the
+    defect was live: the TYPE the caller catches, and the log line `_refuse` promises. And "could
+    not be checked" must not read as "is not there" — they send an operator to different places.
+    """
+    def refuse(*_a: object, **_k: object) -> bool:
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setenv(SHARED_ROOT_VAR, str(tmp_path / "unreachable"))
+    monkeypatch.setenv(CONFIG_PATH_VAR, str(tmp_path / "app"))
+    monkeypatch.setenv(DEPLOY_ENV_VAR, "prod")
+    monkeypatch.setattr(Path, "is_dir", refuse)
+
+    with caplog.at_level(logging.ERROR, logger="kw_common.alerting_env"), \
+            pytest.raises(AlertEnvError) as excinfo:
+        load_alert_settings_from_env("feed-poller")
+    message = str(excinfo.value)
+    assert "could not be checked" in message
+    assert "PermissionError" in message
+    assert "refusing to boot" in caplog.text, "a refusal that logs nothing breaks the contract"
+
+
 # =========================== a missing MOUNT and a missing FILE go to different places (#3b claim)
 def test_a_missing_config_in_a_directory_that_exists_blames_the_file(tmp_path: Path) -> None:
     """The file was deleted, mistyped, or never created — the volume is fine and the message must
@@ -1596,7 +1630,10 @@ def test_a_missing_config_in_a_directory_that_exists_blames_the_file(tmp_path: P
     with pytest.raises(AlertEnvError) as excinfo:
         read_config(path)
     message = str(excinfo.value)
-    assert str(path.parent) in message
+    # ⚠️ THE FULL PATH, NOT ITS PARENT. Asserting `str(path.parent) in message` was vacuous once
+    # the mount split was reverted: the parent is a PREFIX of the file path the message already
+    # prints, so the assertion could no longer fail while any path was named at all.
+    assert str(path) in message
     assert "MOUNT" not in message
 
 
@@ -1617,7 +1654,7 @@ def test_a_marker_the_service_cannot_read_back_is_reported(
     """
     settings, marker_dir, marker = _validated(tmp_path)
     monkeypatch.setattr(alerting_env, "_exposed_bits", lambda _path: 0)
-    monkeypatch.setattr(alerting_env, "_owner_can_read", lambda _path: False)
+    monkeypatch.setattr(alerting_env, "_can_be_read_back", lambda _path: False)
 
     with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
         assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
@@ -1650,21 +1687,41 @@ def test_the_upgrade_repair_cannot_raise_on_a_marker_it_cannot_decode(
     assert marker.is_file(), "the marker was destroyed by a repair it could not perform"
 
 
-def test_owner_can_read_reads_the_owner_bit(tmp_path: Path,
-                                            monkeypatch: pytest.MonkeyPatch) -> None:
-    """Both directions against the SAME file, so it cannot pass by accident of that file's mode;
-    and the platform gate, for the same reason `_exposed_bits` has one."""
+def test_the_readback_check_asks_whether_this_process_can_read_it(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """⭐⭐ THE QUESTION, NOT THE MODE BIT — AND ASKING THE MODE BIT WAS WRONG IN BOTH DIRECTIONS.
+
+    The first version of this check read `S_IRUSR`. That is a fact about the FILE; being able to
+    read it is a fact about the file AND this process, and the two diverge each way. A container
+    running as root reads a 0200 marker perfectly well, so the bit says "unreadable" while the skip
+    works and every clause of the warning would be false. On a uid-mismatched mount a 0600 marker
+    owned by somebody else has the owner bit SET while this process is "other" and the read is
+    denied — the silent runaway, which the bit misses entirely.
+
+    So this is asserted against `os.access`, which is the same question `_marker_matches` asks on
+    the next boot, and both directions are measured against the SAME file so neither can pass by
+    accident of that file's permissions.
+    """
     path = tmp_path / "marker"
     path.write_text("x", encoding="utf-8")
+    assert alerting_env._can_be_read_back(path) is True
 
-    monkeypatch.setattr(os, "name", "posix")
-    assert alerting_env._owner_can_read(path) is True
+    real_access = os.access
+    monkeypatch.setattr(
+        alerting_env.os, "access",
+        lambda p, mode, *a, **k: False if str(p) == str(path) else real_access(p, mode, *a, **k))
+    assert alerting_env._can_be_read_back(path) is False
 
-    monkeypatch.setattr(alerting_env.stat, "S_IMODE", lambda _mode: 0o200)
-    assert alerting_env._owner_can_read(path) is False
 
-    monkeypatch.setattr(os, "name", "nt")
-    assert alerting_env._owner_can_read(path) is True
+def test_the_readback_check_does_not_become_the_failure(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A check that cannot be asked is not evidence of a fault. It answers "readable" so a boot is
+    never failed, and never warned about, on the strength of a question that could not be put."""
+    def refuse(*_a: object, **_k: object) -> bool:
+        raise OSError("cannot be asked")
+
+    monkeypatch.setattr(alerting_env.os, "access", refuse)
+    assert alerting_env._can_be_read_back(tmp_path / "marker") is True
 
 
 def test_a_failed_marker_write_says_what_actually_follows_from_it(

@@ -93,11 +93,21 @@ marker in place: **same contents, narrower mode, no re-validation and no duplica
 alert.** One `INFO` line says it happened.
 
 A service on a uid-mismatched volume will also start seeing warnings about the error log's
-permissions — **two on the first WARN or ERROR alert and three on every one after**, because the
-record path narrows the directory, then the file before the write, then the file again after it,
-and each refusal is now reported. Measured, not estimated. That condition was already there; this
-is the release that stops hiding it, and the volume of it is the honest measure of how often it
-was happening in silence.
+permissions. **One per refused `chmod`, and the record path attempts three per alert** — the log
+directory, then the file before the write, then the file again after it. How many you actually see
+depends on which of those this process owns, and it is worth knowing before you read it as a new
+fault:
+
+| what the host owns | warnings per WARN/ERROR alert |
+|---|---|
+| the container created both the directory and the log file | **0** |
+| the log directory only (the log file is the container's) | **1** |
+| the directory and the log file (the ordinary state after an upgrade) | **3** |
+| a filesystem that refuses every `chmod` (vfat, most CIFS) | **2** on the first alert, then 3 |
+
+Measured against the real record path in each of those four states, not estimated from the call
+count. The condition was already there; this is the release that stops hiding it, and the volume
+is the honest measure of how often it was happening in silence.
 
 ## [1.3.0] - 2026-09-03
 

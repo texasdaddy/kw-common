@@ -149,8 +149,9 @@ preserve mtime, so a config restored at an older timestamp was never re-checked:
 booted clean and the service came up alerting nobody. A digest answers that whatever the clock
 says, in both directions — a restore with different bytes re-validates, an identical one does not.
 Upgrading from a version that wrote an empty marker costs exactly one re-validation — **and one
-confirmation alert per service**, since a re-validation announces. That is not silent, and an
-operator upgrading a fleet should expect one message per service rather than none.
+confirmation alert per service**, since a re-validation announces. That is not silent: an operator
+upgrading a fleet should expect that alert to arrive on every channel the service has configured,
+so one email and one push per service rather than none.
 
 ⭐ **And the marker is created `0600`, because contents that decide are contents somebody can
 read.** The digest is taken over the file holding the SMTP password, so a marker the rest of a
