@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import re
@@ -298,7 +299,7 @@ def read_config(config_path: str | os.PathLike[str]) -> dict[str, str]:
     second answer to the same question. There is exactly one, and this is the seam.
 
     ⚠️ THE ERROR POLICY IS THE OPPOSITE ONE, AND THAT IS THE WHOLE REASON THIS WRAPPER EXISTS.
-    `alerting._parse_env_file` returns `{}` for a missing or unreadable file, which is right for a
+    `alerting.parse_env_file` returns `{}` for a missing or unreadable file, which is right for a
     notification in flight — the email channel is simply unconfigured and ntfy still goes. At BOOT
     that same silence is the failure: "the file is empty" and "the file is UTF-16" must not look
     alike. So the read happens here, with the errors surfaced.
@@ -309,7 +310,7 @@ def read_config(config_path: str | os.PathLike[str]) -> dict[str, str]:
     """
     path = Path(config_path)
     try:
-        # `newline=""` matches `alerting._parse_env_file` exactly: universal-newline translation
+        # `newline=""` matches `alerting.parse_env_file` exactly: universal-newline translation
         # rewrites a lone `\r` before the parser can see it, which silently truncates a value
         # rather than rejecting it. The two readers must make the same choice or the parse they
         # share is being fed different text.
@@ -359,7 +360,7 @@ def read_config(config_path: str | os.PathLike[str]) -> dict[str, str]:
 
 # --- layer one: pure -----------------------------------------------------------------------------
 def load_alert_settings(config_path: str | os.PathLike[str], deploy_env: str,
-                        service: str) -> AlertSettings:
+                        service: str, *, logger_name: str = "") -> AlertSettings:
     """Build `AlertSettings` from an explicit config file, environment and service name.
 
     Pure in the sense that matters: it reads NO environment variable and has NO default path.
@@ -392,9 +393,29 @@ def load_alert_settings(config_path: str | os.PathLike[str], deploy_env: str,
         settings = replace(load_alert_settings_from_env("my-service"),
                            state_file="/data/alerts.json",
                            error_log="/data/logs/my-service-errors.log")
+
+    ⭐ `logger_name` IS PASSED THROUGH, and it has to be. It is the one piece of `AlertSettings`
+    that this layer cannot leave to `replace()` with a straight face: a service adopting the
+    library keeps its OWN logger name precisely so the operator's existing logging configuration
+    goes on working, and this loader is the call every app in this deployment makes. A field the
+    convention layer cannot set is a field the fleet cannot use. `""` — the default — means the
+    library's own logger, so this is inert for every existing caller.
     """
     env = normalise_env(deploy_env)
     key = ntfy_key(service)          # validates `service` before anything else is read
+    # ⛔ THIS LAYER'S REFUSAL TYPE IS `AlertEnvError`, and a pass-through must not smuggle another
+    # one out. `AlertSettings.__post_init__` refuses a control character in `logger_name` with a
+    # `ValueError`, which is right for the constructor and wrong here: an adopter catches
+    # `AlertEnvError` at boot to print its own one-liner, and would have got a bare traceback
+    # instead — the outcome `_refuse` exists to prevent. Reachable straight from a CRLF-bearing
+    # environment variable. Asked BEFORE the file is read, like every other refusal here.
+    if not isinstance(logger_name, str):
+        raise _refuse(f"logger_name must be a string, got {type(logger_name).__name__}")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in str.__str__(logger_name)):
+        raise _refuse(
+            "logger_name contains a control character. It is interpolated into every log record "
+            "as %(name)s, so a newline in it forges log lines, and it is not a name any logging "
+            "configuration can be written against.")
     # ⭐ NORMALISED ONCE, HERE, AND USED EVERYWHERE BELOW. `AlertSettings` strips the service name
     # in its own constructor, so building the prefix from the RAW argument produced two different
     # spellings of the same service — and the prefix is the one that reaches an HTTP header and a
@@ -432,6 +453,7 @@ def load_alert_settings(config_path: str | os.PathLike[str], deploy_env: str,
         config_file=str(Path(config_path)),
         ntfy_url=ntfy_url,
         title_prefix=title_prefix,
+        logger_name=logger_name,
     )
 
 
@@ -459,7 +481,7 @@ def _require_env(name: str) -> str:
     return value.strip()
 
 
-def load_alert_settings_from_env(service: str) -> AlertSettings:
+def load_alert_settings_from_env(service: str, *, logger_name: str = "") -> AlertSettings:
     """The fleet convention, executable: read `SHARED_ROOT` and `DEPLOY_ENV`, build the settings.
 
     This is the call every app in this deployment makes. `load_alert_settings` exists for anything
@@ -495,7 +517,8 @@ def load_alert_settings_from_env(service: str) -> AlertSettings:
             f"the volume was never added to the template, was added with a host path that does not "
             f"exist, or the value names something that is not a directory at all. It is the "
             f"{SHARED_ROOT_VAR} variable.")
-    return load_alert_settings(config_file_for(shared_root), deploy_env, service)
+    return load_alert_settings(config_file_for(shared_root), deploy_env, service,
+                               logger_name=logger_name)
 
 
 # --- boot validation -----------------------------------------------------------------------------
@@ -511,8 +534,13 @@ def marker_name(deploy_env: str) -> str:
 
     The environment is what the check is ABOUT — `required_keys` differs per environment and so
     does the topic — so "this configuration has been validated" is not a fact about the file alone.
-    The marker lives in `CONFIG_PATH`, one per environment, exactly as the standard specifies; it
-    constrains neither the filename nor the count.
+    It is not a fact about the file and the environment alone either, which is #18: the SERVICE is
+    the third thing the check depends on, and it is recorded in the marker's CONTENTS rather than
+    in its name — see `_marker_body`.
+
+    ⚠️ THE FILENAME IS THE STANDARD'S, NOT THIS FUNCTION'S. The ops-alerting standard fixes it at
+    `.alerting-validated-<env>` in `CONFIG_PATH`, so the fix for #18 could not go here even though
+    the environment's did. What the standard does not constrain is how many facts the file holds.
     """
     return f"{MARKER_NAME}-{normalise_env(deploy_env)}"
 
@@ -540,8 +568,167 @@ def _config_digest(config: str | os.PathLike[str]) -> str:
         return ""
 
 
-def _marker_matches(marker: Path, config: Path) -> bool:
-    """Whether this exact config file has already been validated, i.e. this boot may skip.
+def _marker_body(digest: str, service: str) -> str:
+    """The marker's contents: the config digest, then the service that validated it (#18).
+
+    ⭐⭐ THE SERVICE IS PART OF WHAT WAS VALIDATED, SO IT IS PART OF WHAT IS RECORDED.
+    `_check_usable` validates settings DERIVED FROM THE SERVICE NAME — the ntfy key that is
+    looked up, and the title prefix that becomes an HTTP header — so "this configuration has
+    been validated" was never a fact about the file and the environment alone. Rename the
+    service while `CONFIG_PATH`, `DEPLOY_ENV` and the config's bytes stay put and the marker
+    still matched, so a refusal a fresh marker directory produces was skipped: the service came
+    up with a prefix that fails every ntfy send. The environment fix (`marker_name`) and this
+    one are the same defect with `service` in the place of `env`.
+
+    ⭐ IN THE CONTENTS, NOT IN THE FILENAME, and that is the ops-alerting standard's own
+    direction rather than a choice made here. The standard fixes the marker's NAME at
+    `.alerting-validated-<env>` in `CONFIG_PATH`; it says nothing about how many facts the file
+    inside may carry. Line one is still `sha256:<hex>` and nothing else, so anything that reads
+    the FIRST LINE reads the digest correctly.
+
+    ⚠️ THAT IS NOT THE SAME AS BACKWARD COMPATIBLE, and the first version of this docstring said
+    it was. The only reader that exists is this module's own, and 1.3.0-1.4.1 compared the WHOLE
+    stripped text to `sha256:<hex>` — see the comment in `_marker_matches` — so a marker written
+    here does not match there. A ROLLBACK therefore costs exactly what the upgrade costs: one
+    re-validation and one confirmation alert per service, once. Symmetric and cheap, but a cost
+    rather than the absence of one, and it was worth measuring rather than asserting.
+
+    ⚠️ THE NAME IS JSON-ENCODED, WHICH IS NOT DECORATION. `AlertSettings` requires `service` to
+    be a non-blank string and strips it; it does NOT refuse control characters the way
+    `title_prefix` does, because a service name is not a header value. So a name carrying a
+    newline would split into a line this parser could not put back together — and a marker that
+    can never match again is the loud failure `_write_marker` documents: re-validate and
+    re-announce on EVERY boot, forever. `json.dumps` escapes it to one ASCII line that round
+    trips exactly, so the pathological name costs nothing and the ordinary one stays readable
+    (`service:"feed-poller"`) to an operator who opens the file.
+    """
+    return f'{digest}\nservice:{json.dumps(service)}'
+
+
+def _recorded_service(recorded: str) -> str | None:
+    """The service name a marker records, or `None` if it records none this parser trusts.
+
+    `None` for every unparseable shape — an older release's digest-only marker, a truncated
+    line, a payload that is not a JSON string — and `None` never equals a real service name, so
+    every one of those re-validates. That is the safe direction and it is the SAME migration
+    the digest change itself made: one validation and one confirmation alert per service on the
+    first boot after the upgrade, then silence.
+
+    ⛔ THE PAYLOAD MUST OPEN WITH A QUOTE BEFORE `json.loads` SEES IT, and that guard is a
+    REFUSAL rather than a shortcut. `json.loads` is a recursive-descent parser: a payload of two
+    thousand `[` raises `RecursionError`, which is NOT a `ValueError` — so it walked out of a
+    function documented to answer `None` for anything malformed, out of `validate_boot`, which
+    is documented to raise `AlertEnvError` and nothing else, past the `except AlertEnvError` the
+    setup document tells every adopter to write, and out as a bare traceback at boot. Measured:
+    depth 1000 answered `None`, depth 2000 raised, and the threshold moves with whatever stack
+    the caller has already used — so it is not a depth to pick a limit against. `_marker_body`
+    only ever writes `json.dumps(<str>)`, which always opens with `"`, so nothing this module
+    writes is refused by the guard, and nothing that opens with `"` can nest.
+
+    ⚠️⚠️ `RecursionError` IS CAUGHT AS WELL, AND IT IS LOAD-BEARING RATHER THAN REDUNDANT. An
+    earlier version of this docstring declared the two halves mutually redundant; a
+    verification pass falsified that, and the correction matters more than the original claim
+    did. `json.loads` runs in PYTHON frames, so its recursion check trips as a function of the
+    CALLER'S remaining stack rather than of the payload — and with a few frames of headroom the
+    perfectly ordinary payload this module itself writes, `service:"feed-poller"`, raises
+    inside `json.loads`. Measured on CPython 3.12: at a depth 993 frames into a 997-frame
+    budget it answered, at 994 it raised. The quote guard cannot help there — the payload DOES
+    open with a quote. So this arm is what keeps a bare traceback out of `validate_boot` for a
+    WELL-FORMED marker read by a deep caller, and it has its own tests.
+
+    The quote guard is the half that no test can distinguish today: removing it alone changes
+    no observable behaviour, because everything it refuses `json.loads` also refuses. It is
+    kept because it answers a different question — is this payload the SHAPE we write — and
+    because it makes the pathological case cheap instead of merely survivable. That asymmetry
+    is stated rather than smoothed over: one arm is pinned, one is declared.
+    """
+    for line in recorded.splitlines()[1:]:
+        head, sep, payload = line.strip().partition("service:")
+        if head or not sep:
+            continue
+        if not payload.startswith('"'):
+            return None
+        try:
+            value = json.loads(payload)
+        except (ValueError, RecursionError):
+            return None
+        # A payload that opened with a quote and parsed is a `str` by construction. The check
+        # stays because it is what narrows `json.loads`' `Any` to this function's return type,
+        # and because it is the invariant the guard above exists to keep.
+        return value if isinstance(value, str) else None
+    return None
+
+
+def _service_the_marker_records(marker: Path) -> str | None:
+    """The service a marker on disk records, or `None` for absent, unreadable or unparseable.
+
+    Split out because it is asked TWICE per validating boot, once before the marker is written
+    and once after, and the pair is what makes `_report_a_replaced_service` accurate.
+    """
+    try:
+        return _recorded_service(marker.read_text(encoding="utf-8", errors="replace").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _report_a_replaced_service(marker: Path, was: str | None, service: str) -> None:
+    """Say so when this boot has just written ITS name over a DIFFERENT service's record.
+
+    ⚠️ TWO SERVICES POINTED AT ONE `CONFIG_PATH` RE-ANNOUNCE ON EVERY BOOT, and that is what
+    this line exists to name. `validate_boot` requires `marker_dir` to be the app's OWN
+    read-write directory and always has; sharing one used to be quietly wrong — the second
+    service skipped on the first's marker, so its own service-derived settings were never
+    checked, which is #18 arriving from the other side — and since #18 it is loudly wrong: each
+    service rewrites the other's record, so both re-validate and both announce, every boot.
+    Measured at four alerts per boot for two services.
+
+    ⛔ NOTHING HERE CAN TELL A SHARED DIRECTORY FROM A LEGITIMATE RENAME. They produce the
+    identical marker state and both must re-validate, so this changes no decision; it reports
+    what happened. The REPEAT COUNT is what separates them, and that is why this is asked AFTER
+    the write rather than before it.
+
+    ⭐⭐ AFTER THE WRITE, AND THE FIRST VERSION ASKED BEFORE IT — which made the line a lie in
+    every state where the marker is NOT rewritten. `validate_boot` documents two of those as
+    ordinary: no `Alerter` installed withholds the marker deliberately, and a refusal raises
+    before the write. Asked beforehand, ONE rename in either state accused the operator of a
+    shared `CONFIG_PATH` on every boot forever, and the line told them to go and split a
+    directory layout that was not the problem. Measured at five boots, five accusations.
+    Asked here, the count means what it says: a rename replaces the record once and is silent
+    afterwards, a shared directory replaces it on every boot, and a boot that wrote nothing
+    says nothing — it has taken nothing from anybody.
+
+    ⛔ AND IT IS ASKED OF THE FILE, not of whether `_write_marker` was called. That function
+    cannot fail a boot and does not raise, so "we called it" is not "it landed" — an
+    unwritable `CONFIG_PATH` would otherwise produce the same false accusation from the other
+    direction. It has its own warning for that; this one stays quiet.
+
+    ⚠️ WHICH BUYS ITS ACCURACY WITH ONE BLIND SPOT, stated because a diagnostic that implies
+    coverage it lacks is worse than none. On a mount where the marker LANDS but cannot be read
+    back — the `file_mode=0200` CIFS shape `_can_be_read_back` exists for — two services really
+    sharing one `CONFIG_PATH` replace each other's record and announce on every boot, and this
+    line never appears, because the read-back cannot confirm what was written. The operator is
+    not blind there: `_write_marker` says the marker cannot be read back and that this service
+    will re-validate and re-announce on EVERY boot. What is missing is the second service's
+    name. Measured, not reasoned about.
+
+    Silent for the migration case, a marker recording no service at all, which is every
+    service's first boot after this release and is not a mistake.
+    """
+    if was is None or was == service:
+        return
+    if _service_the_marker_records(marker) != service:
+        return
+    log.warning(
+        "alerting: this boot replaced service %r with %r in %s. A RENAME does that once and "
+        "this line will not appear again. If it appears on EVERY boot, two services share this "
+        "CONFIG_PATH, which is not supported: each overwrites the other's record, so both "
+        "re-validate and both send their confirmation alert every time they start. Give each "
+        "service its own CONFIG_PATH directory.",
+        was, service, marker)
+
+
+def _marker_matches(marker: Path, config: Path, service: str) -> bool:
+    """Whether this exact config file has already been validated BY THIS SERVICE (#18).
 
     ⭐⭐ THE DIGEST, NOT THE TIMESTAMP (#15). The marker used to be empty and the question used to
     be "is the marker NEWER than the config". `rsync -a`, `cp -p`, `tar -x` and a volume restore
@@ -562,6 +749,11 @@ def _marker_matches(marker: Path, config: Path) -> bool:
         it needs no operator step — but it is not silent, and an operator upgrading a fleet should
         expect one confirmation per service rather than none.
 
+    ⚠️ AND A MARKER WRITTEN BY 1.3.0-1.4.1 RECORDS NO SERVICE, so it matches nothing either and
+    the same one-off migration happens again on the first boot after THIS upgrade. Stated here
+    rather than left to be discovered: an operator who reads a confirmation alert per service
+    after a bump is seeing the marker format change, not a configuration that broke.
+
     Anything unreadable, absent, empty or malformed answers False: the safe reading of "I cannot
     establish that this file was validated" is to validate it.
     """
@@ -572,12 +764,18 @@ def _marker_matches(marker: Path, config: Path) -> bool:
         return False
     if not recorded.startswith("sha256:"):
         return False
+    # ⭐ ASKED BEFORE THE FILE IS HASHED, because it is the cheaper question and it is the one
+    # that is false on every marker an older release wrote. A rename answers here.
+    if _recorded_service(recorded) != service:
+        return False
     current = _config_digest(config)
     # ⚠️ `and` on a non-empty current, because `_config_digest` answers `""` for an unreadable
     # config — and `"" == ""` would make an unreadable config match an unreadable marker. It
     # cannot happen through the branch above, which already required the `sha256:` prefix, and it
     # is written out anyway: this is the comparison that decides whether validation runs at all.
-    return bool(current) and recorded == current
+    # ⭐ THE FIRST LINE, not the whole text: the marker carries a `service:` line below the
+    # digest now, and comparing the whole body to a bare `sha256:<hex>` would never match.
+    return bool(current) and recorded.splitlines()[0].strip() == current
 
 
 def validate_boot(settings: AlertSettings, deploy_env: str,
@@ -634,7 +832,7 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
             "with load_alert_settings() or load_alert_settings_from_env().")
 
     marker = Path(marker_dir) / marker_name(env)
-    if _marker_matches(marker, config):
+    if _marker_matches(marker, config, settings.service):
         log.info("alerting: %s configuration validated on an earlier boot (%s records the current "
                  "digest of %s); skipping. Any edit to the config file forces a re-check; delete "
                  "the marker to force one without editing it.",
@@ -649,6 +847,9 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
         _reharden(marker)
         return False
 
+    # ⭐ TAKEN BEFORE ANYTHING IS WRITTEN and reported after, so the line below can say what
+    # this boot REPLACED rather than what it merely found. See `_report_a_replaced_service`.
+    was = _service_the_marker_records(marker)
     _check_layout(config, shared_root)
     # ⭐⭐ THE DIGEST IS TAKEN HERE AND CARRIED TO THE MARKER — before anything whose RESULT is
     # used to validate has read the file. Not before every read: `_marker_matches` above may hash
@@ -680,7 +881,9 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
         # would send one either, because the marker suppresses them, so the proof was lost until
         # somebody edited the file. The next boot after `configure()` validates and announces.
         return True
-    _write_marker(marker, digest, consequence=_WROTE_NOTHING_AFTER_VALIDATING)
+    _write_marker(marker, _marker_body(digest, settings.service),
+                  consequence=_WROTE_NOTHING_AFTER_VALIDATING)
+    _report_a_replaced_service(marker, was, settings.service)
     return True
 
 
@@ -978,10 +1181,18 @@ def _can_be_read_back(path: Path) -> bool:
 def _reharden(marker: Path) -> None:
     """Re-write an already-correct marker that is readable beyond its owner, keeping its contents.
 
-    This is the upgrade path and nothing else. A marker written by an earlier release records the
-    right digest at the wrong mode, so it MATCHES and validation skips — and the write that would
-    narrow it never runs. Rewriting it here costs one file write on the first boot after the
-    upgrade, changes nothing about what the marker says, and does not re-validate or re-announce.
+    A marker that MATCHES is a marker `_write_marker` never reaches, so the write that would
+    narrow it never runs and an exposed one stays exposed. Rewriting it here costs one file
+    write, changes nothing about what the marker says, and does not re-validate or re-announce.
+
+    ⚠️ THIS WAS WRITTEN AS "THE UPGRADE PATH AND NOTHING ELSE" AND THAT IS NO LONGER TRUE, which
+    is worth a sentence rather than a silent edit. It was reached by a marker an earlier release
+    wrote at 0644: the digest was right, so it matched, so it skipped. Since #18 a marker written
+    before 1.5.0 records no service and matches nothing, so it never gets here — it re-validates,
+    and `_write_marker` creates a fresh 0600 file, which closes the same exposure by the other
+    door. What is left for this function is a marker THIS release wrote whose mode was widened
+    afterwards: a volume restore, an archive unpacked with a permissive umask, a hand-edit. That
+    is rarer than the upgrade it was written for and it is not hypothetical, so the repair stays.
 
     Does nothing at all when the marker is already restricted, which is every boot after the
     first, and on every platform where these bits are not the access-control mechanism.
@@ -1027,12 +1238,13 @@ _COULD_NOT_NARROW_AN_EXISTING_MARKER = (
     "with this volume mounted, and it records a digest of the file holding the SMTP password.")
 
 
-def _write_marker(marker: Path, digest: str, *, consequence: str) -> None:
-    """Record a config digest in the app's own read-write directory, restricted to this process.
+def _write_marker(marker: Path, body: str, *, consequence: str) -> None:
+    """Record a marker body in the app's own read-write directory, restricted to this process.
 
-    ⭐ ONE LINE, `sha256:<hex>`, AND NOTHING ELSE. The marker used to be empty and its whole
-    meaning lived in its modification time; it now carries the answer itself, so nothing about the
-    ORDER of these two writes matters any more. That deleted a real defect rather than a nicety:
+    ⭐ LINE ONE IS `sha256:<hex>` AND NOTHING ELSE; `_marker_body` builds what goes below it.
+    The marker used to be empty and its whole meaning lived in its modification time; it now
+    carries the answer itself, so nothing about the ORDER of these two writes matters any
+    more. That deleted a real defect rather than a nicety:
     on a one-second-granularity filesystem — an ext4 with 128-byte inodes, which several CI
     runners' scratch disks are — the config and the marker landed on the same second, the marker
     could never be strictly newer, and every boot re-validated and re-alerted forever. Measured
@@ -1045,7 +1257,7 @@ def _write_marker(marker: Path, digest: str, *, consequence: str) -> None:
     recorded must be what was CHECKED; `validate_boot` takes it before anything reads the file.
 
     ⚠️ AND THE CALLER NOW OWNS THE FORMAT, which the old signature guaranteed by computing it. A
-    digest without the `sha256:` prefix would be written happily and then match nothing forever —
+    body not opening with the `sha256:` prefix would be written happily and then match nothing —
     a marker that re-validates and re-announces on EVERY boot, silently, which is precisely the
     failure the deleted `_outrank` existed to prevent. So it is checked here rather than trusted.
 
@@ -1091,7 +1303,7 @@ def _write_marker(marker: Path, digest: str, *, consequence: str) -> None:
     itself is equally readable there, and it holds the password in the clear rather than a digest
     of it.
     """
-    if not digest.startswith("sha256:"):
+    if not body.startswith("sha256:"):
         # Empty means the CONFIG could not be read when the digest was taken, one statement before
         # `read_config` read it successfully — a flap on the shared mount. Anything else means a
         # caller passed a shape this file does not write. Both end the same way: no marker, one
@@ -1100,7 +1312,7 @@ def _write_marker(marker: Path, digest: str, *, consequence: str) -> None:
                     "marker was written to %s. Whatever the marker held before is unchanged, so "
                     "the next boot decides for itself whether to validate. An empty digest means "
                     "the shared config could not be read at the moment it was hashed; anything "
-                    "else is a caller passing a shape this file does not write.", digest, marker)
+                    "else is a caller passing a shape this file does not write.", body, marker)
         return
     tmp = marker.with_name(marker.name + ".tmp")
     try:
@@ -1111,7 +1323,7 @@ def _write_marker(marker: Path, digest: str, *, consequence: str) -> None:
         _discard(tmp)
         fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(digest + "\n")
+            fh.write(body + "\n")
         os.replace(tmp, marker)
     except (OSError, ValueError) as exc:
         # `ValueError` too: a NUL in `CONFIG_PATH` raises it from `mkdir` and `os.open`, and it

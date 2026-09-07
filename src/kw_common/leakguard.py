@@ -106,6 +106,22 @@ KNOWN LIMITS (state them; do not pretend to coverage)
         ⚠️ WHAT REMAINS, stated rather than claimed away: `--staged` sees what the commit ADDS
         relative to HEAD. A leak already present in HEAD is not "staged" and is not reported by
         it — that is the tree scan's question, which is why both still run.
+      * ⭐ WHAT A `SKIP_SUFFIXES` NAME STILL BUYS, in TWO cases (consumer#98, and this engine's
+        own issue for the same residual). The name is a HINT the content has to corroborate, and
+        "corroborate" means precisely one NUL byte in git's own 8000-byte window:
+          (a) A NUL IN THE FIRST 8000 BYTES skips the whole file, in every scan, however much
+              plain text follows. Measured: one commit adding `deploy-notes.pdf` =
+              `b"\x00\nsecret host <cgnat-addr> lives here\n..."` scans clean in every mode,
+              exit 0, while the identical bytes in `deploy.conf` are refused by every mode.
+          (b) A NUL LATER leaves the file scanned, but every LINE carrying one is BLANKED unread —
+              so a value sharing a line with a NUL is cleared. The tree scan says how many lines
+              went unread ("PARTLY read"); the range and `--staged` scans blank the same line and
+              say nothing, because `parse_diff` cannot tell that line from a binary diff.
+        A UTF-16 `.pdf` falls under (a), not (b): UTF-16 of ASCII carries a NUL at byte 1, so the
+        whole file is skipped and the blanking branch is never reached. Closing (a) means either
+        reading every asset's decodable runs (a false-red risk on files an operator cannot edit)
+        or reporting every binary as "not cleared" (a red on every repository with an icon in it);
+        both are behaviour changes with their own costs, so it is stated rather than guessed at.
       * A CUSTOM Unraid pool name (`/mnt/tank`, `/mnt/nvme`) has no shape here — the pool list is
         a fixed set of stock names. Widening to `/mnt/[\w-]+/` would fire on ordinary container
         paths. Custom names are the project-side guard's job.
@@ -605,16 +621,18 @@ ALLOW_SPANS: tuple[str, ...] = (
 # latter, and a file named `deploy-notes.pdf` holding an ordinary ASCII runbook — a LAN host, an
 # appdata path and an RFC1918 address, all in plain text — was therefore read by NEITHER scan and
 # exited 0. Renaming a text file must not defeat a guard. What each scan does now:
-#   * the tree scan asks `_looks_binary` of the BYTES and only skips if they really are binary;
+#   * the tree scan asks `_binary_by_content` of the BYTES — git's own question, a NUL in the
+#     first 8000 bytes — and only skips if they really are binary by that test;
 #   * the range scan scans added lines regardless of suffix — git already refused a text diff for
-#     anything it judged binary, which is a content check stricter than any filename.
+#     anything it judged binary, which is the SAME test reached from what that scan can see.
+# Two scans, one classification, so a file cannot be text to one and an asset to the other.
 # What the list still earns, stated per scan rather than rounded up to "both". In the RANGE and
 # `--staged` scans it stops a 100 MB `.png` being re-diffed with `--text`, and it stops an ordinary
 # image being REPORTED as "unreadable, so not cleared". In the TREE scan it does neither: that scan
 # reads every tracked file's bytes before deciding anything, so the suffix only chooses which
-# QUESTION is asked of them (`_looks_binary`, or the #242 NUL refusal). Reading an asset in full on
-# every tree scan is a real cost the suffix used to avoid; it is a slowdown, not a defect, and
-# batching it is left as its own change rather than smuggled in here.
+# QUESTION is asked of them (`_reading`: the window, then blank the NUL lines; or the #242 NUL
+# refusal). Reading an asset in full on every tree scan is a real cost the suffix used to avoid; it
+# is a slowdown, not a defect, and batching it is left as its own change rather than smuggled in.
 SKIP_SUFFIXES = (".png", ".jpg", ".jpeg", ".ico", ".gif", ".pdf", ".zip", ".gz",
                  ".woff", ".woff2", ".ttf", ".db", ".sqlite")
 
@@ -1064,7 +1082,7 @@ def _is_self(rel_path: str, root: Path | None = None, data: bytes | None = None)
     probably an image, so reading it is pointless". The second is a GUESS FROM A FILENAME, and
     treating a guess as an exemption is what let an ASCII leak in a file named `.pdf` walk past
     both scans (consumer#22). One is a fact about a known path; the other is a prediction, and a
-    prediction now has to be CHECKED against the bytes — see `_looks_binary`.
+    prediction now has to be CHECKED against the bytes — see `_binary_by_content` and `_reading`.
 
     This exempts the file's CONTENT only. Its PATH is scanned like every other path (`scan_path`):
     renaming this guard to something that names the estate is a leak whatever the file contains.
@@ -1138,7 +1156,7 @@ def _own_source_bytes() -> bytes | None:
 
 
 def _binary_suffix(rel_path: str) -> bool:
-    """Does the NAME claim this is a binary asset? A HINT, never a verdict — see `_looks_binary`."""
+    """Does the NAME claim this is a binary asset? A HINT, never a verdict — see `_reading`."""
     return rel_path.lower().endswith(SKIP_SUFFIXES)
 
 
@@ -1149,7 +1167,7 @@ def _skipped(rel_path: str, root: Path | None = None) -> bool:
     complain that this file could not be decoded" — a `.png` git serves as a binary diff, or a
     blob the range scan would otherwise re-diff byte by byte. It is NO LONGER the gate on whether
     CONTENT gets scanned: a skipped suffix whose bytes turn out to be text is now scanned by both
-    scans (`_looks_binary` in the tree scan; `scan_added` no longer filtering added lines by
+    scans (`_binary_by_content` in the tree scan; `scan_added` no longer filtering added lines by
     suffix). The suffix list stops the guard WASTING a read; it no longer stops it LOOKING at text.
 
     ⚠️ WHERE IT IS ACTUALLY CALLED, stated because the previous version of this docstring named the
@@ -1166,33 +1184,113 @@ def _skipped(rel_path: str, root: Path | None = None) -> bool:
     return _binary_suffix(rel_path) or _is_self(rel_path, root)
 
 
-def _looks_binary(data: bytes) -> bool:
-    """Is this blob genuinely not UTF-8 TEXT? Asked of the BYTES, never of the filename.
+# ⛔ 8000, BECAUSE THAT IS GIT'S OWN `buffer_is_binary` WINDOW. Not a tunable: a different number
+# here means a file git serves as TEXT is skipped by the tree scan, or the reverse, and the two
+# scans stop describing the same repository. What that costs was measured — see
+# `_binary_by_content`.
+_SNIFF_BYTES = 8000
+
+
+def _binary_by_content(data: bytes) -> bool:
+    """Would GIT call these bytes binary? A NUL byte within the first `_SNIFF_BYTES` — no more.
 
     ⭐ THIS IS THE HALF THAT MAKES `SKIP_SUFFIXES` SAFE (consumer#22). The suffix list used to be
     trusted outright, so `deploy-notes.pdf` holding an ordinary ASCII runbook — a LAN host, an
     appdata path and an RFC1918 address, all in plain text — was read by neither scan and exited
     0. Renaming a text file must not be a way to defeat a guard.
 
-    TWO tests. The NUL one comes first because it is what git itself uses to call a blob binary,
-    and because it is the cheap answer for every real image:
-      * a NUL byte anywhere — no legitimate UTF-8 source contains one;
-      * it does not decode as UTF-8 at all — a real PNG/JPEG/PDF stream, a latin-1 file.
+    ⛔⛔ THE WINDOW IS GIT'S OWN, AND MATCHING IT IS THE WHOLE POINT (consumer PR95, gate rounds 1
+    and 3). The first version of this asked "is there a NUL ANYWHERE, or does it fail to decode",
+    on the reasoning that a false "binary" verdict only costs a skipped file and so deserves the
+    stricter test. Measured, that reasoning is backwards: it put the two scans into exactly the
+    disagreement the suffix rule exists to prevent, with the TREE scan on the wrong side —
 
-    ⚠️ SCOPED, deliberately: this is consulted ONLY for a path whose suffix already claims to be
-    binary. A NUL-bearing blob at such a path is skipped SILENTLY, where a NUL-bearing blob at any
-    other path is REFUSED and reported (the #242 BOM-less-UTF-16 posture, unchanged). So a UTF-16
-    payload hidden in a file named `.pdf` is still not read — exactly as before this change,
-    no better and no worse. Widening that means re-litigating which suffixes are assets, which is
-    issue #38's design call and not this one's.
+        late.pdf: 9,000+ bytes of ASCII with a CGNAT address on line 6, then one NUL at the end
+        git diff --numstat  ->  text            (git: no NUL in the first 8000 bytes)
+        --range / --staged  ->  exit 1, late.pdf:6 named
+        tree scan           ->  exit 0, "1 tracked text files scanned", the leak not reported
+
+    The pre-commit layer cleared a worktree with the value sitting in it, and the layer that runs
+    most often was the one that missed. So this asks git's question, byte for byte: a file git
+    will serve as text is read as text here, and what it then turns out to contain is decided by
+    `_reading`, which is where the NUL-past-the-window case is handled rather than here.
+
+    ⚠️ WHAT THIS DOES NOT CLOSE, stated because this file's rule is to declare a gap rather than
+    imply coverage: a file NAMED with a binary suffix whose first 8000 bytes DO contain a NUL is
+    still skipped on that evidence, however much plain text follows — one byte is all the
+    corroboration a name needs. That is consumer#98's residual, it is far narrower than the old
+    rule (which needed only the NAME), and it is written down in KNOWN LIMITS.
     """
-    if b"\x00" in data:
-        return True
+    return b"\x00" in data[:_SNIFF_BYTES]
+
+
+class Reading(NamedTuple):
+    """What, if anything, of a file's bytes the tree scan will read.
+
+    ⭐⭐ ONE DECISION FOR BOTH SOURCES OF A TRACKED FILE'S BYTES — the worktree, and the index when
+    the worktree copy is gone. Both must answer the same questions in the same order: is the
+    name's binary claim corroborated in git's window, does it decode, does it carry a NUL. The
+    consumer that first shipped this window paid twice for two paths answering them differently —
+    once when its tree scan and range scan disagreed about a `.pdf` past 8000 bytes, and once when
+    its worktree read and its staged read disagreed about the same bytes. One function, so they
+    cannot drift.
+
+    `text` is what to scan (`None` if nothing); `unreadable` and `partial` are the disclosures the
+    caller must print, because a file this could not fully read is one it cannot fully vouch for.
+    """
+
+    text: str | None
+    unreadable: str | None
+    partial: str | None
+
+
+def _reading(rel: str, raw: bytes, *, absent_from_worktree: bool = False) -> Reading:
+    """Decide what of `raw` is scannable, for the tracked file at `rel`. See `Reading`.
+
+    `absent_from_worktree` says the bytes came from the INDEX (`staged_blob`), and every
+    disclosure then says so: "wide.txt could not be read" and "wide.txt could not be read FROM THE
+    INDEX, and the index is what the commit records" send the operator to different places.
+    """
+    where = " (absent from the worktree)" if absent_from_worktree else ""
+    hinted = _binary_suffix(rel)
+    # A name that CLAIMS binary is believed only if the bytes agree — in git's own window. A real
+    # asset is skipped here in silence, exactly as it always was.
+    if hinted and _binary_by_content(raw):
+        return Reading(None, None, None)
     try:
-        data.decode("utf-8")
+        text = raw.decode("utf-8")
     except UnicodeDecodeError:
-        return True
-    return False
+        if not hinted:
+            # NOT silent: a file this scanner cannot read is a file it cannot vouch for.
+            return Reading(None, (f"{rel} (absent from the worktree, and its staged content is "
+                                  f"not UTF-8)" if absent_from_worktree else rel), None)
+        # ⭐ A HINTED FILE GIT WOULD SERVE AS TEXT IS SCANNED AS TEXT, EVEN WHEN IT IS NOT UTF-8 —
+        # the way the range scan already scans it (`_git` decodes with `errors="replace"`).
+        # Skipping it in silence, which this used to do, let a latin-1 runbook named `.pdf` walk
+        # past the tree scan while `--range` reported it; reporting it "unreadable" would be a red
+        # whose printed remedy ("keep it under an asset suffix") names the suffix it already has.
+        # Replacement characters cannot create a false hit: every pattern is ASCII.
+        text = raw.decode("utf-8", errors="replace")
+    if "\x00" in text:
+        if not hinted:
+            # ⛔⛔ A SUCCESSFUL DECODE IS NOT PROOF IT IS TEXT (issue #242). BOM-less UTF-16LE of
+            # ASCII is `A\x00G\x00E\x00…` — every byte under 0x80, so it IS valid UTF-8. The decode
+            # succeeded, the content was NUL-separated so no pattern could match, and the file was
+            # counted in the "scanned" total: the guard vouching for a file it had not read.
+            return Reading(None, (f"{rel}{where} (contains a NUL byte, so it is not UTF-8 text - "
+                                  f"BOM-less UTF-16/UTF-32 decodes as valid UTF-8 and would scan "
+                                  f"as nothing)"), None)
+        # ⛔ A NAME THAT CLAIMS BINARY IS NOT REFUSED FOR A NUL PAST THE WINDOW — it is read the
+        # way the range scan reads the same file: the NUL-bearing lines BLANKED, the rest scanned.
+        # Refusing it was a false red whose remedy named a suffix already in SKIP_SUFFIXES, and
+        # skipping it whole (what this used to do) was the bypass in `_binary_by_content`'s
+        # docstring. Blanked rather than removed, so a finding after a NUL line keeps its true
+        # line number and both scans agree on it.
+        lines = _lines(text)
+        blanked = sum(1 for line in lines if "\x00" in line)
+        return Reading("\n".join("" if "\x00" in line else line for line in lines), None,
+                       f"{rel}{where} ({blanked} line(s) carried a NUL and were not read)")
+    return Reading(text, None, None)
 
 
 def gitlinks(root: Path) -> set[str]:
@@ -1641,7 +1739,10 @@ def commits_in_range(root: Path, rev_range: str) -> list[str]:
     `<sha> --not --remotes` for a BRAND-NEW branch, which has no remote counterpart to diff
     against and would otherwise be scanned as zero commits.
     """
-    return list(reversed(_git(root, "rev-list", *rev_range.split()).split()))
+    # `--` for the same reason every diff in this file carries one: a token such as `HEAD` is
+    # resolved against the filesystem too, and a file of that name beside the root is otherwise
+    # "ambiguous argument", exit 128.
+    return list(reversed(_git(root, "rev-list", *rev_range.split(), "--").split()))
 
 
 def widen_unreachable_base(root: Path, rev_range: str) -> tuple[str, str | None]:
@@ -1894,8 +1995,31 @@ def changed_paths(root: Path, *revs: str) -> list[str]:
     cleanup gets switched off. Modified paths ARE included: re-scanning a path is the safe
     direction to be wrong in, and a guard may re-scan where it may not skip.
     """
+    # ⛔ THE TRAILING `--` IS NOT DECORATION (consumer PR99). Without it git resolves a revision
+    # against BOTH the ref namespace and the FILESYSTEM, so anything named `HEAD` beside the
+    # repository root — a tracked file, an untracked one, or a directory, measured all three —
+    # gets `fatal: ambiguous argument 'HEAD': both revision and filename`, exit 128, and the scan
+    # died with a traceback naming an argument the operator never typed. The separator says
+    # "everything before this is a revision" and settles it.
+    #
+    # ⛔⛔ THE THREE AMBIGUITY-CHECKED VERBS THIS FILE RUNS CARRY ONE — `diff`, `rev-list` and
+    # `show`. The first version of this comment said "every diff whose revision can be a NAME
+    # rather than a full sha", and that scoping was FALSE IN BOTH HALVES: git's ambiguity check
+    # fires on a FULL 40-hex sha too, as soon as a filesystem entry of that name exists, and
+    # reasoning that a full sha was safe is exactly what left `commit_identity` and
+    # `commit_message` — which run `git show <sha>` — without one. The verification gate planted a
+    # single UNTRACKED file named after an in-range commit and the whole range scan died
+    # `exited 128`, printing "Fetch the base ref", a remedy for a cause with nothing to do with
+    # it. A repository keeping a `format-patch` scratch file or a sha-named dump reaches that.
+    #
+    # ⚠️ NAMED RATHER THAN GENERALISED, deliberately, because the confirming pass caught THIS
+    # comment over-claiming the same way its predecessor did. `rev-parse --verify` and `cat-file`
+    # also take revisions here and carry no separator — measured with a sha-named file planted,
+    # neither is ambiguity-checked, so nothing is wrong — but "every git call that takes a
+    # revision" was a sentence wider than the diff, in a comment whose entire subject is an
+    # over-scoped sentence hiding a bug. Say which verbs, not which class.
     out = _git(root, *_DIFF_CONFIG, "diff", *_DIFF_FLAGS, "--name-only", "-z",
-               "--diff-filter=d", *revs)
+               "--diff-filter=d", *revs, "--")
     return [p for p in out.split("\0") if p]
 
 
@@ -1934,7 +2058,10 @@ def added_lines(root: Path, sha: str) -> ParsedDiff:
     Skipped suffixes are filtered FIRST, so a 100 MB `.png` is never fetched only to be discarded.
     """
     parent = first_parent(root, sha)
-    parsed = parse_diff(_git(root, *_DIFF_CONFIG, "diff", *_DIFF_FLAGS, parent, sha))
+    # `--` for the reason `changed_paths` gives. ⚠️ NOT because "a full sha cannot collide" — it
+    # can, the moment a file of that name exists, which is the reasoning that left `git show`
+    # uncovered until the gate planted one.
+    parsed = parse_diff(_git(root, *_DIFF_CONFIG, "diff", *_DIFF_FLAGS, parent, sha, "--"))
     return resolve_unscannable(root, parsed, (parent, sha))
 
 
@@ -2012,15 +2139,26 @@ def scan_added(sha: str, parsed: ParsedDiff, compiled: list[tuple[str, re.Patter
     ⚠️ THIS NO LONGER SKIPS "the same files the tree scan skips", and the old summary line saying
     so was left in place while the paragraph below contradicted it. What the two scans share is the
     RULE — content decides, not the filename — not an identical file list: the tree scan asks
-    `_looks_binary` of bytes it has, and this asks nothing, because git already refused to serve a
-    text diff for a blob it judged binary. Same answer, reached from what each scan can see.
+    `_binary_by_content` of bytes it has, and this asks nothing, because git already refused to
+    serve a text diff for a blob it judged binary. Same answer, reached from what each scan can
+    see — and the SAME test, git's 8000-byte window, so it is the same answer in fact and not only
+    in intent.
 
     ⭐ `_is_self`, NOT `_skipped`, ON THE ADDED LINES (consumer#22). git only serves a TEXT diff
     for a blob it judged to be text, so lines arriving here have already passed a content check
     stricter than any filename — and dropping them because the file is called `.pdf` is the
-    filename-trust half of #22 on the range side. The tree scan's twin is `_looks_binary`. The
-    `unscannable` list below still uses `_skipped`: that one is about not complaining that a
-    genuine `.png` could not be decoded, which is a question about assets, not about text.
+    filename-trust half of #22 on the range side. The tree scan's twin is `_binary_by_content`,
+    which asks git's exact question of the bytes so the two cannot disagree. The `unscannable`
+    list below still uses `_skipped`: that one is about not complaining that a genuine `.png`
+    could not be decoded, which is a question about assets, not about text.
+
+    ⚠️ STATED, NOT CLOSED: a NUL-bearing ADDED LINE in a suffix-hinted file is dropped by
+    `parse_diff` into `unscannable`, and the `_skipped` filter below then drops it from the report
+    — so the range scan and `--staged` scan the NUL-free lines of such a file and say nothing about
+    the line they could not read. The tree scan discloses the same situation as "PARTLY read"
+    (`_reading`). `parse_diff` cannot tell "git served a binary diff" from "one added line carried
+    a NUL", which is what a disclosure here would need; it is recorded as a follow-up rather than
+    bolted on.
     """
     findings: list[str] = []
     for path, lineno, content in parsed.added:
@@ -2083,7 +2221,7 @@ def commit_identity(root: Path, sha: str) -> list[tuple[str, str]]:
     site, and a separate issue" (#35) on a measurement taken against UNSIGNED commits, where the
     setting is genuinely inert. Signing is what makes it bite.
     """
-    raw = _git(root, "show", "-s", "--no-show-signature", f"--format={_IDENT_FORMAT}", sha)
+    raw = _git(root, "show", "-s", "--no-show-signature", f"--format={_IDENT_FORMAT}", sha, "--")
     parts = raw.rstrip("\n").split("\0")
     if len(parts) != len(_IDENT_FIELDS):
         # ⚠️ NOT a silent `zip` truncation. `zip` stops at the shorter side, so a malformed or
@@ -2135,7 +2273,8 @@ def commit_message(root: Path, sha: str) -> str:
     text carries a key path (`C:/Users/<name>/.ssh/allowed_signers`) and a signer principal —
     a FABRICATED finding attributed to a commit message that is in fact clean.
     """
-    return _git(root, "show", "-s", "--no-show-signature", f"--format={_MESSAGE_FORMAT}", sha)
+    return _git(root, "show", "-s", "--no-show-signature", f"--format={_MESSAGE_FORMAT}", sha,
+                "--")
 
 
 def scan_message(sha: str, message: str) -> list[str]:
@@ -2764,7 +2903,17 @@ def _link_text(path: Path) -> bytes:
 def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
     findings: list[str] = []
     undecodable: list[str] = []
+    # Files read only IN PART — a name that hints binary whose content carries a NUL past git's
+    # window, where the NUL-bearing lines are blanked and the rest scanned. Counted and reported
+    # separately, because this file's own doctrine is "not scanned, so not cleared", and folding
+    # a partly-read file into `scanned` in silence says it was read when it was not.
+    partial: list[str] = []
     scanned = 0
+    # Paths EXAMINED, counted separately from files READ. Every tracked path is scanned for a
+    # leak in its NAME, including the ones whose bytes nothing opens — so "how much did this run
+    # look at" and "how many files did it read" are two different numbers, and the verdict prints
+    # both. (`examined` is what retired the zero-file floor; see the end of this function.)
+    examined = 0
     # Submodule entries, resolved once. See `gitlinks` for why they cannot be told apart from a
     # staged-but-deleted file by catching exceptions.
     modes = _index_modes(root)
@@ -2780,6 +2929,7 @@ def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
         # itself is never opened. (`<host>.lan.png` is caught because the PATH surface runs a
         # LOOSER `.lan` bound than file content does — see PATH_PATTERN_OVERRIDES. It was NOT
         # caught when this comment first asserted it; the claim came before the behaviour.)
+        examined += 1
         findings += [f"{rel}: <path>: {label}: {match!r}"
                      for label, match in scan_path(rel)]
         if _is_self(rel, root):
@@ -2793,8 +2943,7 @@ def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
         # scanned like anything else. Fail-closed on ambiguity.
         if rel in submodules and not path.is_file():
             continue
-        raw: bytes | None = None
-        text: str | None = None
+        raw: bytes
         absent_from_worktree = False
         # ⛔⛔ A SYMLINK PUBLISHES ITS LINK TEXT, NOT ITS TARGET — and `read_bytes` FOLLOWS the
         # link, so this scan used to read whatever the link pointed at and never the one thing
@@ -2858,8 +3007,8 @@ def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
             # asset" for both sources, which is what `_skipped`'s two-scans-must-agree note has
             # always been about.
             absent_from_worktree = True
-            raw = staged_blob(root, rel)
-            if raw is None:
+            staged = staged_blob(root, rel)
+            if staged is None:
                 # ⚠️ DO NOT NAME A CAUSE THIS DOES NOT KNOW. The remaining reason `git cat-file`
                 # refuses `:<path>` is that there is no stage-0 entry — an UNMERGED path. The
                 # encoding half of this message moved to where the decode now happens, rather than
@@ -2868,71 +3017,40 @@ def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
                     f"{rel} (absent from the worktree, and git could not read its staged content: "
                     f"the path is probably unmerged and has no stage-0 entry)")
                 continue
+            raw = staged
         except OSError as exc:
             # Anything else unreadable — a permission problem, a broken symlink. Reported rather
             # than raised, because a traceback here aborts the scan part-way and every file after
             # it goes unexamined.
             undecodable.append(f"{rel} (unreadable: {type(exc).__name__})")
             continue
-        if raw is not None:
-            # ⭐⭐ THE SECOND HALF OF THE SELF-EXEMPTION, and it needs the BYTES, which is why it
-            # cannot live beside the path test above. An INSTALLED guard is not inside the
-            # repository it scans, so the path test never fires there — and the repository that
-            # OWNS this engine keeps its source as an ordinary tracked file, full of synthetic
-            # deny cases. This asks "are these my own bytes", which no other file can answer yes
-            # to and no configuration can widen. See `_is_self`.
-            if _is_self(rel, root, raw):
-                continue
-            # ⭐⭐ THE SUFFIX IS A HINT, NOT A VERDICT (consumer#22). `SKIP_SUFFIXES` used to end
-            # the matter before the file was opened, so `deploy-notes.pdf` holding a plain ASCII
-            # runbook — LAN host, appdata path, RFC1918 address — was never read by either scan and
-            # exited 0. The bytes now decide: an asset that really is one is skipped exactly as
-            # before, and one that is text is scanned exactly like any other text file.
-            #
-            # ⚠️ THE TWO BRANCHES DIFFER IN WHAT A FAILED DECODE MEANS, and that asymmetry is
-            # deliberate rather than an oversight. At a `.png` it means "yes, an image" — skip it
-            # silently, which is the whole point of the suffix list and keeps issue #38 exactly
-            # where it was. At any other path it means "I could not read this", which is REPORTED,
-            # because a file this scanner cannot read is a file it cannot vouch for.
-            if _binary_suffix(rel):
-                if _looks_binary(raw):
-                    continue
-                # `_looks_binary` already proved this decodes; it cannot raise here.
-                text = raw.decode("utf-8")
-            else:
-                try:
-                    text = raw.decode("utf-8")
-                except UnicodeDecodeError:
-                    # NOT silent: a file this scanner cannot read is a file it cannot vouch for.
-                    undecodable.append(
-                        f"{rel} (absent from the worktree, and its staged content is not UTF-8)"
-                        if absent_from_worktree else rel)
-                    continue
-        # ⛔⛔ A SUCCESSFUL DECODE IS NOT PROOF IT IS TEXT (issue #242). BOM-less UTF-16LE of ASCII
-        # is `A\x00G\x00E\x00…` — every byte under 0x80, so it IS valid UTF-8. `read_text`
-        # succeeded, the decoded content was NUL-separated so no pattern could match, and the file
-        # was counted in the "scanned" total. The guard vouched for a file it had not read.
-        #
-        # ⭐ PLACED AFTER THE `try`, DELIBERATELY, so it covers BOTH sources of `text` — the
-        # worktree read AND the staged blob from `staged_blob`. Those are two of the three decode
-        # sites in this file, and the sibling repo's attempt at this reached only one of them
-        # because it was written at the reads rather than at what they produce (consumer#242).
-        # (`text` is necessarily a str here: both sources set `raw`, and every path that leaves it
-        # unset has already `continue`d. Asserted by construction rather than re-checked, because a
-        # defensive `text is None` branch could only print a NUL message about something that is
-        # not a NUL problem.)
-        if "\x00" in text:
-            # `absent_from_worktree` threaded in here too: this is the one branch that could
-            # report a staged blob without saying the file is not on disk, which sent the operator
-            # looking for a file that is not there.
-            where = " (absent from the worktree)" if absent_from_worktree else ""
-            undecodable.append(
-                f"{rel}{where} (contains a NUL byte, so it is not UTF-8 text - BOM-less "
-                f"UTF-16/UTF-32 decodes as valid UTF-8 and would scan as nothing)")
+        # ⭐⭐ THE SECOND HALF OF THE SELF-EXEMPTION, and it needs the BYTES, which is why it
+        # cannot live beside the path test above. An INSTALLED guard is not inside the
+        # repository it scans, so the path test never fires there — and the repository that
+        # OWNS this engine keeps its source as an ordinary tracked file, full of synthetic
+        # deny cases. This asks "are these my own bytes", which no other file can answer yes
+        # to and no configuration can widen. See `_is_self`.
+        if _is_self(rel, root, raw):
+            continue
+        # ⭐⭐ ONE DECISION FOR BOTH SOURCES OF `raw` — the worktree read and the staged blob.
+        # `_reading` asks, in order: does the name's binary claim hold in git's own window (skip
+        # in silence), does it decode (report it if not, unless the name hints binary and git
+        # would serve it as text anyway), does it carry a NUL (report it — the #242 BOM-less
+        # UTF-16 posture — unless the name hints binary, in which case the NUL lines are blanked
+        # and the rest is scanned, exactly as the range scan reads the same file). Both sources
+        # used to answer those questions in two places, and the consumer that shipped this window
+        # measured its two sources reaching opposite verdicts on identical bytes.
+        read = _reading(rel, raw, absent_from_worktree=absent_from_worktree)
+        if read.unreadable:
+            undecodable.append(read.unreadable)
+            continue
+        if read.partial:
+            partial.append(read.partial)
+        if read.text is None:
             continue
         scanned += 1
         findings += [f"{rel}:{n}: {label}: {match!r}"
-                     for n, label, match in scan_text(text, compiled, rel)]
+                     for n, label, match in scan_text(read.text, compiled, rel)]
 
     if undecodable:
         print(f"UNREADABLE as UTF-8 ({len(undecodable)}) - not scanned, so not cleared:")
@@ -2960,35 +3078,38 @@ def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
               "/mnt/POOL/..., RFC5737 addresses) or take the value from an env Variable.")
         print("If a hit is genuinely legitimate, add the literal to `allow_literals` in this "
               f"repository's {CONFIG_FILENAME}, with the `why` the format requires.")
+    if partial:
+        # ⚠️ NOT A FAILURE, and printed anyway. These files WERE scanned, on every line this could
+        # read — so refusing them would be the false red with an inert remedy that `_reading`
+        # exists to remove. But a partial read is not a clean bill of health either, and saying
+        # nothing is how "0 files scanned, no internal info found" happened in the first place.
+        # Printed LAST, after the findings, so a reader (or a test) can take everything from
+        # this heading down as disclosure rather than as a refusal.
+        print(f"\nPARTLY read ({len(partial)}) - a binary-suffixed file whose NUL-bearing lines "
+              f"could not be read; the rest of each was scanned:")
+        for p in partial:
+            print("  " + _ascii(p))
     if findings or undecodable:
         return 1
-    if tracked and scanned == 0:
-        # ⛔⛔ A RUN THAT SCANNED NOTHING IS NOT A CLEAN RUN (consumer#22, second half). This
-        # printed `no internal info found (0 tracked text files scanned)` and exited 0 — a
-        # cheerful pass, in the same words as a real one, for a scan that opened no file at all.
-        # Every way of getting here is a failure worth stopping on: `--repo` aimed at the wrong
-        # directory, a tree whose every file is an asset, or someone widening SKIP_SUFFIXES until
-        # nothing is left to read.
-        #
-        # ⚠️ IT IS NOT THE SAME QUESTION AS "were there findings". Findings and unreadable files
-        # are both reported ABOVE and both already exit 1; this is the third state neither of them
-        # covers — no findings BECAUSE there was no input. The count was printed all along, which
-        # is what makes this cheap: the number was right there in the success message and nothing
-        # acted on it.
-        #
-        # ⛔ `tracked and` IS LOAD-BEARING, AND ITS ABSENCE BLOCKED A LEGITIMATE ACTION. An EMPTY
-        # tracked list is not "a scan that skipped everything", it is a scan with nothing to do —
-        # and `git commit --allow-empty -m initial`, the standard way to start a repository, has
-        # exactly that shape. Without this the pre-commit hook refused it and the repository could
-        # not be bootstrapped at all. The acceptance this exists for says "a 0-files-scanned run
-        # against a NON-EMPTY tree", and the empty tree is the case it deliberately does not name.
-        print(f"REFUSING to report clean: {len(tracked)} tracked path(s), but ZERO were read as "
-              "text, so no file CONTENT was scanned.")
-        print("A scan that opened no file cannot clear a tree. Check that --repo points at the "
-              "right repository and that SKIP_SUFFIXES has not grown to cover everything. If this "
-              "really is an assets-only tree, every path was still checked - add one text file "
-              "(a README) so the content scan has something to vouch for.")
-        return 1
+    # ⛔⛔ THE ZERO-FILE FLOOR IS RETIRED, AND THIS COMMENT IS WHAT REMAINS OF IT (consumer#22,
+    # second half — and the half its own consumer then measured and deliberately did NOT ship).
+    #
+    # This used to REFUSE a tree with tracked files but `scanned == 0`: "a run that read nothing
+    # is not a clean run". True of the run it was written for — a `.pdf`-named ASCII runbook that
+    # the suffix list kept every scan from opening — and that case is closed by `_reading` above,
+    # which reads such a file. What the floor was left catching was a repository whose tracked
+    # files are ALL genuine assets: an icon-only tree, a fonts package. That is a CORRECT tree,
+    # and reddening it — with "add a README" as the remedy — is exactly how a guard gets switched
+    # off; the consumer that first shipped the floor measured that false red and keyed its floor
+    # on PATHS EXAMINED instead. Since every tracked path is scanned above, such a run has not
+    # looked at nothing: it examined every name and declined every body, for a reason the design
+    # states and the verdict below now prints.
+    #
+    # And "paths examined == 0" is the EMPTY tree, which this scanner passes on purpose one branch
+    # down (`git commit --allow-empty -m initial` is the standard way to start a repository, and
+    # the floor once blocked it) — the one decision here the consumer made the other way, and
+    # made knowingly. So nothing is left for a floor to refuse. The counts stay in the verdict,
+    # both of them, because a clean answer that says what it examined is one a reader can check.
     if not tracked:
         # ⚠️ NAME THE ROOT WHEN THERE WAS NOTHING TO SCAN. An empty tracked list is legitimate (a
         # fresh repository, `git commit --allow-empty`), so it is not an error — but it is also
@@ -2998,7 +3119,8 @@ def _scan_tree(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
         print(f"no internal info found (0 tracked text files scanned; {_ascii(str(root))} has no "
               f"tracked files at all - check --repo if that is a surprise)")
         return 0
-    print(f"no internal info found ({scanned} tracked text files scanned)")
+    print(f"no internal info found ({scanned} tracked text files scanned, {examined} tracked "
+          f"path(s) examined)")
     return 0
 
 
@@ -3022,11 +3144,29 @@ def staged_blob(root: Path, rel: str) -> bytes | None:
     remedy that was inert because `.png` was already in SKIP_SUFFIXES. Handing the caller the bytes
     lets ONE rule decide "is this an asset", for the worktree read and the staged blob alike.
 
-    `:<path>` is the index revision of the file. None now means only that git refused the path —
-    in practice an UNMERGED path, which has no stage-0 entry.
+    None now means only that git refused the path — in practice an UNMERGED path, which has no
+    stage-0 entry.
+
+    ⛔⛔ `:0:<path>`, NOT `:<path>` — THE STAGE PREFIX IS WHAT MAKES THE REST A PATH (consumer
+    PR99). `:<rev>` is a git REVISION expression, and `:0:`/`:1:`/`:2:`/`:3:` inside one name a
+    merge STAGE. So a file whose NAME begins with one of those prefixes resolved to a different
+    file entirely:
+
+        staged_blob(root, "cfg.env")     -> b"HOST=placeholder.example\\n"
+        staged_blob(root, "0:cfg.env")   -> b"HOST=placeholder.example\\n"   <- the WRONG file
+
+    A path named `0:cfg.env` carrying a leak was therefore vouched for by `cfg.env`'s bytes, and
+    the scan reported clean. That is exactly the "one file's content mis-attributed to another"
+    failure this file refused `cat-file --batch` to avoid, re-entering through the argument rather
+    than the protocol. `1:`/`2:`/`3:` fail closed on an ordinary path but resolve to a real, other
+    blob when the target IS unmerged. With the explicit stage the remainder is unambiguously a
+    path: `git cat-file blob :0:0:cfg.env` -> `fatal: path '0:cfg.env' does not exist`.
+
+    ⚠️ Not reachable on Windows, where git refuses `:` in a filename outright — which is precisely
+    why it had to be ported rather than waited for: CI and most contributors are not on Windows.
     """
     try:
-        return subprocess.run(["git", "cat-file", "blob", f":{rel}"], cwd=root,
+        return subprocess.run(["git", "cat-file", "blob", f":0:{rel}"], cwd=root,
                               capture_output=True, check=True, timeout=_GIT_TIMEOUT_S).stdout
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
@@ -3058,7 +3198,10 @@ def staged_diff(root: Path) -> tuple[ParsedDiff, list[str]]:
     unscanned by this layer.
     """
     base = "HEAD" if resolves(root, "HEAD") else _EMPTY_TREE
-    parsed = parse_diff(_git(root, *_DIFF_CONFIG, "diff", *_DIFF_FLAGS, "--cached", base))
+    # ⛔ `--` AFTER THE BASE. `HEAD` here is a NAME, and git resolves a name against the working
+    # tree as well as the refs — anything called `HEAD` beside the repository root made this die
+    # 128 with "ambiguous argument" and a traceback (consumer PR99). See `changed_paths`.
+    parsed = parse_diff(_git(root, *_DIFF_CONFIG, "diff", *_DIFF_FLAGS, "--cached", base, "--"))
     # ⛔ THE SAME `--text` RESOLUTION THE RANGE SCAN DOES, and not an optional refinement: without
     # it an ordinary `.gitattributes`-marked lockfile — git reports `Binary files … differ` for a
     # `-diff` attribute — would be reported "not scanned, so NOT CLEARED" and BLOCK the commit,

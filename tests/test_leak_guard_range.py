@@ -1423,8 +1423,9 @@ def test_staged_content_that_is_not_UTF8_is_still_reported_as_not_cleared(tmp_pa
 
     ⚠️ THE PATH MATTERS AS MUCH AS THE VERDICT HERE. `wide.txt` has no binary suffix, so it must be
     REPORTED. The same bytes at a path that DOES claim to be an asset (`wide.pdf`) are skipped
-    silently instead — that is the split `_looks_binary` exists for, and pinning both together is
-    what stops one of them quietly adopting the other's behaviour.
+    silently instead (UTF-16 carries a NUL at byte 1, inside git's window) — that is the split
+    `_reading` exists for, and pinning both together is what stops one of them quietly adopting
+    the other's behaviour.
 
     ⚠️ ASSERTS THE PROPERTY, NOT THE SENTENCE. This used to require the literal phrase "could not
     be read", which the message no longer uses — it now names the actual cause (the staged content
@@ -2112,10 +2113,21 @@ def test_a_skipped_suffix_stays_skipped_by_BOTH_scans_when_its_content_has_a_NUL
 
     Both directions asserted, so this cannot be satisfied by skipping everything: the skipped
     suffix passes, and a byte-identical file at a NON-skipped suffix is still refused.
+
+    ⚠️ AND IT RUNS BOTH SCANS, which its name always claimed and its body did not. The tree scan
+    now READS a suffix-hinted file whose NUL falls past git's window (blanking the NUL lines), so
+    this is exactly where a refusal with an inert remedy would reappear if that branch regressed.
+
+    ⚠️ THE BODY IS CLEAN, DELIBERATELY. It used to carry a real leak in UTF-16LE, which made this
+    test require the guard to say NOTHING about a file that contains one — so a later repair
+    that reported it would fail here, and the test would be defending a bypass. The property it
+    is for is "a name already in SKIP_SUFFIXES must not produce an unfixable red"; what the guard
+    does with a LEAK in such a file is `test_a_leak_on_a_NUL_FREE_line_of_a_late_NUL_pdf_is_
+    found_by_ALL_THREE_scans` in the engine-adds module.
     """
     repo = tmp_path / "pdfnul"
     base = _seeded(repo)
-    body = b"%PDF-1.4\n" + b"x" * 9000 + b"\n" + _LEAK_LINE.encode("utf-16-le") + b"\n"
+    body = b"%PDF-1.4\n" + b"x" * 9000 + b"\nnothing internal here\n\x00\x00tail\n"
     (repo / "doc.pdf").write_bytes(body)
     (repo / "doc.dat").write_bytes(body)
     _commit(repo, "add assets")
@@ -2124,12 +2136,17 @@ def test_a_skipped_suffix_stays_skipped_by_BOTH_scans_when_its_content_has_a_NUL
     assert "Binary files" not in _git(repo, "diff", "--unified=0", "--no-color", base, "HEAD"), (
         "premise broken: git called it binary, so this exercises the fallback, not the case named")
 
-    proc = _run_guard(repo, "--range", f"{base}..HEAD")
-    out = proc.stdout + proc.stderr
-    assert "doc.pdf" not in out, (
-        f"a suffix already in SKIP_SUFFIXES was refused by the range scan while the tree scan "
-        f"skips it, and the printed remedy cannot clear it: {out}")
-    assert "doc.dat" in out, f"the non-skipped twin must still be refused: {out}"
+    for label, proc in (("range", _run_guard(repo, "--range", f"{base}..HEAD")),
+                        ("tree", _run_guard(repo))):
+        out = proc.stdout + proc.stderr
+        # The tree scan DISCLOSES the partial read of doc.pdf (a "PARTLY read" block, printed
+        # last); everything before that heading is what it refused.
+        refused = out.partition("PARTLY read (")[0]
+        assert proc.returncode == 1, f"the {label} scan cleared doc.dat: {out}"
+        assert "doc.pdf" not in refused, (
+            f"the {label} scan refused a suffix already in SKIP_SUFFIXES, and the printed remedy "
+            f"cannot clear it: {out}")
+        assert "doc.dat" in refused, f"the non-skipped twin must still be refused by {label}: {out}"
 
 
 @pytest.mark.timeout(300)

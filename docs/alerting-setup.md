@@ -61,14 +61,14 @@ and downloads the template beside it; neither runs anything it downloaded.
 
 ```powershell
 New-Item -ItemType Directory -Force -Path .\configs
-Invoke-WebRequest -Uri https://raw.githubusercontent.com/texasdaddy/kw-common/v1.4.1/alerting.env.template -OutFile .\configs\alerting.env
+Invoke-WebRequest -Uri https://raw.githubusercontent.com/texasdaddy/kw-common/v1.5.0/alerting.env.template -OutFile .\configs\alerting.env
 ```
 
 ### macOS and Linux
 
 ```sh
 mkdir -p ./configs
-curl -fLo ./configs/alerting.env https://raw.githubusercontent.com/texasdaddy/kw-common/v1.4.1/alerting.env.template
+curl -fLo ./configs/alerting.env https://raw.githubusercontent.com/texasdaddy/kw-common/v1.5.0/alerting.env.template
 ```
 
 `-f` makes `curl` fail on an HTTP error rather than writing the error page into your config file —
@@ -161,11 +161,36 @@ check first. `validate_boot_from_env` additionally reads `CONFIG_PATH` and check
   `SMTP_USER` to stand in for it** all refuse here rather than failing silently on the first real
   alert. (With `SMTP_USER` set explicitly, a display-name `EMAIL_FROM` is perfectly fine.)
 
-Then it sends **one** confirmation alert and writes a marker into `CONFIG_PATH` recording the
-config file's **sha256** — one line, `sha256:<hex>`. Later boots skip the check while that digest
-still matches, so any edit to the file is what makes the next boot re-validate. The marker is
-**per environment**, so promoting a service from `dev` to `prod` re-validates even though the
-shared file did not change.
+Then it sends **one** confirmation alert and writes a marker into `CONFIG_PATH` recording two
+facts — the config file's **sha256** on line one, `sha256:<hex>`, and the **service** that
+validated it on line two, `service:"<name>"`. Later boots skip the check while both still match,
+so any edit to the file is what makes the next boot re-validate. The marker is **per
+environment**, so promoting a service from `dev` to `prod` re-validates even though the shared
+file did not change — and it records the service, so **renaming** a service re-validates too. The
+checks are not a function of the file alone: an unusable title prefix and the ntfy topic key are
+both derived from the service name.
+
+⚠️ **A marker written before v1.5.0 records no service**, so the first boot after that upgrade
+re-validates and sends one confirmation alert per service. Then it stops. An operator upgrading a
+fleet should expect that alert rather than read it as a configuration that broke. Rolling back
+costs the same one alert per service, for the mirror-image reason: the older release compares the
+marker's whole text to a bare `sha256:<hex>`, which a two-line marker cannot equal.
+
+⛔ **Two services may not share one `CONFIG_PATH`.** That has always been the rule — the marker
+directory is the app's OWN read-write directory — and since v1.5.0 breaking it is expensive
+rather than merely wrong: each service overwrites the other's record, so both re-validate and
+both send their confirmation alert on EVERY boot. A boot that REPLACES a different service's
+record says so in the process log, naming both services: a line on every boot is a shared
+directory, a line that appears once is a service that was renamed. A boot that writes no marker
+— no `Alerter` installed, or a refusal — says nothing, because it has taken nothing from
+anybody.
+
+⚠️ **One blind spot, stated rather than implied away.** On a mount where the marker lands but
+cannot be read back — a `file_mode` that removes the owner's read bit, which some CIFS mounts
+do — the line never appears, because nothing can confirm what was written. Two services sharing
+a `CONFIG_PATH` there re-announce on every boot with no line naming the second one. You are not
+blind: the process log says the marker **cannot be read back** and that this service will
+re-validate and re-announce on every boot. Fix that first; it is upstream of everything here.
 
 To force a re-check without editing the file, delete the marker: `CONFIG_PATH/.alerting-validated-<env>`.
 

@@ -16,13 +16,13 @@ no port, no alignment audit, and no "which copy is the good one" question to ans
 Consumers install from git at an **exact tag** — never a branch:
 
 ```
-pip install git+https://github.com/texasdaddy/kw-common@v1.4.1
+pip install git+https://github.com/texasdaddy/kw-common@v1.5.0
 ```
 
 In a `requirements.in` / `requirements.txt`:
 
 ```
-kw-common @ git+https://github.com/texasdaddy/kw-common@v1.4.1
+kw-common @ git+https://github.com/texasdaddy/kw-common@v1.5.0
 ```
 
 ⛔ **Never pin a branch.** `@main` makes every rebuild of every consumer a silent, unreviewed
@@ -58,6 +58,7 @@ configure(AlertSettings(
     ntfy_url="https://ntfy.example.com/my-topic",     # https only; "" = no ntfy channel
     state_file="/data/my-service/alert-state.json",   # None = de-duplication OFF
     error_log="/data/my-service/logs/errors.log",     # None = no error-log sink
+    logger_name="my-service.alerts",                  # "" = this library's own logger
 ))
 
 warn_if_unconfigured("my-service")   # at boot: says loudly if alerts would go nowhere
@@ -69,6 +70,14 @@ notify(OK, "my-service: backup ok", "12.4 GB", clears="my-service: backup failed
 Everything the module needs is passed in. It reads no environment variable and has no default
 path — see the contract below, and the module's own docstring for the full behaviour (severities,
 `escalating=`, `clears=`, and the error log's exposure warning).
+
+⭐ **`logger_name` is configuration like everything else.** A logger name is an operator-facing
+surface: a per-logger level, a filter, or a log shipper's routing is written against it, so a
+service that has always emitted its alerting on its own name would otherwise have every record
+silently relocated to `kw_common.alerting` the day it adopted this library. Set it and the records
+stay where the operator's configuration expects them. `""` — the default — means this library's
+own logger, and a blank or non-string name means the same thing rather than the ROOT logger, which
+is what `logging.getLogger("")` would otherwise hand back for an unset container Variable.
 
 ⚠️ **An ntfy topic URL must be `https://`.** It is a *write capability*, not an address: anyone who
 observes it can page you from then on, and over cleartext the URL, the alert `Title` and the body
@@ -135,11 +144,21 @@ channel is one the library can actually SEND on. That last one matters more than
 asked only "is there a value" would pass it, announce that the configuration checks out, and leave
 the channel dead. It asks `alerting`'s own readiness functions rather than re-deriving the answer.
 
-On success it sends **one** confirmation alert and writes a marker into `CONFIG_PATH` recording the
-config file's **sha256**; later boots skip while that digest still matches. The marker is **per
-environment**: with one marker for all of them, promoting a service from dev to prod — which does
-not touch the shared file — skipped validation entirely and the service came up with no topic at
-all. **On failure it logs and raises and does not attempt to alert** — it cannot report a broken
+On success it sends **one** confirmation alert and writes a marker into `CONFIG_PATH` recording
+two facts: the config file's **sha256** on line one, and **the service that validated it** on line
+two. Later boots skip while both still match. The marker is **per environment**: with one marker
+for all of them, promoting a service from dev to prod — which does not touch the shared file —
+skipped validation entirely and the service came up with no topic at all. The service is recorded
+for the same reason and it was the same defect: validation checks settings **derived from the
+service name**, so a rename on an unchanged config used to skip a refusal it should have got.
+
+⚠️ **Two services must not share one `CONFIG_PATH`.** That was always the rule — `marker_dir` is
+the app's own read-write directory — and the cost of breaking it changed: each service now
+overwrites the other's record, so both re-validate and both announce on every boot. A boot that
+replaces a different service's record says so in the process log, naming both — **every boot
+means a shared directory; once means a rename.**
+
+**On failure it logs and raises and does not attempt to alert** — it cannot report a broken
 alerting channel through that channel — and with no `Alerter` installed it validates but withholds
 the marker, so the confirmation is not lost to a boot that could not send it.
 
@@ -148,10 +167,13 @@ the marker, so the confirmation is not lost to a boot that could not send it.
 preserve mtime, so a config restored at an older timestamp was never re-checked: a broken file
 booted clean and the service came up alerting nobody. A digest answers that whatever the clock
 says, in both directions — a restore with different bytes re-validates, an identical one does not.
-Upgrading from a version that wrote an empty marker costs exactly one re-validation — **and one
-confirmation alert per service**, since a re-validation announces. That is not silent: an operator
-upgrading a fleet should expect that alert to arrive on every channel the service has configured,
-so one email and one push per service rather than none.
+Upgrading from a version that wrote an empty marker, or from one whose marker recorded no
+service, costs exactly one re-validation — **and one confirmation alert per service**, since a
+re-validation announces. That is not silent: an operator upgrading a fleet should expect that
+alert to arrive on every channel the service has configured, so one email and one push per
+service rather than none. ⚠️ **Rolling BACK costs the same**, and symmetry is the reason: an
+older release compared the marker's whole text to a bare digest, so a two-line marker does not
+match there either.
 
 ⭐ **And the marker is created `0600`, because contents that decide are contents somebody can
 read.** The digest is taken over the file holding the SMTP password, so a marker the rest of a

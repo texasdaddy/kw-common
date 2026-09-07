@@ -17,6 +17,7 @@ import http.server
 import json
 import logging
 import os
+import smtplib
 import ssl
 import stat
 import subprocess
@@ -468,6 +469,12 @@ READY_CORPUS = [
     "https://例.example/topic",
     "https://\U0001f600.example/topic",
     "https://ntfy.example.com/geheim-töpic",
+    # ⭐ #8: a bracketed IPv6 host with COLON-BEARING USERINFO. Refused by `urlsplit` on a
+    # hardened interpreter and by `_bracketed_host_misplaced` on one without the hardening — so
+    # this belongs in the corpus, where the drift guard measures readiness against the send path
+    # on whichever interpreter is running.
+    "https://tok:hunter2[::1]/topic",
+    "https://tok:hunter2%2540[::1]/topic",
 ]
 
 
@@ -2915,8 +2922,13 @@ def test_the_config_repr_shows_the_password_as_set_or_unset_never_its_value(
     assert "'SMTP_PASSWORD': '<set>'" in shown
     assert "ops@example.com" in shown, "the non-secret fields must stay readable"
     assert "<unset>" in repr(AlertConfig(email={"SMTP_PASSWORD": ""}))
+    # ⚠️ EVERY FIELD, spelled out. A hand-written repr can only omit a field SILENTLY, and the
+    # one it omits is the one nobody notices is missing — so this is the exact string, and adding
+    # a field to `AlertConfig` is meant to fail here rather than quietly stop being printed.
     assert repr(AlertConfig()) == ("AlertConfig(ntfy_url='', email=None, config_file=None, "
-                                   "allow_cleartext_ntfy=False)")
+                                   "allow_cleartext_ntfy=False, logger_name='')")
+    assert repr(AlertConfig(logger_name="svc.alerts")).endswith("logger_name='svc.alerts')"), (
+        "the injected logger name is ordinary configuration and stays readable")
 
 
 @posix_only
@@ -3445,3 +3457,491 @@ def test_the_extracted_surface_is_exported() -> None:
 
 def test_the_port_bounds_are_a_tcp_port() -> None:
     assert (MIN_SMTP_PORT, MAX_SMTP_PORT) == (1, 65535)
+
+
+# ===========================================================================================
+# What the first ADOPTER measured and could only work around — consumer#45, #46, #50, #51, #58 —
+# plus this repository's own #8. Each is fixed in the library because a consumer copy of any of
+# them is the duplication this package exists to end.
+# ===========================================================================================
+
+
+def test_a_separators_only_EMAIL_FROM_disables_the_channel_and_NAMES_the_setting(
+        settings: AlertSettings, caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ consumer#45. `EMAIL_FROM=";"` is non-empty, so a presence check called it configured —
+    and `smtplib` derives the ENVELOPE SENDER from that header, which for `;` is the EMPTY
+    STRING. Most submission servers refuse a null return-path, so every send failed while the
+    boot line said "email + ntfy ready": the dead-while-looking-configured shape, on the sender
+    side, and the exact case issue 36 closed for `EMAIL_TO` alone.
+
+    The measurement the issue reports, re-derived here the way `send_message` derives it, so the
+    premise is proved rather than asserted.
+    """
+    from email.message import EmailMessage
+    from email.utils import getaddresses
+
+    msg = EmailMessage()
+    msg["From"] = ";"
+    assert getaddresses([msg["From"]])[0][1] == "", (
+        "premise: `;` must really produce an empty envelope sender, or this tests nothing")
+
+    write_email_config(settings, EMAIL_FROM=";")
+    with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
+        assert AlertConfig.load(settings).email_ready() is False
+    assert "EMAIL_FROM" in caplog.text
+    assert "missing or unusable" in caplog.text
+    assert ";" not in caplog.text.split("EMAIL_FROM")[0], "the VALUE is never echoed"
+
+
+def test_the_benign_EMAIL_FROM_shapes_the_issue_names_are_left_alone(
+        settings: AlertSettings) -> None:
+    """⚠️ THE OTHER DIRECTION, because the issue is explicit that two of its four measured cases
+    are NOT defects and must not be "fixed": a `;`-separated pair truncates to the first address
+    and delivers, and a comma-separated pair resolves a sensible envelope sender. Both are
+    misconfigurations with reasonable outcomes; only the value that normalises to NOTHING is the
+    broken one. A repair that disabled these would be a behaviour change nobody asked for.
+    """
+    for value in ("bot@x.example;other@y.example", "bot@x.example;",
+                  "bot@x.example,other@y.example", "Alerts <bot@x.example>"):
+        write_email_config(settings, EMAIL_FROM=value)
+        assert AlertConfig.load(settings).email_ready() is True, value
+
+
+def test_a_refused_SMTP_PORT_complains_ONCE_per_distinct_value_not_once_per_send(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ consumer#46, measured: 5 calls to `smtp_port()` produced 5 identical ERROR lines. The
+    config is re-read on every delivered notification — deliberately, so a rotated password takes
+    effect without a restart — so one mistyped port filled the log of any service that alerts
+    often with a single repeated sentence.
+
+    Both directions, because "log once" alone is satisfiable by never logging again: the repeat
+    is silent, and a value CORRECTED and then re-broken complains afresh. That second half is why
+    the memo keys on the value rather than on "have I complained before".
+    """
+    cfg = AlertConfig(email={"SMTP_PORT": "65536"})
+    with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
+        ports = [cfg.smtp_port() for _ in range(5)]
+    assert ports == [alerting.DEFAULT_SMTP_PORT] * 5, "the fallback is unchanged"
+    assert caplog.text.count("SMTP_PORT") == 1, (
+        f"one bad port, five sends, {caplog.text.count('SMTP_PORT')} log lines")
+
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
+        assert AlertConfig(email={"SMTP_PORT": "587"}).smtp_port() == 587
+        AlertConfig(email={"SMTP_PORT": "65536"}).smtp_port()
+    assert caplog.text.count("SMTP_PORT") == 1, (
+        "a port corrected and then re-broken must complain again, or a real recurrence is "
+        "swallowed forever")
+
+    # ...and the boot report never went quiet: it does not consult the memo at all.
+    assert cfg.setting_faults() == [smtp_port_fault("65536")]
+    assert AlertConfig(email={"SMTP_PORT": "65536"}).setting_faults() != []
+
+
+def test_the_SMTP_PORT_memo_tells_EACH_SERVICES_operator_once(
+        caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    """⛔⛔ THE FIRST VERSION OF THIS MEMO WAS A SINGLE GLOBAL HOLDING "the last raw value seen",
+    and the verification gate measured it wrong in BOTH directions:
+
+      * two services in one process with the SAME bad port — the first complained and the second
+        was silenced FOREVER, and since this release also gives each service its own logger, its
+        operator had no stream in which the fault ever appeared;
+      * a HEALTHY config sharing the process evicted the broken one's memo on every call, because
+        the success path wrote it too: 50 sends produced 50 lines, the flood this exists to remove.
+
+    ⚠️ AND IT GOES THROUGH THE REAL SHAPE, not a hand-built one. The first version of this test
+    gave the two services DIFFERENT `config_file` values — which no supported call path in this
+    package produces, because `alerting_env.config_file_for()` hands every service in a process
+    the same `<shared_root>/configs/alerting.env`. It passed while the scenario it named was still
+    broken, which the confirming pass caught. Two services, ONE shared file, their own loggers.
+    """
+    records: dict[str, int] = {"svcA.alerts": 0, "svcB.alerts": 0}
+
+    class Count(logging.Handler):
+        def __init__(self, key: str) -> None:
+            super().__init__()
+            self.key = key
+
+        def emit(self, record: logging.LogRecord) -> None:
+            if "SMTP_PORT" in record.getMessage():
+                records[self.key] += 1
+
+    for key in records:
+        logger = logging.getLogger(key)
+        logger.addHandler(Count(key))
+        monkeypatch.setattr(logger, "level", logging.DEBUG)
+        monkeypatch.setattr(logger, "propagate", False)
+    try:
+        shared = "/srv/shared/configs/alerting.env"      # ONE file, as the convention gives it
+        broken = [AlertConfig(email={"SMTP_PORT": "0"}, config_file=shared, logger_name=name)
+                  for name in records]
+        # A genuinely SEPARATE healthy config — its own file and its own logger, which is the only
+        # way a healthy one differs from a broken one when the port comes from a shared file. It
+        # must evict neither entry; the old global was evicted by exactly this.
+        healthy = AlertConfig(email={"SMTP_PORT": "587"}, config_file="/srv/other/alerting.env",
+                              logger_name="other.alerts")
+        for _ in range(25):
+            for cfg in broken:
+                cfg.smtp_port()
+            healthy.smtp_port()
+    finally:
+        for key in records:
+            for handler in list(logging.getLogger(key).handlers):
+                if isinstance(handler, Count):
+                    logging.getLogger(key).removeHandler(handler)
+
+    assert records == {"svcA.alerts": 1, "svcB.alerts": 1}, (
+        f"each service's own operator must be told exactly ONCE about the shared file's bad port, "
+        f"and a healthy read must evict neither — got {records} across 25 rounds")
+
+    # ⭐ AND THE MIRROR, which the mutation matrix found unpinned: TWO CONFIG FILES, ONE LOGGER.
+    # That is every consumer who has not set `logger_name` — it defaults to `""`, so they all
+    # share the library's own logger — and dropping the config file from the key silences the
+    # second file's fault for exactly them. Both halves of the key are load-bearing, on opposite
+    # populations, so both need a case.
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
+        for _ in range(25):
+            for path in ("/srv/one/alerting.env", "/srv/two/alerting.env"):
+                AlertConfig(email={"SMTP_PORT": "0"}, config_file=path).smtp_port()
+    assert caplog.text.count("SMTP_PORT") == 2, (
+        f"two DIFFERENT config files on the library's own logger must each be reported once — "
+        f"got {caplog.text.count('SMTP_PORT')} line(s):\n{caplog.text}")
+
+    # ...and the same config+logger, corrected then re-broken, complains AFRESH — the property
+    # that made "once per distinct value" preferable to "once per process".
+    #
+    # ⚠️ BOTH HEALTHY READS CLEAR, and the mutation matrix is what found the second one unpinned:
+    # a port can be corrected to a VALID value or REMOVED ALTOGETHER (blank, which falls back to
+    # the default silently), and each takes its own branch. Testing only the valid one let
+    # "the blank path never clears" survive the whole suite — so a port fixed by deleting it and
+    # then mistyped again would have been swallowed forever.
+    for healthy in ("587", "", "   "):
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
+            # ⚠️ EACH ROUND STARTS FROM A HEALTHY READ, not from a broken one. `caplog.clear()`
+            # empties the LOG and not the memo, so an iteration beginning with the same broken
+            # value the previous one ended on is legitimately silent — and a test that counted
+            # that would be measuring its own carry-over rather than the code.
+            for port in (healthy, "0", healthy, "0"):
+                AlertConfig(email={"SMTP_PORT": port}, config_file="/etc/svc.env").smtp_port()
+        assert caplog.text.count("SMTP_PORT") == 2, (
+            f"a port corrected to {healthy!r} and then re-broken must complain again — a real "
+            f"recurrence was swallowed:\n{caplog.text}")
+
+    # ...and a hand-built config with an UNHASHABLE config_file does not raise out of an accessor
+    # that has never raised for one.
+    assert AlertConfig(email={"SMTP_PORT": "0"},
+                       config_file=["/etc/a.env"]).smtp_port() == alerting.DEFAULT_SMTP_PORT
+
+
+def test_the_two_module_level_loggers_are_KEYWORD_ONLY(tmp_path: Path) -> None:
+    """⚠️ THE CHANGELOG PROMISES THIS AND NOTHING ASSERTED IT — the confirming pass reverted the
+    `*` on `read_jsonl_tail` and the entire suite stayed green.
+
+    It matters less than it looks (the parameter is new in 1.5.0, so no released caller can be
+    passing it positionally) and it is asserted anyway, because a promise in the release notes
+    that the signature does not keep is exactly the defect this release already shipped once with
+    `logger_name`. Both spellings, since the same sentence names both.
+    """
+    log = logging.getLogger("kw_common.alerting")
+    assert alerting.read_jsonl_tail(str(tmp_path / "none.log"), 5, logger=log) == []
+    with pytest.raises(TypeError):
+        alerting.read_jsonl_tail(str(tmp_path / "none.log"), 5, "", None, 1,  # type: ignore[misc]
+                                 log)
+
+    config = tmp_path / "some.env"
+    config.write_text("A=1\n", encoding="utf-8")
+    assert alerting.parse_env_file(str(config), logger=log) == {"A": "1"}
+    with pytest.raises(TypeError):
+        alerting.parse_env_file(str(config), log)   # type: ignore[misc]
+
+
+def test_a_hostile_str_subclass_as_the_logger_name_cannot_cost_the_config_load() -> None:
+    """⛔ `isinstance(name, str)` ADMITS A `str` SUBCLASS, which `AlertSettings` accepts and which
+    this module explicitly designs for elsewhere (`_usable_path` is written around "a `str`
+    subclass whose `strip()` lies"). One whose `strip()` RAISES made `_logger_named` raise, inside
+    `AlertConfig.load`, outside any guard — turning a boot report that said "ALERTING
+    UNCONFIGURED" into "ALERTING CONFIG UNREADABLE" and every channel into `"failed"`.
+
+    That is verbatim the outcome `_settings_logger_name` was written to prevent, one call further
+    on, which is where the verification gate found it. Where a record goes is cosmetic; nothing
+    about it may cost a delivery.
+    """
+    class Hostile(str):
+        def strip(self, *args: object) -> str:
+            raise RuntimeError("hostile strip()")
+
+    name = Hostile("svc.alerts")
+    settings = AlertSettings(service="svc", logger_name=name)   # the constructor accepts it
+    assert alerting._logger_named(name) is alerting.log, "a hostile name must fall back, not raise"
+    assert AlertConfig.load(settings).logger_name == name, "the config still loads"
+    assert Alerter(settings)._log is alerting.log
+    # The whole point: the alert still goes out, and readiness still answers.
+    assert Alerter(settings).notify(ERROR, "t", "m") == {"email": "skipped", "ntfy": "skipped"}
+    assert AlertConfig.load(settings).ready_channels() == []
+
+
+def test_a_logger_name_carrying_a_control_character_is_REFUSED_like_a_title_prefix() -> None:
+    """⛔ A LOGGER NAME REACHES EVERY `%(name)s` IN AN OPERATOR'S FORMATTER, so a newline in it
+    FORGES log lines — the class `_parse_env_text`'s own comment warns about — and a name carrying
+    one is not the name any logging configuration was written against, so the records land
+    somewhere nobody is watching, which is this field's whole failure mode.
+
+    `title_prefix` has refused a control character since it was added, for the same reason.
+    Accepting one here while refusing it there was an inconsistency the gate found.
+    """
+    for bad in ("svc\nINJECT", "svc\rx", "a\x00b", "svc\x7f"):
+        with pytest.raises(ValueError, match="control character"):
+            AlertSettings(service="svc", logger_name=bad)
+    AlertSettings(service="svc", logger_name="svc.alerts")      # the ordinary one is fine
+
+
+def test_the_four_pure_helpers_the_adopter_tested_are_EXPORTED_and_the_old_spellings_still_work(
+        ) -> None:
+    """⭐ consumer#50. An adopter imported six `_`-prefixed names from this module because its own
+    suite tested them directly — so six behaviours a consumer depends on sat outside `__all__`
+    and outside semver, and any rename would have been a surprise at runtime rather than a red
+    build.
+
+    The four PURE ones are promised now, the same shape `smtp_port_fault` was exported for. The
+    `_`-prefixed spellings survive as ALIASES so the adopter's existing imports keep working —
+    asserted to be the same object, because two functions would be two behaviours.
+
+    ⚠️ `_CHANNELS` and `_now` are deliberately NOT here, as the issue itself recommends: one is a
+    private structure a consumer should not read and the other is a test seam. Naming them would
+    promise a shape rather than a behaviour.
+    """
+    for name in ("recipients", "parse_env_file", "escalate_gap_hours", "is_cert_failure"):
+        assert name in alerting.__all__, f"{name} is not under semver"
+        assert getattr(alerting, f"_{name}") is getattr(alerting, name), (
+            f"_{name} is a SECOND function rather than an alias, so the two can drift")
+    assert "_CHANNELS" not in alerting.__all__ and "_now" not in alerting.__all__, (
+        "the issue's own recommendation: those two are not the shape to promise")
+    # The behaviour came with the name — a promise to a callable that does nothing is not one.
+    assert alerting.recipients("a@x.example;b@y.example") == "a@x.example, b@y.example"
+    assert alerting.escalate_gap_hours(1) == alerting.ESCALATE_BASE_HOURS
+    assert alerting.is_cert_failure(ssl.SSLCertVerificationError("bad")) is True
+
+
+def test_the_logger_is_INJECTED_so_a_consumer_keeps_its_own_name(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """⭐ consumer#51. A logger NAME is an operator-facing surface — a per-logger level, a filter,
+    a shipper's routing are all written against it — so a service that has always emitted its
+    alerting on its own name cannot have this library silently relocate every record. The adopter
+    kept its name by REBINDING this module's `log` global, which is correct for one consumer per
+    process and last-writer-wins the moment there are two.
+
+    Asserted by capturing REAL records on both loggers: the injected one receives them and the
+    library's own does not. A test that only checked the injected side would pass for an
+    implementation that logged to both.
+    """
+    records: dict[str, list[str]] = {"svc.alerts": [], "kw_common.alerting": []}
+
+    class Capture(logging.Handler):
+        def __init__(self, key: str) -> None:
+            super().__init__()
+            self.key = key
+
+        def emit(self, record: logging.LogRecord) -> None:
+            records[self.key].append(record.getMessage())
+
+    for key in records:
+        logger = logging.getLogger(key)
+        logger.addHandler(Capture(key))
+        monkeypatch.setattr(logger, "level", logging.DEBUG)
+        monkeypatch.setattr(logger, "propagate", False)
+
+    try:
+        settings = AlertSettings(service="svc", logger_name="svc.alerts",
+                                 state_file=str(tmp_path / "state.json"))
+        # `warn_if_unconfigured` logs from the Alerter, and `smtp_port` from the CONFIG — two
+        # different objects, so both are exercised. A config that never saw the settings would
+        # otherwise keep logging to the module.
+        Alerter(settings).warn_if_unconfigured()
+        Alerter(settings).config().smtp_port()
+        AlertConfig(email={"SMTP_PORT": "65536"}, logger_name="svc.alerts").smtp_port()
+    finally:
+        for key in records:
+            for handler in list(logging.getLogger(key).handlers):
+                if isinstance(handler, Capture):
+                    logging.getLogger(key).removeHandler(handler)
+
+    assert records["svc.alerts"], "nothing reached the injected logger"
+    assert any("ALERTING" in line for line in records["svc.alerts"])
+    assert any("SMTP_PORT" in line for line in records["svc.alerts"]), (
+        "the CONFIG logs to the module's own logger, so half the records still relocate")
+    assert records["kw_common.alerting"] == [], (
+        f"records reached the library's logger as well: {records['kw_common.alerting']}")
+
+
+def test_settings_that_PREDATE_the_logger_field_still_load_and_log(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⚠️ AN `Alerter` TAKES ANY SETTINGS-SHAPED OBJECT AND VALIDATES NOTHING — the module says so
+    repeatedly, and a stand-in or a dataclass built before this field exists is a real input. It
+    must fall back to the library's own logger rather than raising `AttributeError` on the
+    alerting path, which is where an exception costs the alert.
+    """
+    class Old:
+        service = "svc"
+        config_file = None
+        ntfy_url = ""
+        state_file = None
+        error_log = None
+
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        assert Alerter(Old()).warn_if_unconfigured() == []  # type: ignore[arg-type]
+    assert "ALERTING UNCONFIGURED" in caplog.text, (
+        "settings without the field must still log, to the module's own logger")
+
+    class Hostile(Old):
+        @property
+        def logger_name(self) -> str:
+            raise RuntimeError("boom")
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting"):
+        assert Alerter(Hostile()).warn_if_unconfigured() == []  # type: ignore[arg-type]
+    assert "ALERTING UNCONFIGURED" in caplog.text, (
+        "a settings object whose logger_name RAISES must not cost the record")
+
+
+@pytest.mark.parametrize("name", ["", "   ", None, 0])
+def test_a_blank_or_unusable_logger_name_means_the_MODULE_logger_never_the_root(
+        name: object) -> None:
+    """⛔ `logging.getLogger("")` IS THE ROOT LOGGER. A settings object carrying an empty string —
+    which is what an unset container Variable looks like — would otherwise route every alerting
+    record to the root, where it inherits whatever the application configured for everything
+    else. Blank means the library's own logger, explicitly.
+    """
+    assert alerting._logger_named(name) is alerting.log
+
+
+def test_a_failed_send_no_longer_logs_the_RECIPIENT_ADDRESS(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ consumer#58, the open half of its #27. `SMTPRecipientsRefused` carries the recipient
+    dict in its `str()`, so a failed email send printed the address VERBATIM — on every alert
+    while the channel was broken, in the log the README tells an operator to fetch and paste into
+    an issue, and in exactly the shape the leak guard's freemail pattern exists to catch.
+
+    Not a credential, which is why the ntfy HOST is still readable; but a personal address
+    repeated once per alert is the class the boot dump already masks, and a redaction that holds
+    in one place and leaks two lines later is what the issue was filed about.
+
+    The vacuity guard is the point: the address must genuinely be in the exception's text, or the
+    absence below is trivially true.
+
+    ⚠️ ASSEMBLED AT RUNTIME, like every other deny-shaped literal in this suite. This file is
+    scanned by the guard that ships beside it, and a freemail address written out whole is a
+    finding of that guard — which is the guard being RIGHT about a public repository, not a false
+    positive. Both guards duly caught the first draft of this line. `.invalid` is reserved by
+    RFC 2606, so nothing here is deliverable anywhere.
+    """
+    address = "someone@" + "gmail.invalid"
+    settings = AlertSettings(service="svc", config_file=str(tmp_path / "alerting.env"))
+    write_email_config(settings, EMAIL_TO=address)
+
+    refusal = smtplib.SMTPRecipientsRefused({address: (550, b"5.1.1 no such user")})
+    assert address in str(refusal), "premise: the exception must really quote the address"
+
+    def refusing(*_a: object, **_k: object) -> None:
+        raise refusal
+
+    monkeypatch.setattr(alerting, "_CHANNELS", (("email", refusing),))
+    with caplog.at_level(logging.DEBUG, logger="kw_common.alerting"):
+        assert Alerter(settings).notify(ERROR, "t", "m") == {"email": "failed"}
+
+    assert address not in caplog.text, "the recipient address reached the process log"
+    assert "<redacted>" in caplog.text, (
+        "nothing was replaced — an empty message would satisfy the assertion above without "
+        "redacting anything")
+    assert "SMTPRecipientsRefused" in caplog.text, "the exception TYPE is what stays diagnostic"
+
+
+def test_the_redactor_covers_the_address_in_BOTH_the_shapes_an_exception_quotes_it() -> None:
+    """The header form is what an operator typed; the BARE form is what `getaddresses` yields and
+    what a server's refusal quotes. Covering only one leaves the other live — the same two-shapes
+    lesson the ntfy topic taught (`/topic` and `topic`).
+
+    `SMTP_USER` stays OUT, deliberately and asserted: it is documented unsecret, it is often a
+    bare word such as `apikey`, and redacting that out of every diagnostic is pure cost.
+    """
+    cfg = AlertConfig(email={"EMAIL_TO": "Ops Team <ops@example.com>, second@example.com",
+                             "EMAIL_FROM": "svc@example.com",
+                             "SMTP_USER": "apikey",
+                             "SMTP_PASSWORD": "pw"})
+    for quoted in ("Ops Team <ops@example.com>, second@example.com", "ops@example.com",
+                   "second@example.com", "svc@example.com"):
+        assert quoted not in alerting._redact(f"refused {quoted}", cfg), quoted
+    assert alerting._redact("logged in as apikey", cfg) == "logged in as apikey", (
+        "SMTP_USER is documented unsecret and redacting a bare word costs every diagnostic")
+
+
+def test_a_bracketed_ipv6_host_with_userinfo_is_refused_on_EVERY_interpreter(
+        monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    """⭐ #8. `https://tok:hunter2[::1]/topic` was refused only because `urlsplit` raises
+    `Invalid IPv6 URL` — and that check (`urllib.parse._check_bracketed_netloc`) shipped in
+    CPython PATCH releases, which `requires-python = ">=3.10"` does not constrain. Measured in
+    the issue: present on 3.10.20 and 3.14.7, ABSENT on 3.12.0. Where it is absent the channel
+    reported READY and was dead on every send.
+
+    ⚠️ THE TEST MUST NOT BE INTERPRETER-DEPENDENT, which is the trap the issue's closing note
+    names: on a hardened build `urlsplit` raises before the new branch is reached, so a test that
+    only drove `ntfy_ready()` would pass for the wrong reason there and prove nothing about the
+    branch. So the hardening is STUBBED OUT — the unhardened interpreter, reproduced — and the
+    pure predicate is asserted directly besides.
+    """
+    hardened = ["https://tok:hunter2[::1]/topic", "https://tok:hunter2%2540[::1]/topic"]
+
+    # The predicate itself: the stdlib's own rule, so the two cannot disagree about a URL.
+    assert alerting._bracketed_host_misplaced("tok:hunter2[::1]") is True
+    assert alerting._bracketed_host_misplaced("[::1]") is False
+    assert alerting._bracketed_host_misplaced("[::1]:8443") is False
+    assert alerting._bracketed_host_misplaced("user@[::1]:8443") is False
+    assert alerting._bracketed_host_misplaced("[::1]junk") is True
+    assert alerting._bracketed_host_misplaced("[::1") is True
+    assert alerting._bracketed_host_misplaced("ntfy.example.com:8443") is False
+
+    # ⛔ THE PERCENT-ENCODED SPELLING, which is the whole reason the predicate is asked of the
+    # RESOLVED host and not of `parts.netloc`. The first version asked the raw netloc and the
+    # verification gate walked past it with this URL: no literal `[` for a raw check to see, while
+    # `urllib` unquotes it and `http.client` is handed `tok:secret[::1]`. It is the same mistake
+    # `%40` and `%2540` made against the two earlier userinfo predicates, and it needs no stub —
+    # `urlsplit` does not raise for it on ANY interpreter, so only the branch can refuse it.
+    for encoded in ("https://tok:secret%5B::1%5D/topic", "https://%5B::1%5Dextra/topic"):
+        assert AlertConfig(ntfy_url=encoded).ntfy_ready() is False, encoded
+
+    # UNHARDENED, reproduced: `urlsplit` accepts the netloc and the branch has to catch it.
+    import urllib.parse
+
+    real_split = urllib.parse.urlsplit
+
+    def unhardened(url: str, *args: object, **kwargs: object) -> object:
+        try:
+            return real_split(url, *args, **kwargs)  # type: ignore[arg-type]
+        except ValueError:
+            # What an interpreter without `_check_bracketed_netloc` returns for these: the parse
+            # succeeds and the netloc is handed on unexamined.
+            scheme, _, rest = url.partition("://")
+            netloc, slash, tail = rest.partition("/")
+            return urllib.parse.SplitResult(scheme, netloc, slash + tail, "", "")
+
+    monkeypatch.setattr(alerting, "urlsplit", unhardened)
+    for url in hardened:
+        with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
+            assert AlertConfig(ntfy_url=url).ntfy_ready() is False, url
+        assert "hunter2" not in caplog.text, "the refusal must never echo the credential"
+        caplog.clear()
+
+    # The vacuity guard: without the stub these are refused by `urlsplit` on a hardened build and
+    # by the branch on an unhardened one — either way False, which is the property that matters.
+    for url in hardened:
+        assert AlertConfig(ntfy_url=url).ntfy_ready() is False, url
+
+
+def test_an_ordinary_bracketed_ipv6_topic_is_still_READY() -> None:
+    """The false-red direction. `https://[::1]/topic` and a port form are legitimate and are in
+    `READY_CORPUS`; a refusal that reached them would disable a working channel."""
+    for url in ("https://[::1]/topic", "https://[::1]:8443/topic", "https://[fe80::1]/t"):
+        assert AlertConfig(ntfy_url=url).ntfy_ready() is True, url

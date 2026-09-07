@@ -9,6 +9,244 @@ exported symbol that changed. ⛔ It does NOT name the consumers that need a cod
 repository is public, and honouring that older promise would publish the fleet's inventory at
 exactly the moment the release notes are read most widely.
 
+## [1.5.0] - 2026-09-06
+
+**This release is a migration brief as much as a changelog.** Five repositories still carry their
+own copy of the leak guard, and the scan-coverage defects a sibling fixed in ITS copy are fixed
+here instead — so the fleet gets them by moving a pin rather than by five hand-ports that each get
+a chance to diverge. Six library-side defects the first adopter could only work around are fixed
+with them.
+
+### ⚠️ WHAT A CONSUMER SHOULD EXPECT WHEN IT BUMPS
+
+**New findings are the fix working, not a regression.** Three of the changes below make a scan
+read something it previously skipped, so a repository whose tree scanned clean on 1.4.1 may
+scan RED on 1.5.0 — a plain-text file wearing an asset's name, a leak on a readable line of a
+file that carries a NUL further in. That is a leak that was always there and was never read.
+Fix the value; do not reach for an allowance.
+
+**And two changes make a scan STOP reddening a tree that is correct.** A repository whose tracked
+files are all genuine assets — an icon set, a fonts package — was refused by 1.4.1 with "ZERO were
+read as text" and no remedy its operator could apply. And a repository that keeps a file named
+after a commit sha at its root (a `format-patch` scratch file, a `git show <sha> > <sha>` dump)
+had its whole `--range` scan die `exited 128`, printing a remedy for a cause that had nothing to
+do with it. Both pass now.
+
+**Two boot-time refusals are new**, and this is the one to read carefully because of WHAT it does
+and WHEN it lands.
+* *What:* both are refusals in `email_ready()` / `ntfy_ready()`, so `warn_if_unconfigured` reports
+  the channel down immediately — and `alerting_env.validate_boot*` RAISES `AlertEnvError`, which
+  the setup document tells adopters to let stop the process. So this is not only "a channel is
+  disabled": a service configured either way **does not start**.
+* *When:* **on the first boot after the bump, for every service.** ⚠️ This is the one paragraph
+  that changed late and it changed in the safer direction, so read it rather than skimming it.
+  1.4.1's new refusal was met LATER — `validate_boot` returns early while the marker records the
+  current config's digest, so a deployment whose `configs/alerting.env` was untouched skipped
+  re-validation and met the refusal at some unrelated later moment. The marker now records the
+  SERVICE as well (#18, below), so no marker written before 1.5.0 matches: every service
+  re-validates exactly once on its first boot after the bump, and that is where both refusals
+  land. A migration that fails is far better than one that fails three months later looking
+  like something else — but it means **the bump itself is when to be watching**, not the next
+  config edit. Roll one service first.
+* *Which:* an `EMAIL_FROM` that normalises to nothing (`";"`), and an ntfy URL with something
+  before the `[` of a bracketed IPv6 host — the shape `urlsplit`'s IPv6 hardening was the only
+  thing refusing, on the interpreters that have it. Real userinfo (`user:pass@[::1]`) was already
+  refused by an older branch and is not what changed.
+* *Cost:* a deployment relying on either was not delivering. ⚠️ Stated exactly rather than
+  absolutely: an `EMAIL_FROM` of `";"` produces a NULL return-path, which **most** submission
+  servers refuse — a relay that accepts one was delivering, and for that deployment this is a
+  behaviour change rather than a fix. Nothing else that was delivering stops.
+
+**One re-validation and one confirmation alert per service, once.** The marker's contents grew a
+line, so every marker an earlier release wrote is now unmatched — which costs exactly one
+validation and one announcement per service, then silence. That alert reaches every channel the
+service has configured, so an operator upgrading the fleet should expect one email and one push
+per service rather than none. It is the same migration 1.3.0 made when the marker stopped being
+empty, and it needs no operator step.
+
+⚠️ **Rolling BACK costs the same, and the first draft of this section said it cost nothing.**
+Line one is still `sha256:<hex>`, so anything reading the FIRST LINE reads the digest — but the
+only reader that exists is this library's own, and 1.3.0–1.4.1 compares the marker's WHOLE text
+to a bare digest, which a two-line marker cannot equal. Measured, not reasoned about. So a
+rollback re-validates and re-announces once per service, exactly as the upgrade does. Cheap and
+symmetric, but a cost rather than the absence of one.
+
+⛔ **Check that no two services share a `CONFIG_PATH` before you bump.** That has always been
+against the rule — `marker_dir` is documented as the app's OWN read-write directory — and the
+COST of breaking it changed here. It used to be quiet and wrong: the second service skipped
+validation on the first service's marker, so its own service-derived settings were never
+checked, which is #18 arriving from the other side. It is now loud: each service overwrites the
+other's record, so both re-validate and both announce on EVERY boot — measured at four alerts
+per boot for two services. Nothing in the library can tell that apart from a legitimate rename,
+which produces the identical marker state and must re-validate, so the behaviour is the same for
+both and the process log is what separates them: a warning is logged when a boot REPLACES a
+different service's record, so **a line that appears on every boot is a shared directory and one
+that appears once is a rename.** A boot that writes no marker — no `Alerter` installed, or a
+refusal — logs nothing, because it has taken nothing from anybody.
+
+**Nothing in any module's `__all__` was removed or renamed.** Four names were added.
+
+**Unchanged, and worth knowing if you have a large tracked asset:** the tree scan reads every
+tracked file's bytes before deciding anything, so peak memory is about twice the largest tracked
+file. That is not new — 1.4.1 does the same, measured — and the suffix list still avoids the read
+in the range and `--staged` scans. It is mentioned only so nobody attributes it to this release.
+
+### Added
+
+- **`AlertSettings(logger_name=...)`, and `load_alert_settings(..., logger_name=...)` /
+  `load_alert_settings_from_env(..., logger_name=...)`.** A logger NAME is an operator-facing
+  surface — a per-logger level, a filter, a shipper's routing are all written against it — so a
+  service that has always emitted its alerting records on its own name could not adopt this
+  library without silently relocating every one of them. The first adopter kept its name by
+  REBINDING this module's `log` global: correct for one consumer in one process, and
+  last-writer-wins the moment there are two. It is injected configuration now, like everything
+  else. `""` (the default) means this module's own logger, and it is inert for every existing
+  caller. ⚠️ A blank or non-string name means the module's logger and never the ROOT one —
+  `logging.getLogger("")` IS the root, which is what an unset container Variable would have
+  produced.
+- **Four pure helpers are exported and under semver: `recipients`, `parse_env_file`,
+  `escalate_gap_hours`, `is_cert_failure`.** The first adopter imported all four by their
+  `_`-prefixed spellings because its own suite tested them directly, so four behaviours a
+  consumer depends on sat outside the contract and any rename would have been a surprise at
+  runtime rather than a red build. The `_`-prefixed spellings survive as ALIASES of the same
+  objects, so existing imports keep working; they are not themselves promised. `_CHANNELS` and
+  `_now` are deliberately NOT exported — one is a private structure a consumer should not read,
+  the other a test seam.
+- **`parse_env_file(..., logger=...)` and `read_jsonl_tail(..., logger=...)`**, both keyword-only
+  (`read_jsonl_tail`'s was not, until the verification gate read this line against the signature
+  and found the claim false), so
+  the two module-level functions that log can be told where. Positional shapes are unchanged.
+
+### Fixed — the leak guard reads what it claimed to read
+
+- **The TREE scan missed a leak that `--range` and `--staged` both caught.** Its binary test asked
+  "is there a NUL ANYWHERE, or does this fail to decode"; git asks "is there a NUL in the first
+  8000 bytes". So a file named `.pdf` holding 9 KB of plain ASCII with one NUL at the end was
+  served as TEXT by git — reported by the range and staged scans, and SKIPPED WHOLE by the tree
+  scan, which is the layer a pre-commit hook runs and the one that runs most often. Measured on
+  1.4.1: `--staged` and `--range` exit 1 naming the line, tree scan exit 0, "1 tracked text files
+  scanned". The window is git's own now, so all three classify a file the same way. A NUL-bearing
+  LINE in such a file is blanked rather than removed, so a finding after it keeps its true line
+  number, and the tree scan discloses the partial read (`PARTLY read`) instead of counting the
+  file as fully scanned.
+- **A latin-1 file under an asset's name is scanned rather than skipped in silence.** A failed
+  UTF-8 decode was treated as "binary", but git serves such a file as text and the range scan has
+  always scanned it with replacement characters — so a latin-1 runbook named `.pdf` was reported
+  by `--range` and cleared by the tree scan. Same file, same verdict, from every scan.
+- **`--staged` no longer resolves one file's name to another file's bytes.** It asked git for
+  `:<path>`, which is a REVISION expression in which `:0:`/`:1:`/`:2:`/`:3:` name a merge STAGE —
+  so a path beginning with one of those prefixes was vouched for by a DIFFERENT file's content and
+  the scan reported clean. It asks for `:0:<path>` now, which makes the remainder unambiguously a
+  path. (Not reachable on Windows, where git refuses a colon in a filename, which is exactly why
+  it had to be ported rather than waited for.)
+- **Anything named `HEAD` beside the repository root no longer kills a scan with a traceback.**
+  git resolves a revision NAME against the filesystem as well as the refs, so a file, an untracked
+  file or a DIRECTORY of that name produced `fatal: ambiguous argument 'HEAD'`, exit 128 — and
+  `--staged` died with a stack trace naming an argument the operator never typed. Every diff and
+  every `rev-list` this engine runs now carries the `--` separator.
+- **The zero-file floor is RETIRED, and that is a repair rather than a removal.** It refused any
+  tree with tracked files where none was read as text — written for the `.pdf`-of-ASCII case,
+  which the change above now READS. What it was left catching was a repository of nothing but
+  genuine assets: a correct tree, reddened, with "add a README" as the only remedy, which is
+  precisely how a guard gets switched off. Every tracked PATH is scanned, so such a run has not
+  looked at nothing, and the verdict says so: `no internal info found (N tracked text files
+  scanned, M tracked path(s) examined)`. ⚠️ **Two success lines changed wording** — that one, and
+  the empty-tree verdict, which is a different string with a semicolon and no `examined` count
+  (`no internal info found (0 tracked text files scanned; <root> has no tracked files at all -
+  check --repo if that is a surprise)`). Anything matching on either needs updating. The empty
+  tree still passes (`git commit --allow-empty` is how a repository is started), which is the one
+  decision here taken differently from the sibling's.
+- **A file named after a commit sha no longer kills the range scan.** `commit_identity` and
+  `commit_message` run `git show -s --format=… <sha>`, and git resolves a revision against the
+  FILESYSTEM as well as the refs — so one file of that name at the root, tracked or not, produced
+  `exited 128` and the scan printed "Fetch the base ref", a remedy for something else entirely.
+  The comment justifying the separator elsewhere claimed a full sha could not collide, which is
+  what left these two calls uncovered; every git call here that takes a revision carries `--` now.
+
+### Fixed — alerting
+
+- **`email_ready()` asks `EMAIL_FROM` the question it already asked `EMAIL_TO`.** A
+  separators-only value is non-empty, so it passed the presence check — and `smtplib` derives the
+  ENVELOPE SENDER from that header, which for `;` is the empty string. Most submission servers
+  refuse a null return-path, so every send failed while the boot line said "email + ntfy ready".
+  The two halves of one hand-edited file were held to different rules. ⚠️ **A new boot refusal**,
+  for a configuration that was not delivering. Two addresses in `EMAIL_FROM` still truncate to the
+  first and deliver, which is a misconfiguration with a reasonable outcome and is left alone.
+- **A refused `SMTP_PORT` complains once per DISTINCT VALUE — per config file, per logger — rather
+  than once per send.** The config is re-read on every delivered notification, deliberately, so a
+  rotated password takes effect without a restart; one mistyped port therefore produced one
+  identical ERROR line per alert, forever. Measured: 5 calls, 5 lines. A value corrected and then
+  re-broken complains afresh, so a real recurrence is not swallowed, and the boot report
+  (`setting_faults()`) carries the fault regardless. ⚠️ Two services in one process share the
+  fleet's single `alerting.env`, so they share the FAULT — the logger is part of the key precisely
+  so each service's own operator is told once, rather than the first one to ask taking the only
+  line. On the fleet's shape that means N services, N lines, then silence.
+- **A failed email send no longer logs the RECIPIENT ADDRESS verbatim.** `SMTPRecipientsRefused`
+  carries the recipient dict in its `str()`, so a broken channel printed the address on every
+  alert — in the log an operator is told to fetch and paste into an issue, and in exactly the
+  shape this package's own leak guard exists to catch. The resolved `EMAIL_TO`/`EMAIL_FROM`
+  addresses join the redaction set, in both the header form an operator typed and the bare form an
+  exception quotes. `SMTP_USER` stays out, documented unsecret: it is often a bare word such as
+  `apikey`, and redacting that from every diagnostic is pure cost.
+- **`ntfy_ready()` refuses a bracketed IPv6 host carrying userinfo on EVERY interpreter (#8).**
+  That URL was refused only because `urlsplit` raises `Invalid IPv6 URL`, and that check shipped
+  in CPython PATCH releases — which `requires-python = ">=3.10"` does not constrain. Measured:
+  present on 3.10.20 and 3.14.7, absent on 3.12.0, where the channel reported READY and was dead
+  on every send. The refusal mirrors the stdlib's own rule rather than adding a fourth
+  hand-written host-shape predicate, so the two cannot disagree about a URL. ⚠️ A new boot
+  refusal on the interpreters that lacked the check; an ordinary `https://[::1]/topic` is
+  unaffected.
+- **The validation marker records the SERVICE that validated, not only the config and the
+  environment (#18).** `_check_usable` validates settings DERIVED FROM THE SERVICE NAME — the ntfy
+  key it looks up, and the title prefix that becomes an HTTP header — so "this configuration has
+  been validated" was never a fact about the file and the environment alone. Renaming a service
+  while `CONFIG_PATH`, `DEPLOY_ENV` and the config's bytes stayed put left the marker matching, so
+  the refusal a fresh marker directory produces was skipped and the service came up with a title
+  prefix that fails every ntfy send. It is the same defect the per-environment marker fixed, with
+  `service` in the place of `env`. ⚠️ **In the CONTENTS, not the filename** — the ops-alerting
+  standard fixes the name at `.alerting-validated-<env>`, so line one is still `sha256:<hex>` and
+  nothing else, and anything reading the FIRST LINE reads the digest correctly — which is not
+  the same as backward compatible; see the rollback note above.
+  Line two is `service:"<name>"`, JSON-encoded so that a name carrying a quote, a non-ASCII
+  letter or a control character cannot split into a line the parser could never read back — which
+  would be a marker that matches nothing forever, re-announcing on every boot. `json.loads` is
+  also recursive and `RecursionError` is not a `ValueError`, so the reader refuses any payload
+  that does not open with a quote before the parser sees it — a marker of two thousand `[` used
+  to leave `validate_boot` as a bare traceback, past the `except AlertEnvError` the setup
+  document tells adopters to write. See the migration note above: this is what makes every
+  service re-validate once, and the two notes beside it for the rollback and the shared
+  `CONFIG_PATH`.
+- **A `logger_name` that raises cannot cost a config load.** Found while adding the field: a
+  bare `getattr(settings, "logger_name", "")` suppresses only `AttributeError`, so a property
+  raising anything else propagated out of `AlertConfig.load` and turned a boot report that said
+  "ALERTING UNCONFIGURED" into "ALERTING CONFIG UNREADABLE". Read through a helper that never
+  raises, the same contract `_title_prefix` has had for the same reason.
+
+### Changed
+
+- `repr(AlertConfig)` prints the new `logger_name` field. `SMTP_PASSWORD` stays masked.
+
+### Declared rather than closed
+
+- **#26** — a binary suffix plus ONE NUL inside git's 8000-byte window still hides plain text from
+  every scan. The residual of the narrowed suffix rule, measured, with the three ways to close it
+  and what each costs.
+- **#27** — the range and `--staged` scans blank a NUL-bearing line without disclosing it, where
+  the tree scan says so. `parse_diff` cannot currently tell that case from an ordinary binary
+  diff.
+- **#28** — a clean latin-1 file reds the TREE scan while `--staged` and `--range` clear it, and
+  the same bytes under a binary-hinting NAME pass all three. Measured identical on 1.4.1, so this
+  release neither introduced nor widened it; closing it means deciding whether a non-UTF-8 file at
+  an ordinary path should be scanned with replacement characters or stay refused, which is a
+  behaviour change of its own.
+- **The annotated-tag SCOPE differs from the sibling's, deliberately.** This engine scans the tag
+  object the RANGE NAMES; the sibling scans a tag pointing at a commit in the range. Neither is a
+  defect and the difference is measurable: a tag cut at an ALREADY-PUSHED commit (the ordinary
+  release gesture, where the range covers zero commits) is scanned here and is a stated gap there,
+  while a tag on an in-range commit that the push does not send is scanned there and not here.
+  CI passes `$GITHUB_REF`, so the release path is covered. Ref NAMES are scanned by no layer —
+  see the note in `refs_being_published`.
+
 ## [1.4.1] - 2026-09-05
 
 The audit pass: the open issue list measured against the published wheel and burned down, and a
@@ -794,6 +1032,7 @@ every service runs the same code instead of a copy that drifts.
   cannot disagree. Calling the function directly with `backups=None` raises; see issue #5.
   *(Superseded: 1.4.1 accepts `None` as that sentinel again.)*
 
+[1.5.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.5.0
 [1.4.1]: https://github.com/texasdaddy/kw-common/releases/tag/v1.4.1
 [1.4.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.4.0
 [1.3.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.3.0

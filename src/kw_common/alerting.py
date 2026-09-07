@@ -125,8 +125,9 @@ WHAT THIS MODULE WILL NOT PUT IN A LOG
 
     1. **Refusals at the source.** A URL with userinfo and a non-ASCII SMTP credential are both
        rejected before the code that would quote them is reached. Neither ever worked.
-    2. **Redaction of what remains** (`_redact`), covering `SMTP_PASSWORD` and the topic URL.
-       Read its docstring for what it does NOT catch, which is the part that matters.
+    2. **Redaction of what remains** (`_redact`), covering `SMTP_PASSWORD`, the topic URL, and
+       the resolved `EMAIL_TO` / `EMAIL_FROM` addresses. Read its docstring for what it does NOT
+       catch, which is the part that matters.
     3. **Shape, never value**, wherever this module describes a setting the ALERTING PATH
        rejected — see `_fault_shape`. Scoped deliberately: `AlertSettings.__post_init__` does
        echo the value of a rejected integer sizing knob, which is a construction-time refusal an
@@ -136,12 +137,25 @@ WHAT THIS MODULE WILL NOT PUT IN A LOG
     None of this reaches what a CALLER puts in a title or a message. Sanitise at the raise site,
     where the value is understood.
 
-    ⚠️ AND "ITS OWN CONFIGURATION" IS SCOPED TO THE TWO VALUES `_secret_values` NAMES — the
-    SMTP password and the topic URL. `EMAIL_TO`, `EMAIL_FROM` and `SMTP_USER` are NOT redacted,
-    and smtplib quotes them: `SMTPSenderRefused` carries the sender, `SMTPRecipientsRefused` the
-    recipients, and a relay that echoes the login name puts `SMTP_USER` into
-    `SMTPAuthenticationError`. Those are addresses rather than credentials, and the line is a
-    diagnostic an operator needs — stated here so the claim above is not read as wider than it is.
+    ⚠️ AND "ITS OWN CONFIGURATION" IS SCOPED TO WHAT `_secret_values` NAMES — the SMTP password,
+    the topic URL, and (since 1.5.0) the RESOLVED `EMAIL_TO` / `EMAIL_FROM` addresses. This
+    paragraph used to say the addresses were NOT redacted, on the grounds that they are addresses
+    rather than credentials and the line is a diagnostic an operator needs. That was the right
+    reading until the address turned out to repeat on EVERY alert while a channel is broken —
+    `SMTPRecipientsRefused` carries the recipient dict in its `str()` — in the log the README
+    tells an operator to fetch and paste into an issue, which is the freemail shape this
+    package's own leak guard exists to catch (consumer#58).
+
+    ⚠️ ONE CONSEQUENCE WORTH KNOWING, because the obvious summary of it is wrong. `SMTP_USER` is
+    not in the set as a KEY, deliberately: it is often a bare word such as `apikey`, and redacting
+    that from every diagnostic is pure cost. But `AlertConfig.load` defaults `SMTP_USER` to
+    `EMAIL_FROM` when that is a bare mailbox — the documented, recommended shape — so in the
+    ordinary deployment its VALUE is in the set via the `EMAIL_FROM` entry, and a relay that
+    echoes the login name has it redacted out of `SMTPAuthenticationError`. The exception TYPE
+    and everything else in the line survive.
+
+    The HOST is still not redacted, which is what keeps the TLS branch diagnostic — see
+    `_secret_values`.
 
 INVARIANTS
     - `notify()` NEVER raises. Alerting that can crash its caller is worse than no alerting.
@@ -202,6 +216,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.message import EmailMessage
+from email.utils import getaddresses
 from urllib.parse import urlsplit
 
 __all__ = [
@@ -220,6 +235,15 @@ __all__ = [
     "smtp_port_fault",
     "parse_since",
     "read_jsonl_tail",
+    # ⭐ THE FOUR PURE HELPERS THE FIRST ADOPTER TESTED DIRECTLY (consumer#50). Each is a
+    # classifier or a normaliser with no state and no I/O beyond the file `parse_env_file` is
+    # handed — the same shape `smtp_port_fault` was exported for. The `_`-prefixed spellings
+    # survive as aliases for the code that imported them before they were promised; they are
+    # not themselves under semver.
+    "recipients",
+    "parse_env_file",
+    "escalate_gap_hours",
+    "is_cert_failure",
     "EMAIL_KEYS",
     "EMAIL_REQUIRED",
     "DEFAULT_SMTP_PORT",
@@ -236,6 +260,103 @@ __all__ = [
 ]
 
 log = logging.getLogger("kw_common.alerting")
+
+
+def _logger_named(name: object) -> logging.Logger:
+    """The logger an `Alerter` or `AlertConfig` writes to: the one `AlertSettings.logger_name`
+    names, or this module's own when that is blank or unusable.
+
+    ⭐ A LOGGER NAME IS CONFIGURATION, AND CONFIGURATION IS INJECTED (consumer#51). A per-logger
+    level, a filter, a log shipper's routing — all of it is written against the NAME, so a
+    service that has always emitted its alerting records on `alerting` cannot move them to
+    `kw_common.alerting` without silently breaking what an operator configured. The first adopter
+    kept its name by REBINDING this module's `log` global — correct for one consumer per process,
+    and last-writer-wins the moment there are two. This is the injected form.
+
+    ⚠️ `log` IS LOOKED UP AT CALL TIME, not captured. That is what keeps the rebind working for
+    the consumer that still does it: with no name injected, every record goes wherever the module
+    global points at the moment of the call. Not a promise — the injected name is the contract —
+    but not broken either, on purpose.
+
+    A non-string or blank name means the module logger, and NOT the root logger: `getLogger("")`
+    IS the root, and routing every alerting record to the root because a settings object carried
+    an empty string — which is what an unset container Variable looks like — would be the
+    silent-relocation failure this exists to prevent. ⚠️ Scoped exactly: `logger_name="root"` is
+    the root logger, because that is what `logging` means by the name, and this refuses a BLANK
+    rather than pretending to police which logger a consumer may deliberately choose.
+
+    ⛔ THE `try` IS NOT DECORATION. `isinstance(name, str)` admits a `str` SUBCLASS, which
+    `AlertSettings` accepts and which this module explicitly designs for elsewhere (`_usable_path`
+    is written around "a `str` subclass whose `strip()` lies"). One whose `strip()` RAISES made
+    this function raise, inside `AlertConfig.load`, outside any guard — turning a boot report that
+    said "ALERTING UNCONFIGURED" into "ALERTING CONFIG UNREADABLE" and every channel into
+    `"failed"`. That is verbatim the outcome `_settings_logger_name` was written to prevent, one
+    call further on, and the verification gate found it there. Where the alert goes is cosmetic;
+    nothing about it may cost a delivery.
+    """
+    try:
+        return logging.getLogger(name) if isinstance(name, str) and name.strip() else log
+    except Exception:  # noqa: BLE001 — resolving a logger must never be the failure
+        return log
+
+
+def _settings_logger_name(settings: object) -> str:
+    """`settings.logger_name`, or `""`. NEVER raises — the same contract, for the same reason, as
+    `_title_prefix` one section down.
+
+    ⭐⭐ DEFENSIVE BECAUSE THE MODULE ALREADY LEARNED THIS ONCE. "An `Alerter` takes any
+    settings-shaped object and validates nothing": a stand-in without the attribute, a dataclass
+    predating it, or a `property` that raises are all real inputs. `getattr(…, "")` covers only
+    the FIRST of those — a default suppresses `AttributeError` and nothing else — so a property
+    raising anything else propagated out of `AlertConfig.load` and cost the whole config load.
+    Measured while adding the field: a hostile `logger_name` turned a boot report that had said
+    "ALERTING UNCONFIGURED" into "ALERTING CONFIG UNREADABLE".
+
+    Where the alert goes in the log is COSMETIC, exactly as the title prefix is. Nothing about it
+    may cost a delivery or a diagnostic, so anything unusable means the library's own logger.
+    """
+    try:
+        name = getattr(settings, "logger_name", "")
+    except Exception:  # noqa: BLE001 — a logger NAME must never be the failure
+        return ""
+    return name if isinstance(name, str) else ""
+
+
+# ⭐ THE `SMTP_PORT` COMPLAINT IS MADE ONCE PER DISTINCT VALUE, PER CONFIG (consumer#46).
+# The config file is re-read on every delivered notification — deliberately, so a rotated password
+# takes effect without a restart — and `smtp_port()` is asked on every send, so one mistyped port
+# produced one identical ERROR line per alert, forever. A service alerting every few minutes filled
+# its log with a single sentence.
+#
+# ⛔⛔ KEYED ON (WHERE THE VALUE CAME FROM, WHERE THE COMPLAINT GOES), AND WRITTEN ONLY WHEN A
+# FAULT IS REPORTED. The first version was a single global holding "the last raw value seen", on
+# the reasoning that the config it memoises is the one shared file. That reasoning was wrong twice
+# over, and the verification gate measured both:
+#
+#   * TWO SERVICES IN ONE PROCESS with the same bad port: the first complained, and the second was
+#     silenced FOREVER by the first service's memo — with the per-service loggers this release also
+#     ships, its operator had no stream in which the fault ever appeared. The message names neither
+#     the service nor the file, so even the surviving line could not be attributed.
+#   * A HEALTHY CONFIG SHARING THE PROCESS evicted the broken one's memo on every call, because the
+#     success path wrote it too: 50 sends produced 50 lines, which is the flood this exists to
+#     remove.
+#
+# ⚠️ AND THE LOGGER IS PART OF THE KEY, WHICH THE SECOND VERSION MISSED. Keyed on `config_file`
+# alone it still failed the first case for THIS LIBRARY'S OWN DEPLOYMENT SHAPE: `config_file_for()`
+# hands every service in a process the same `<shared_root>/configs/alerting.env`, so two services
+# share one key and the second one's operator — watching their own logger — still never sees the
+# fault. The confirming pass caught that, and it is the same mistake one level up: reasoning about
+# the key from what the value IS rather than from who needs to be told. One line per audience.
+#
+# So the entry is cleared when THAT config reads healthy, which keeps the property that beat "log
+# once per process": a value corrected and then re-broken complains again, while a value left
+# broken is quiet after the first line.
+#
+# Bounded by (config files x logger names) in a process, i.e. the number of services. ⚠️ Not
+# synchronised, like the rest of this module: two threads racing the same key can produce a
+# duplicate line, which is stated rather than claimed away. The boot report (`setting_faults`)
+# never consults this, so an operator who pages on it sees the fault whatever this does.
+_COMPLAINED_SMTP_PORT: dict[tuple[str | None, str], str] = {}
 
 # --- severity ------------------------------------------------------------------------------
 OK = "OK"
@@ -413,13 +534,18 @@ def _safe_text(exc: BaseException) -> str:
 def _secret_values(cfg: AlertConfig) -> list[str]:
     """Every value in THIS config that must not appear in a log line.
 
-    Two things, and the reasoning differs for each:
+    Three things, and the reasoning differs for each:
 
     * **`SMTP_PASSWORD`** — a secret in the ordinary sense.
     * **The ntfy topic URL, its path and any userinfo** — a topic URL is a WRITE CAPABILITY, not
       an address: whoever holds it can page the operator. The module already refuses to echo it
       from `ntfy_ready()`'s own failure branches; this is the same rule applied to text that
       arrives from somewhere else.
+    * **The resolved `EMAIL_TO` / `EMAIL_FROM` addresses** — NOT capabilities, and included on a
+      different argument: `SMTPRecipientsRefused` and `SMTPSenderRefused` quote them, so a broken
+      channel repeated a personal address once per alert into the log an operator is told to paste
+      into an issue (consumer#58). Both the raw setting and each bare address inside it, because
+      the exception quotes the bare form and the operator wrote the header form.
 
     The HOST is deliberately NOT in the set: it is not itself the capability, and it is the half
     of the URL an operator needs in order to act. The example this used to give was wrong and is
@@ -444,6 +570,24 @@ def _secret_values(cfg: AlertConfig) -> list[str]:
     # UNANSWERABLE, and `_redact`'s own handler turns that into suppressing the text — which is
     # the safe direction. Catching it here would silently redact nothing instead.
     add(email.get("SMTP_PASSWORD"))
+    # ⭐ THE ADDRESSES TOO (consumer#58). `SMTPRecipientsRefused` carries the recipient dict in its
+    # `str()`, so a failed send printed the address VERBATIM on every alert while the channel was
+    # broken — in the log the README tells an operator to paste into an issue, and the exact
+    # shape the guard's freemail pattern exists to catch. Not a credential, which is why the
+    # HOST is still not here; but a personal address repeated once per alert is the class the
+    # boot dump masks, and a redaction that holds in one place and leaks two lines later is the
+    # asymmetry the issue was filed about. Both the raw setting and each bare address inside it,
+    # because the exception quotes the bare form and an operator wrote the header form.
+    # `SMTP_USER` stays out, deliberately: it is documented unsecret, it is often a bare word
+    # (`apikey`), and redacting a word out of every diagnostic is the over-redaction cost with
+    # none of the benefit.
+    for key in ("EMAIL_TO", "EMAIL_FROM"):
+        value = email.get(key)
+        if isinstance(value, str) and "@" in value:
+            add(value)
+            for _, address in getaddresses([recipients(value)]):
+                if "@" in address:
+                    add(address)
 
     url = cfg.ntfy_url
     if isinstance(url, str) and url.strip():
@@ -542,6 +686,11 @@ class AlertSettings:
                    which turns a cleartext topic into an unconfigured channel. See `ntfy_ready()`
                    for why a topic URL is treated as a credential rather than an address.
 
+    `logger_name`  the `logging` logger this service's alerting records are written to. `""`
+                   (the default) means this module's own, `kw_common.alerting`. A service that
+                   has always logged its alerting on its own name keeps it here rather than by
+                   rebinding a module global — see `_logger_named`.
+
     The remaining fields are the sizing knobs. They are constructor arguments rather than module
     constants a consumer is expected to edit after install, because an edited install is a fork.
     """
@@ -573,6 +722,10 @@ class AlertSettings:
     # title. A condition's identity must not change when its deployment does, or promoting a
     # service from dev to prod re-fires every escalating condition it had already reported.
     title_prefix: str = ""
+    # ⭐ APPENDED, defaulted to "" so it is inert for every existing caller (consumer#51). The
+    # NAME of the logger, not a logger object: settings are frozen, picklable data, and a name is
+    # what an operator's logging configuration is written against.
+    logger_name: str = ""
 
     def __post_init__(self) -> None:
         # Raising here is deliberate and does NOT weaken the "notify() never raises" invariant:
@@ -674,6 +827,30 @@ class AlertSettings:
                 f"{type(self.allow_cleartext_ntfy).__name__} — note that a non-empty string such "
                 f"as 'false' is TRUE to Python, so it is refused rather than honoured backwards")
 
+        # A `str` and nothing else, for the same reason `title_prefix` is: `None` is the obvious
+        # thing to reach for when a caller means "the default", and `logging.getLogger(None)` is
+        # the ROOT logger — every alerting record silently relocated to the root at boot.
+        if not isinstance(self.logger_name, str):
+            raise ValueError(
+                f"AlertSettings.logger_name must be a string ('' for this module's own logger), "
+                f"got {type(self.logger_name).__name__}")
+        # ⭐ AND NOT A CONTROL CHARACTER, for the same reason `title_prefix` refuses one — and it
+        # was inconsistent to refuse it there and accept it here. A logger NAME reaches every
+        # `%(name)s` in an operator's formatter, so a `\n` in it FORGES log lines, which is the
+        # class `_parse_env_text`'s own comment warns about; and a name carrying one is not the
+        # name any logging configuration was written against, so the records silently land
+        # somewhere nobody is watching — this field's whole failure mode.
+        # ⚠️ `str(...)` FIRST. `isinstance` above admits a `str` SUBCLASS, and this module designs
+        # for hostile ones elsewhere — one whose `__iter__` raises would otherwise escape this
+        # scan as a `RuntimeError` where every other refusal in this constructor is a `ValueError`.
+        # The confirming pass found the two repairs in one diff taking opposite stances on the
+        # same input class; this is the one that had to move.
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in str.__str__(self.logger_name)):
+            raise ValueError(
+                "AlertSettings.logger_name contains a control character. It is interpolated into "
+                "every log record as %(name)s, so a newline in it forges log lines — and it is "
+                "not a name any logging configuration can be written against.")
+
 
 def _is_bare_mailbox(value: str) -> bool:
     """Whether `value` is a plain `local@domain` an SMTP relay could authenticate as.
@@ -704,10 +881,15 @@ def _is_bare_mailbox(value: str) -> bool:
 
 
 # --- the shared config file --------------------------------------------------------------------
-def _parse_env_file(path: str) -> dict[str, str]:
+def parse_env_file(path: str, *, logger: logging.Logger | None = None) -> dict[str, str]:
     """Parse a KEY=VALUE file. Blank lines, `#` comments, an `export ` prefix and surrounding
     quotes are all tolerated, because this file is hand-edited by an operator. A missing file
-    is not an error — it means the channel is unconfigured, which the caller reports."""
+    is not an error — it means the channel is unconfigured, which the caller reports.
+
+    `logger` is where the one warning this can emit goes; `None` means this module's own. It is
+    a keyword so the positional shape the first adopter tested against is unchanged.
+    """
+    lg = logger or log
     values: dict[str, str] = {}
     try:
         # ⭐ `newline=""` DISABLES universal-newline translation, and it is HALF of the fix —
@@ -734,10 +916,15 @@ def _parse_env_file(path: str) -> dict[str, str]:
         # UnicodeDecodeError is NOT theoretical and NOT an OSError: this file is hand-edited by
         # an operator, and one accented character saved as cp1252 (or a UTF-16 save) used to
         # raise straight out through notify() and kill the caller's loop.
-        log.warning("alert config %s unreadable (%s) — email alerts disabled until it is fixed",
-                    path, type(exc).__name__)
+        lg.warning("alert config %s unreadable (%s) — email alerts disabled until it is fixed",
+                  path, type(exc).__name__)
         return values
     return _parse_env_text(raw)
+
+
+# The spelling the first adopter imported before this was exported (consumer#50). An alias, not
+# a second function, and not under semver: the promised name is the one in `__all__`.
+_parse_env_file = parse_env_file
 
 
 def _parse_env_text(raw: str) -> dict[str, str]:
@@ -792,7 +979,7 @@ def _parse_env_text(raw: str) -> dict[str, str]:
 _RECIPIENT_SEPARATORS = re.compile(r"[,;]")
 
 
-def _recipients(raw: str) -> str:
+def recipients(raw: str) -> str:
     """`EMAIL_TO` as a `To` header smtplib can actually derive recipients from.
 
     ⭐ A `;` in `EMAIL_TO` — a single stray keystroke — used to cost alerts silently.
@@ -847,6 +1034,9 @@ def _recipients(raw: str) -> str:
     """
     parts = (part.strip() for part in _RECIPIENT_SEPARATORS.split(raw))
     return ", ".join(part for part in parts if part)
+
+
+_recipients = recipients   # the pre-export spelling (consumer#50); an alias, not a contract
 
 
 def _fault_shape(raw: str) -> str:
@@ -911,6 +1101,24 @@ def smtp_port_fault(raw: str) -> str:
             f"default {str(DEFAULT_SMTP_PORT)!r}")
 
 
+def _bracketed_host_misplaced(netloc: str) -> bool:
+    """Does a `[` in the host part of `netloc` sit anywhere but at its start, or is its `]`
+    followed by something other than `:<port>`? The rule `urllib.parse._check_bracketed_netloc`
+    enforces on a patched interpreter, mirrored so an unpatched one reaches the same verdict (#8).
+
+    `rpartition("@")` because the userinfo is the part that carries the colon the issue is about;
+    the stdlib splits the same way. A netloc with no `[` is not this function's question.
+    """
+    hostport = netloc.rpartition("@")[2]
+    before, has_bracket, rest = hostport.partition("[")
+    if not has_bracket:
+        return False
+    if before:
+        return True
+    _, closed, after = rest.partition("]")
+    return not closed or (bool(after) and not after.startswith(":"))
+
+
 @dataclass(frozen=True)
 class AlertConfig:
     """A resolved snapshot of both channels' settings."""
@@ -921,6 +1129,14 @@ class AlertConfig:
     # Appended for the same reason `AlertSettings.allow_cleartext_ntfy` is: a field's position is
     # the constructor signature. `AlertConfig(url, email, path)` still means what it meant.
     allow_cleartext_ntfy: bool = False
+    # Appended likewise. Carried here because the readiness checks and the send path log from a
+    # CONFIG, which does not see the settings it was loaded from (consumer#51).
+    logger_name: str = ""
+
+    @property
+    def _log(self) -> logging.Logger:
+        """Where this config's readiness refusals and send-path warnings go."""
+        return _logger_named(self.logger_name)
 
     def __repr__(self) -> str:
         """The dataclass repr with `SMTP_PASSWORD` shown as `<set>`/`<unset>`, never its value.
@@ -947,7 +1163,8 @@ class AlertConfig:
                      for key, value in email.items()}
         return (f"AlertConfig(ntfy_url={self.ntfy_url!r}, email={email!r}, "
                 f"config_file={self.config_file!r}, "
-                f"allow_cleartext_ntfy={self.allow_cleartext_ntfy!r})")
+                f"allow_cleartext_ntfy={self.allow_cleartext_ntfy!r}, "
+                f"logger_name={self.logger_name!r})")
 
     @classmethod
     def load(cls, settings: AlertSettings) -> AlertConfig:
@@ -957,22 +1174,33 @@ class AlertConfig:
         moving the inbox in it takes effect WITHOUT restarting the service. The cost is one small
         file read per notification.
         """
+        # `_settings_logger_name`, not `settings.logger_name`: an `Alerter` takes any
+        # settings-shaped object, and one predating this field — or one whose property raises —
+        # must keep loading exactly as it did. See that function for what a bare `getattr` missed.
+        logger_name = _settings_logger_name(settings)
+        lg = _logger_named(logger_name)
         path = _usable_path(settings.config_file)
         parsed: dict[str, str] = {}
         if path is not None:
             try:
-                parsed = _parse_env_file(path)
-            except Exception as exc:  # the FILE is the email channel's own config source
+                parsed = parse_env_file(path, logger=lg)
+            # ⚠️ THE SUPPRESSION BELOW IS NEW AND HIDES NOTHING REAL. BLE001 exempts a blind
+            # `except` whose handler LOGS the exception, and it recognised that by tracking this
+            # module's `logging.getLogger` global. Now that the logger is resolved from the
+            # settings (consumer#51) ruff cannot see one, so the exemption it used to grant has
+            # to be written out. The handler still logs with `exc_info`; nothing else changed.
+            # The three siblings below carry the same suppression for the same reason.
+            except Exception as exc:  # noqa: BLE001 — the FILE is the email channel's own config
                 # Anything at all that goes wrong reading the file belongs to the EMAIL channel.
                 # Letting it out of here would take ntfy — whose config is a plain string and is
                 # perfectly fine — down with it, which is the exact failure this keeps relearning.
                 # Loading config is not a channel, so it gets its own boundary. `exc_info` because
                 # "could not be read" is what an operator's bad file looks like AND what a bug in
                 # the parser looks like, and without the traceback the second kind is invisible.
-                log.error("alert config %s could not be read (%s) — email alerts DISABLED; other "
-                          "channels are unaffected. If the file is fine, this is a bug in the "
-                          "parser; the traceback says which.", path, type(exc).__name__,
-                          exc_info=True)
+                lg.error("alert config %s could not be read (%s) — email alerts DISABLED; other "
+                      "channels are unaffected. If the file is fine, this is a bug in the "
+                      "parser; the traceback says which.", path, type(exc).__name__,
+                      exc_info=True)
                 parsed = {}
         email = {k: parsed.get(k, "").strip() for k in EMAIL_KEYS}
         # ⭐ `SMTP_USER` IS OPTIONAL AND DEFAULTS TO `EMAIL_FROM`. They are the same value in this
@@ -1008,7 +1236,8 @@ class AlertConfig:
         return cls(ntfy_url=settings.ntfy_url or "",
                    email=email,
                    config_file=path,
-                   allow_cleartext_ntfy=_opted_into_cleartext(settings))
+                   allow_cleartext_ntfy=_opted_into_cleartext(settings),
+                   logger_name=logger_name)
 
     # --- readiness (blank gating) ---------------------------------------------------------
     def ntfy_ready(self) -> bool:
@@ -1045,14 +1274,15 @@ class AlertConfig:
         NOTHING here echoes the URL. It is a capability, so every branch names the shape of the
         problem and stops there.
         """
+        lg = self._log
         if not self.ntfy_url:
             return False
         if _UNSAFE_IN_URL.search(self.ntfy_url):
             # Whitespace or a control character survives urlsplit but makes http.client raise
             # `InvalidURL`, whose message quotes the path — which would print the topic, a
             # capability, into the log the rest of this module is careful to keep it out of.
-            log.error("the ntfy URL contains whitespace or a control character — ntfy alerts "
-                      "are DISABLED until it is fixed")
+            lg.error("the ntfy URL contains whitespace or a control character — ntfy alerts "
+                     "are DISABLED until it is fixed")
             return False
         try:
             parts = urlsplit(self.ntfy_url)
@@ -1063,12 +1293,12 @@ class AlertConfig:
             # notification too, which is exactly what the fan-out exists to prevent.
             # The CLASS NAME only, deliberately: urlsplit's message quotes the offending host,
             # and the topic URL is a capability. Do not "improve" this by logging `exc`.
-            log.error("the ntfy URL is not parseable (%s) — ntfy alerts are DISABLED "
-                      "until it is fixed", type(exc).__name__)
+            lg.error("the ntfy URL is not parseable (%s) — ntfy alerts are DISABLED "
+                     "until it is fixed", type(exc).__name__)
             return False
         if parts.scheme not in ("http", "https") or not parts.netloc:
-            log.error("the ntfy URL must be the FULL topic URL (https://<host>/<topic>), not a "
-                      "bare topic — ntfy alerts are DISABLED until it is fixed")
+            lg.error("the ntfy URL must be the FULL topic URL (https://<host>/<topic>), "
+                           "not a bare topic — ntfy alerts are DISABLED until it is fixed")
             return False
         if not parts.path.isascii() or not parts.query.isascii():
             # ⭐ THE SMTP CREDENTIAL REFUSAL'S MISSING SIBLING. `http.client` encodes the request
@@ -1084,9 +1314,9 @@ class AlertConfig:
             # comment claimed `http.client` IDNA-encodes the host so a non-ASCII hostname works.
             # Measured: it does not, because `urllib` pre-adds the `Host` header and the IDNA
             # branch is skipped.)
-            log.error("the ntfy URL's topic contains a non-ASCII character, which http.client "
-                      "cannot put in a request line and whose failure would print it — ntfy "
-                      "alerts are DISABLED until it is fixed. Percent-encode the topic.")
+            lg.error("the ntfy URL's topic contains a non-ASCII character, which http.client "
+                     "cannot put in a request line and whose failure would print it — ntfy "
+                     "alerts are DISABLED until it is fixed. Percent-encode the topic.")
             return False
         try:
             # THE SEND PATH'S OWN PARSE. See the docstring: `urlsplit` reads the raw netloc and
@@ -1106,8 +1336,37 @@ class AlertConfig:
             # alerting path and a readiness check that throws takes the OTHER channel's
             # notification with it. It is the one refusal branch with no test, for want of an
             # input that reaches it.
-            log.error("the ntfy URL could not be parsed the way the send path parses it (%s) — "
-                      "ntfy alerts are DISABLED until it is fixed", type(exc).__name__)
+            lg.error("the ntfy URL could not be parsed the way the send path parses it (%s) — "
+                     "ntfy alerts are DISABLED until it is fixed", type(exc).__name__)
+            return False
+        if _bracketed_host_misplaced(host):
+            # ⭐ THE ONE SHAPE THE STDLIB REFUSES ONLY ON A PATCHED INTERPRETER (#8). A bracketed
+            # IPv6 host with colon-bearing userinfo — `https://tok:secret[::1]/topic` — is refused
+            # by `urlsplit` raising "Invalid IPv6 URL", and that check (`_check_bracketed_netloc`)
+            # shipped in CPython PATCH releases, which `requires-python = ">=3.10"` does not
+            # constrain. Measured: present on 3.10.20 and 3.14.7, ABSENT on 3.12.0, where such a
+            # URL reported READY and was dead on every send.
+            #
+            # ⛔⛔ ASKED OF `host`, NOT OF `parts.netloc`, AND THAT IS THE WHOLE POINT — the first
+            # version of this asked the RAW netloc and the verification gate walked straight past
+            # it with `https://tok:secret%5B::1%5D/topic`: no literal `[` for a raw check to see,
+            # while `urllib` unquotes it and `http.client` is handed `tok:secret[::1]`. That is
+            # not a new mistake, it is THE mistake this check has now been made twice — the
+            # docstring above records `%40` and `%2540` beating the two previous userinfo
+            # predicates for exactly the same reason. Judge the host the send path will use.
+            #
+            # It is only REACHABLE on an interpreter lacking the hardening, since a patched
+            # `urlsplit` has already raised above. ⚠️ NARROWER THAN THE STDLIB'S: this mirrors
+            # `_check_bracketed_netloc`'s placement rule (nothing before the `[`, nothing but a
+            # port after the `]`) and NOT `_check_bracketed_host`'s validation that the brackets
+            # contain an IPv6 literal — so `[hello]` is refused by a patched interpreter and
+            # admitted here. Stated rather than closed: adding an address parser would be the
+            # fourth hand-written host-shape predicate, which is the arms race #8 exists to avoid.
+            # The shape, never the value.
+            lg.error("the ntfy URL's host is not a valid bracketed IPv6 literal (something "
+                     "precedes the '[' or follows the ']' that is not a port) — ntfy alerts "
+                     "are DISABLED until it is fixed. If the URL carries userinfo, put the "
+                     "token in a header-bearing proxy, not in the URL.")
             return False
         if "@" in host or _UNSAFE_IN_URL.search(host):
             # ⭐ USERINFO IS REFUSED, AND IT COSTS NOTHING TO REFUSE. `urllib` puts the whole
@@ -1122,10 +1381,10 @@ class AlertConfig:
             # carriage return and a space.
             #
             # The message names the SHAPE, never the value: this is a capability.
-            log.error("the ntfy URL carries userinfo (user:password@host) or a character that "
-                      "cannot appear in a host, which urllib cannot send and whose failure would "
-                      "print it — ntfy alerts are DISABLED until it is fixed. Put an ntfy token "
-                      "in a header-bearing proxy, not in the URL.")
+            lg.error("the ntfy URL carries userinfo (user:password@host) or a character that "
+                     "cannot appear in a host, which urllib cannot send and whose failure would "
+                     "print it — ntfy alerts are DISABLED until it is fixed. Put an ntfy token "
+                     "in a header-bearing proxy, not in the URL.")
             return False
         try:
             # ⭐⭐ THE SEND PATH'S OWN VALIDATOR, NOT A PREDICATE THAT IMITATES IT — and the
@@ -1171,10 +1430,10 @@ class AlertConfig:
         except Exception as exc:  # noqa: BLE001 — a readiness check must never raise
             # Class name only. `InvalidURL`'s message QUOTES the offending part of the host,
             # which is the credential this whole branch exists to keep out of the log.
-            log.error("the ntfy URL's host is not one http.client can send to (%s) — ntfy alerts "
-                      "are DISABLED until it is fixed. Check for a stray ':' (a non-numeric port "
-                      "is the usual cause) or a character outside latin-1.",
-                      type(exc).__name__)
+            lg.error("the ntfy URL's host is not one http.client can send to (%s) — ntfy alerts "
+                     "are DISABLED until it is fixed. Check for a stray ':' (a non-numeric port "
+                     "is the usual cause) or a character outside latin-1.",
+                     type(exc).__name__)
             return False
         if parts.scheme == "http" and not self.allow_cleartext_ntfy:
             # ⭐ A TOPIC URL IS A WRITE CAPABILITY, NOT AN ADDRESS. Anyone who observes it can
@@ -1186,15 +1445,16 @@ class AlertConfig:
             # self-hosted ntfy on a trusted network is a real deployment, and a library that
             # simply turns such a channel off leaves the operator with no path except a fork.
             # `AlertSettings(allow_cleartext_ntfy=True)` is that path.
-            log.error("the ntfy URL is http:// — a topic URL is a write capability, and over "
-                      "cleartext it and every alert Title are readable by anything on the path. "
-                      "ntfy alerts are DISABLED. Use https://, or pass "
-                      "AlertSettings(allow_cleartext_ntfy=True) to accept the exposure "
-                      "deliberately on a trusted network.")
+            lg.error("the ntfy URL is http:// — a topic URL is a write capability, and over "
+                     "cleartext it and every alert Title are readable by anything on the path. "
+                     "ntfy alerts are DISABLED. Use https://, or pass "
+                     "AlertSettings(allow_cleartext_ntfy=True) to accept the exposure "
+                     "deliberately on a trusted network.")
             return False
         return True
 
     def email_ready(self) -> bool:
+        lg = self._log
         email = self.email or {}
         # EMAIL_TO is judged by what the SEND PATH will actually use, not by what was typed. A
         # value that is nothing but separators — `";"` — is non-empty, so a plain presence check
@@ -1212,14 +1472,26 @@ class AlertConfig:
             # line at all. This module's one unforgivable failure is going quiet, so the shortcut
             # has to mean what it says: nothing was configured, not nothing was USABLE.
             return False
-        resolved = {**email, "EMAIL_TO": _recipients(email.get("EMAIL_TO", ""))}
+        # ⭐ `EMAIL_FROM` IS ASKED THE SAME QUESTION AS `EMAIL_TO` (consumer#45). The two halves of
+        # one hand-edited file were held to different rules: a separators-only `EMAIL_FROM=;` is
+        # non-empty, so it passed the presence check — and `smtplib` derives the ENVELOPE SENDER
+        # from that header, which for `;` is the empty string. Most submission servers refuse a
+        # null return-path, so every send failed while this reported READY and the boot line said
+        # "email + ntfy ready" — the dead-while-looking-configured shape, on the sender side. A
+        # value that normalises to nothing usable now disables the channel and names the setting,
+        # exactly as the recipient side has since issue 36's fix. (Two addresses in `EMAIL_FROM`
+        # still truncate to the first and deliver; that is a misconfiguration with a reasonable
+        # outcome, and it is left alone.)
+        resolved = {**email,
+                    "EMAIL_TO": recipients(email.get("EMAIL_TO", "")),
+                    "EMAIL_FROM": recipients(email.get("EMAIL_FROM", ""))}
         missing = [k for k in EMAIL_REQUIRED if not resolved.get(k)]
         if missing:
             # Names only. The values include the SMTP password. "or unusable" because one of these
             # names can now be present-but-empty-after-normalisation rather than absent, and
             # "missing" alone would send an operator looking for a line that is right there.
-            log.error("email alerts DISABLED — %s missing or unusable in %s",
-                      ", ".join(missing), self.config_file)
+            lg.error("email alerts DISABLED — %s missing or unusable in %s",
+                     ", ".join(missing), self.config_file)
             return False
         # ⭐ THE SAME REFUSAL THE SEND PATH MAKES, ASKED HERE FIRST. `_send_email` rejects a
         # non-ASCII `SMTP_USER`/`SMTP_PASSWORD` before smtplib can quote the character — and this
@@ -1229,9 +1501,9 @@ class AlertConfig:
         # that disagrees with its own send path is how it happens. Key names only, never values.
         for key in ("SMTP_USER", "SMTP_PASSWORD"):
             if not resolved.get(key, "").isascii():
-                log.error("email alerts DISABLED — %s in %s contains a non-ASCII character, "
-                          "which SMTP AUTH cannot carry; re-set it to an ASCII value",
-                          key, self.config_file)
+                lg.error("email alerts DISABLED — %s in %s contains a non-ASCII character, "
+                         "which SMTP AUTH cannot carry; re-set it to an ASCII value",
+                         key, self.config_file)
                 return False
         return True
 
@@ -1261,18 +1533,35 @@ class AlertConfig:
         submission port, so the channel is alive; reporting it unusable would be a false claim
         about a channel that sends.
         """
+        lg = self._log
+        # ⚠️ `_usable_path`, not the raw field: this is a PUBLIC dataclass a consumer may build by
+        # hand, and an unhashable `config_file` would otherwise raise out of an accessor that has
+        # never raised for one. It normalises to `str | None`, which is what `AlertConfig.load`
+        # always produces anyway.
+        key = (_usable_path(self.config_file), lg.name)
         raw = (self.email or {}).get("SMTP_PORT", "").strip()
         if not raw:
+            # ⚠️ A HEALTHY READ CLEARS ONLY THIS KEY. Clearing more — or writing a "last seen"
+            # value here — is what let one service's good port silence another's bad one, and let
+            # a healthy config evict a broken one's memo on every send.
+            _COMPLAINED_SMTP_PORT.pop(key, None)
             return DEFAULT_SMTP_PORT
         # The DECISION is `smtp_port_fault`'s, so that a boot report and a config dump reach the
         # same verdict without provoking a send-time log line to find it out. What stays here is
         # the REPORTING, which is what makes this the send-time accessor.
         fault = smtp_port_fault(raw)
         if not fault:
+            _COMPLAINED_SMTP_PORT.pop(key, None)
             return int(raw)
+        # ⭐ ONCE PER DISTINCT VALUE, PER CONFIG, PER LOGGER (consumer#46) — see
+        # `_COMPLAINED_SMTP_PORT`. The same fault on the same value, send after send, is one line;
+        # a different value complains afresh, and so does the SAME value reported to a different
+        # service's logger, because that is a different operator who has not been told.
         # `%s` with the complaint already assembled, so nothing in the message is re-interpreted
         # as a format string. The SHAPE of the rejected value, never the value.
-        log.error("%s", fault)
+        if _COMPLAINED_SMTP_PORT.get(key) != raw:
+            _COMPLAINED_SMTP_PORT[key] = raw
+            lg.error("%s", fault)
         return DEFAULT_SMTP_PORT
 
     def setting_faults(self) -> list[str]:
@@ -1293,19 +1582,21 @@ class AlertConfig:
     def is_ready(self, channel: str) -> bool:
         """Is this ONE channel usable? Never raises — a config value bad enough to break its own
         readiness check disables that channel and leaves every other channel alone."""
+        lg = self._log
         try:
             # Derived from the channel NAME, so `_CHANNELS` is the single registry. A separate
             # lookup table here would be a second one, and adding a channel to only one of them
             # made this method raise the KeyError its own docstring promises it never will.
             # The lookup is INSIDE the guard for the same reason the readiness call is.
             return bool(getattr(self, f"{channel}_ready")())
-        except Exception as exc:  # one channel's bad config is not the other channel's problem
+        # Suppressed as in `AlertConfig.load` — the handler logs with `exc_info`.
+        except Exception as exc:  # noqa: BLE001 — one channel's bad config is not another's
             # exc_info because this catches two very different things: an operator typo in the
             # config, and a defect in the readiness check itself. Without the traceback both
             # render as one line blaming the config, and the second kind is invisible forever.
-            log.error("%s alerts DISABLED — its readiness check failed with %s. This is either "
-                      "bad config or a bug in this check; the traceback says which. Other "
-                      "channels are unaffected.", channel, type(exc).__name__, exc_info=True)
+            lg.error("%s alerts DISABLED — its readiness check failed with %s. This is either "
+                     "bad config or a bug in this check; the traceback says which. Other "
+                     "channels are unaffected.", channel, type(exc).__name__, exc_info=True)
             return False
 
     def ready_channels(self) -> list[str]:
@@ -1314,6 +1605,7 @@ class AlertConfig:
 
 # --- channels ------------------------------------------------------------------------------
 def _send_email(cfg: AlertConfig, spec: SeveritySpec, title: str, message: str) -> None:
+    lg = cfg._log
     email = cfg.email or {}
     # ⭐ REFUSED HERE, BEFORE smtplib IS HANDED THE CREDENTIAL — because smtplib's own refusal
     # PRINTS PART OF IT. `SMTP.auth` does `("\0%s\0%s" % (user, password)).encode("ascii")`, so a
@@ -1345,7 +1637,7 @@ def _send_email(cfg: AlertConfig, spec: SeveritySpec, title: str, message: str) 
     # Normalised, never raw: `send_message()` derives the recipient list from this header, and a
     # `;` in it silently cost recipients — how many depends on the value and the Python build, so
     # do not pin one outcome here. See `_recipients`.
-    msg["To"] = _recipients(email["EMAIL_TO"])
+    msg["To"] = recipients(email["EMAIL_TO"])
     msg.set_content(message)
     with smtplib.SMTP(email["SMTP_HOST"], cfg.smtp_port(), timeout=SMTP_TIMEOUT_S) as smtp:
         # `starttls()` with no context does NOT verify the server: smtplib falls back to
@@ -1367,9 +1659,9 @@ def _send_email(cfg: AlertConfig, spec: SeveritySpec, title: str, message: str) 
         # and nothing said so (measured). The refused COUNT only — never the addresses (the line
         # repeats per alert and is the one that gets pasted into a bug report), and not a total
         # either: counting the header's separators over-counted a quoted display name.
-        log.warning("email alert delivered to some recipients only — the server refused %d "
-                    "recipient(s). Check EMAIL_TO against the server's recipient policy.",
-                    len(refused))
+        lg.warning("email alert delivered to some recipients only — the server refused %d "
+                   "recipient(s). Check EMAIL_TO against the server's recipient policy.",
+                   len(refused))
 
 
 class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
@@ -1461,7 +1753,7 @@ _CHANNELS: tuple[tuple[str, Callable[[AlertConfig, SeveritySpec, str, str], None
 
 
 # --- error-log helpers (pure; the Alerter supplies the paths) ----------------------------------
-def _restrict(path: str, mode: int) -> None:
+def _restrict(path: str, mode: int, *, logger: logging.Logger | None = None) -> None:
     """Narrow an EXISTING path's permissions. Silent on success; WARNS when it cannot.
 
     The `mode=` arguments to `os.makedirs` and `os.open` apply only when the thing is CREATED —
@@ -1486,6 +1778,7 @@ def _restrict(path: str, mode: int) -> None:
     A path that does not exist is NOT a failure and stays silent: this function narrows what is
     already there, and every caller creates the thing separately.
     """
+    lg = logger or log
     try:
         if os.path.exists(path):
             os.chmod(path, mode)
@@ -1494,14 +1787,15 @@ def _restrict(path: str, mode: int) -> None:
         # rather than swallowed: `errno` is the difference between "this volume cannot do
         # permissions" (EPERM/EOPNOTSUPP) and "this path is wrong" (ENOENT), and an operator can
         # act on the first two immediately.
-        log.warning("alerting: could not restrict %s to %s (%s) — it keeps whatever permissions "
-                    "it already had, so treat it as readable by anything with this volume "
-                    "mounted. On a bind mount this is usually a uid mismatch between the host "
-                    "directory and the user this process runs as.",
-                    path, oct(mode), errno.errorcode.get(exc.errno or 0, exc.errno))
+        lg.warning("alerting: could not restrict %s to %s (%s) — it keeps whatever permissions "
+                   "it already had, so treat it as readable by anything with this volume "
+                   "mounted. On a bind mount this is usually a uid mismatch between the host "
+                   "directory and the user this process runs as.",
+                   path, oct(mode), errno.errorcode.get(exc.errno or 0, exc.errno))
 
 
-def _roll_error_log(path: str, max_bytes: int, backups: int) -> None:
+def _roll_error_log(path: str, max_bytes: int, backups: int, *,
+                    logger: logging.Logger | None = None) -> None:
     """Start a fresh file once the current one reaches the cap, keeping `backups` generations.
 
     `os.replace` is atomic, so a reader never sees the log missing. Generations shift from the
@@ -1510,6 +1804,7 @@ def _roll_error_log(path: str, max_bytes: int, backups: int) -> None:
     At `backups=1` this is exactly a single-backup roll: the shifting loop below is empty and the
     only move is live → `.1`.
     """
+    lg = logger or log
     try:
         if os.path.getsize(path) < max_bytes:
             return
@@ -1540,9 +1835,9 @@ def _roll_error_log(path: str, max_bytes: int, backups: int) -> None:
             # nothing anywhere said so (measured by the audit — a planted directory at `.2` lost
             # the whole `.1` generation with an empty log). The roll still proceeds, because
             # refusing it would let the live file grow past its cap; the loss is reported.
-            log.warning("alerting: could not shift the error-log generation %s.%d to .%d (%s) — "
-                        "the roll continues and the records in .%d are being overwritten",
-                        path, i - 1, i, errno.errorcode.get(exc.errno or 0, exc.errno), i - 1)
+            lg.warning("alerting: could not shift the error-log generation %s.%d to .%d (%s) — "
+                       "the roll continues and the records in .%d are being overwritten",
+                       path, i - 1, i, errno.errorcode.get(exc.errno or 0, exc.errno), i - 1)
     os.replace(path, f"{path}.1")
 
 
@@ -1651,7 +1946,8 @@ def _record_is_at_or_after(rec: dict, floor: datetime) -> bool:
 
 def read_jsonl_tail(path: str, limit: int, since_iso: str = "",
                     keep: Callable[[dict], bool] | None = None,
-                    backups: int | None = ERROR_LOG_BACKUPS) -> list[dict]:
+                    backups: int | None = ERROR_LOG_BACKUPS, *,
+                    logger: logging.Logger | None = None) -> list[dict]:
     """The most recent records from a rotating jsonl file, oldest-first. Never raises on I/O.
 
     Reads the rotated generations oldest → newest and then the live file, so a `since`/`limit`
@@ -1680,6 +1976,7 @@ def read_jsonl_tail(path: str, limit: int, since_iso: str = "",
     built an arbitrary-file read. Resolve the path from the service's own config, never from the
     request.
     """
+    lg = logger or log
     floor = parse_since(since_iso)
     generations = max(1, ERROR_LOG_BACKUPS if backups is None else backups)
     files = [f"{path}.{i}" for i in range(generations, 0, -1)] + [path]
@@ -1722,44 +2019,50 @@ def read_jsonl_tail(path: str, limit: int, since_iso: str = "",
         except FileNotFoundError:
             continue  # that generation has not been rolled yet — normal
         except Exception as exc:  # noqa: BLE001 — an unreadable mount must not break retrieval
-            log.warning("could not read the error log %s (%s) — its records are missing from "
-                        "this result", fp, type(exc).__name__)
+            lg.warning("could not read the error log %s (%s) — its records are missing from "
+                       "this result", fp, type(exc).__name__)
             continue
     return list(out)
 
 
-def _escalate_gap_hours(count: int) -> float:
+def escalate_gap_hours(count: int) -> float:
     """How long after the Nth send before an escalating condition may page again."""
     doublings = min(max(count - 1, 0), _MAX_DOUBLINGS)
     return min(ESCALATE_BASE_HOURS * (2 ** doublings), ESCALATE_MAX_HOURS)
 
 
-def _clears_list(clears: object) -> list[str]:
+_escalate_gap_hours = escalate_gap_hours   # the pre-export spelling (consumer#50); an alias
+
+
+def _clears_list(clears: object, *, logger: logging.Logger | None = None) -> list[str]:
     """Normalise `clears=` to a list of condition titles. Never raises.
 
     A caller that passes nonsense loses the clear; it must not also lose the alert, and it must
     not be left guessing — an ignored clear means the named condition stays marked firing, whose
     only symptom is a LATER alert that never arrives. So say so at ERROR now.
     """
+    lg = logger or log
     if clears is None:
         return []
     if isinstance(clears, str):
         return [clears]
     try:
         titles = list(clears)  # type: ignore[call-overload]
-    except Exception:  # not just TypeError: a generator can raise mid-iteration
-        log.error("alerting: clears=%r is neither a title nor an iterable of titles — ignoring "
-                  "it. Any condition it meant to resolve stays marked firing.", clears,
-                  exc_info=True)
+    # Suppressed for the reason `AlertConfig.load` states: the handler logs with `exc_info`, and
+    # ruff stopped recognising the logger when it became an injected one.
+    except Exception:  # noqa: BLE001 — not just TypeError: a generator can raise mid-iteration
+        lg.error("alerting: clears=%r is neither a title nor an iterable of titles — ignoring "
+                 "it. Any condition it meant to resolve stays marked firing.", clears,
+                 exc_info=True)
         return []
     good = [t for t in titles if isinstance(t, str)]
     if len(good) != len(titles):
-        log.error("alerting: clears=%r contains entries that are not condition titles — those "
-                  "are ignored and stay marked firing.", clears)
+        lg.error("alerting: clears=%r contains entries that are not condition titles — those "
+                 "are ignored and stay marked firing.", clears)
     return good
 
 
-def _is_cert_failure(exc: BaseException) -> bool:
+def is_cert_failure(exc: BaseException) -> bool:
     """Is this failure a TLS certificate that did not verify — i.e. possible interception?
 
     Not just `isinstance`: `urlopen` catches every `OSError` from the handshake and re-raises it
@@ -1786,6 +2089,9 @@ def _is_cert_failure(exc: BaseException) -> bool:
         except Exception:  # noqa: BLE001 — a log-level decision must not break the fan-out
             return False
     return False
+
+
+_is_cert_failure = is_cert_failure   # the pre-export spelling (consumer#50); an alias
 
 
 # --- the alerter ------------------------------------------------------------------------------
@@ -1917,6 +2223,19 @@ class Alerter:
 
     settings: AlertSettings
 
+    @property
+    def _log(self) -> logging.Logger:
+        """This service's alerting logger — `settings.logger_name`, or the module's own.
+
+        ⛔ THROUGH `_settings_logger_name`, which never raises: `self.settings` is an attribute
+        access on an object this class does not validate, and a logger lookup that raised would
+        take down the alert it was about to record. An unresolvable name means the module logger.
+        """
+        try:
+            return _logger_named(_settings_logger_name(self.settings))
+        except Exception:  # noqa: BLE001 — the logger must never be the failure
+            return log
+
     # --- diagnostics ---------------------------------------------------------------------
     def state_file_problem(self) -> str:
         """Why the escalation state file is not durable, or "" if it is fine.
@@ -2000,6 +2319,7 @@ class Alerter:
         Like `notify()`, this cannot raise: it runs at the top of the service's main loop, so an
         exception here is a boot crash — a restart loop over a mistyped config file.
         """
+        lg = self._log
         try:
             # ⛔ INSIDE a guard, for exactly the reason `_append_error_record` resolves its path
             # inside one: `self.settings` is an attribute access, and an attribute access can run
@@ -2009,33 +2329,33 @@ class Alerter:
             # object made THIS the boot crash the paragraph warns about.
             service = self.settings.service
         except Exception as exc:  # noqa: BLE001 — a boot check must not be the boot crash
-            log.warning("ALERTING: this service's own name could not be resolved from its "
-                        "settings (%s) — reporting alerting readiness without it",
-                        type(exc).__name__)
+            lg.warning("ALERTING: this service's own name could not be resolved from its "
+                       "settings (%s) — reporting alerting readiness without it",
+                       type(exc).__name__)
             service = "<unknown service>"
         # FIRST, before the config load — that load has an `except` which returns, and a boot with
         # an unreadable config file is exactly the boot that needs both warnings rather than one.
         problem = self.state_file_problem()
         if problem:
-            log.warning("ALERTING STATE for %s: %s. A service with an escalating alert needs a "
-                        "persistent state_file.", service, problem)
+            lg.warning("ALERTING STATE for %s: %s. A service with an escalating alert needs a "
+                       "persistent state_file.", service, problem)
         problem = self.error_log_problem()
         if problem:
-            log.warning("ALERTING ERROR LOG for %s: %s. Set error_log to a path inside a "
-                        "mounted volume.", service, problem)
+            lg.warning("ALERTING ERROR LOG for %s: %s. Set error_log to a path inside a "
+                       "mounted volume.", service, problem)
         try:
             ready = self.config().ready_channels()
         except Exception as exc:  # noqa: BLE001 — bad config must not stop the service booting
-            log.warning("ALERTING CONFIG UNREADABLE for %s (%s) — treating every channel as "
-                        "unconfigured; alerts will go NOWHERE", service, type(exc).__name__)
+            lg.warning("ALERTING CONFIG UNREADABLE for %s (%s) — treating every channel as "
+                       "unconfigured; alerts will go NOWHERE", service, type(exc).__name__)
             return []
         if ready:
-            log.info("alerting: %s ready for %s", " + ".join(ready), service)
+            lg.info("alerting: %s ready for %s", " + ".join(ready), service)
         else:
-            log.warning("ALERTING UNCONFIGURED for %s — no email and no ntfy channel is usable, "
-                        "so every alert this service raises will go NOWHERE. Set ntfy_url to the "
-                        "full topic URL and/or point config_file at the shared email settings.",
-                        service)
+            lg.warning("ALERTING UNCONFIGURED for %s — no email and no ntfy channel is usable, "
+                       "so every alert this service raises will go NOWHERE. Set ntfy_url to the "
+                       "full topic URL and/or point config_file at the shared email settings.",
+                       service)
         return ready
 
     def config(self) -> AlertConfig:
@@ -2059,7 +2379,7 @@ class Alerter:
         if path is None:
             return []
         return read_jsonl_tail(path, limit, since_iso, keep,
-                               backups=self.settings.error_log_backups)
+                               backups=self.settings.error_log_backups, logger=self._log)
 
     def _append_error_record(self, severity: object, title: object, message: object) -> None:
         """Append one JSON line describing this alert. Never raises.
@@ -2075,6 +2395,7 @@ class Alerter:
         `restart: no` that is a container which never comes back and never says why. The irony
         was that those lines existed precisely to tolerate absurd callers.
         """
+        lg = self._log
         try:
             # ⛔ INSIDE the guard, including resolving the path. It sat outside, which made the
             # paragraph above false: `self.settings` is an attribute access, and an attribute
@@ -2092,8 +2413,8 @@ class Alerter:
                 "service": _field(self.settings.service, self.settings.max_record_field),
             }
         except Exception as exc:  # noqa: BLE001 — building a log line must never break alerting
-            log.warning("could not build an error-log record (%s) — this alert is in the process "
-                        "log only", type(exc).__name__)
+            lg.warning("could not build an error-log record (%s) — this alert is in the process "
+                       "log only", type(exc).__name__)
             return
 
         try:
@@ -2102,14 +2423,14 @@ class Alerter:
                 # 0o700: these records carry alert MESSAGE BODIES, and the directory is expected
                 # to be treated as operator-confidential.
                 os.makedirs(directory, mode=0o700, exist_ok=True)
-                _restrict(directory, 0o700)
-            _restrict(path, 0o600)
+                _restrict(directory, 0o700, logger=self._log)
+            _restrict(path, 0o600, logger=self._log)
             _roll_error_log(path, self.settings.error_log_max_bytes,
-                            self.settings.error_log_backups)
+                            self.settings.error_log_backups, logger=self._log)
         except Exception as exc:  # noqa: BLE001 — housekeeping must not cost us the record
             # A roll that fails is not a reason to drop the alert being recorded; try the append
             # anyway. Worst case the file grows past its cap, which beats losing the error.
-            log.warning("could not prepare the error log %s (%s)", path, type(exc).__name__)
+            lg.warning("could not prepare the error log %s (%s)", path, type(exc).__name__)
         try:
             # os.open rather than open(), so a NEW file is created 0o600 rather than created wide
             # and narrowed afterwards. An existing one was already narrowed by `_restrict` above,
@@ -2126,10 +2447,10 @@ class Alerter:
             # alert, which on a quiet service can be days. Deliberately redundant with the mode
             # argument: both are cheap, and the failure they guard is a credential-bearing file
             # readable by anything on the host.
-            _restrict(path, 0o600)
+            _restrict(path, 0o600, logger=self._log)
         except Exception as exc:  # noqa: BLE001 — never raises, like every other sink here
-            log.warning("could not append to the error log %s (%s) — this alert is in the process "
-                        "log only", path, type(exc).__name__)
+            lg.warning("could not append to the error log %s (%s) — this alert is in the process "
+                       "log only", path, type(exc).__name__)
 
     # --- edge-trigger / escalate bookkeeping ----------------------------------------------
     def _dedup_enabled(self) -> bool:
@@ -2161,6 +2482,7 @@ class Alerter:
     def _read_state(self) -> dict[str, dict]:
         """Currently-firing conditions, keyed by title. A missing or unusable file means "nothing
         is firing", which errs towards sending — the safe direction for a de-duplicator."""
+        lg = self._log
         if not self._dedup_enabled():
             # "Nothing is firing" is exactly the right answer with the opt-out set: every
             # condition then looks new, so every call is delivered. Gated HERE as well as at the
@@ -2173,8 +2495,8 @@ class Alerter:
         except FileNotFoundError:
             return {}
         except Exception as exc:  # noqa: BLE001 — corrupt JSON, wrong encoding, unreadable mount
-            log.warning("alert state %s unreadable (%s) — treating every condition as new, so "
-                        "this alert goes out", path, type(exc).__name__)
+            lg.warning("alert state %s unreadable (%s) — treating every condition as new, so "
+                       "this alert goes out", path, type(exc).__name__)
             return {}
         if not isinstance(data, dict):
             # ⭐ VALID JSON THAT IS NOT A MAPPING GETS THE SAME LINE AS INVALID JSON. `[]`, `null`,
@@ -2182,9 +2504,9 @@ class Alerter:
             # used to become `{}` in silence, one branch below the WARNING that unparseable
             # content earns, so a firing condition re-paged once and the file was quietly
             # overwritten with nothing in the log to explain it.
-            log.warning("alert state %s holds a JSON %s, not an object — treating every "
-                        "condition as new, so this alert goes out, and the file is being "
-                        "rewritten empty", path, type(data).__name__)
+            lg.warning("alert state %s holds a JSON %s, not an object — treating every "
+                       "condition as new, so this alert goes out, and the file is being "
+                       "rewritten empty", path, type(data).__name__)
             # ⭐ REWRITTEN HERE, so the line fires once WHERE THE REWRITE LANDS. An OK never
             # writes the state file unless it clears something, so a service that only ever
             # sends heartbeats read the same list and warned on every notification forever (the
@@ -2206,6 +2528,7 @@ class Alerter:
         Dropping a condition makes it alert again if it recurs, which is the direction this
         module always fails in.
         """
+        lg = self._log
         cap = self.settings.max_tracked_conditions
         if len(state) <= cap:
             return state
@@ -2217,10 +2540,10 @@ class Alerter:
                 return 0.0  # junk sorts oldest, so it is what gets dropped
 
         keep = sorted(state.items(), key=first_seen)[-cap:]
-        log.warning("alert state is tracking more than %d conditions — dropping the %d oldest, "
-                    "which will alert again if they recur. A title that carries a unique id per "
-                    "occurrence does this: key the CONDITION, not the instance.",
-                    cap, len(state) - len(keep))
+        lg.warning("alert state is tracking more than %d conditions — dropping the %d oldest, "
+                   "which will alert again if they recur. A title that carries a unique id per "
+                   "occurrence does this: key the CONDITION, not the instance.",
+                   cap, len(state) - len(keep))
         return dict(keep)
 
     def _write_state(self, state: dict[str, dict]) -> None:
@@ -2230,6 +2553,7 @@ class Alerter:
         read as corrupt. If the whole thing fails the service simply forgets — it re-pages a
         condition it had already reported, which is the right way round to be wrong.
         """
+        lg = self._log
         if not self._dedup_enabled():
             # Every other gate decides whether to SEND; this one decides whether anything is
             # PERSISTED, and it covers `_forget_unreported()`, which writes on the
@@ -2265,8 +2589,8 @@ class Alerter:
         except Exception as exc:  # noqa: BLE001 — a read-only mount must not break alerting
             with contextlib.suppress(OSError, ValueError):
                 os.unlink(tmp)
-            log.warning("could not save alert state to %s (%s) — recurring conditions will "
-                        "re-alert", path, type(exc).__name__)
+            lg.warning("could not save alert state to %s (%s) — recurring conditions will "
+                       "re-alert", path, type(exc).__name__)
 
     def _peek_condition(self, title: str) -> object:
         """This condition's entry before anything touches it, so a notification that reaches
@@ -2293,6 +2617,7 @@ class Alerter:
         invert the trade — a crash then re-pages instead — and is a change to the state machine
         rather than to this docstring.
         """
+        lg = self._log
         try:
             state = self._read_state()
             if previous is _MISSING:
@@ -2304,12 +2629,12 @@ class Alerter:
                     return
                 state[title] = previous  # type: ignore[assignment]
             self._write_state(state)
-            log.info("alerting: %r reached no channel, so it stays un-reported — the next "
-                     "occurrence will alert instead of being de-duplicated against a delivery "
-                     "that failed.", title)
+            lg.info("alerting: %r reached no channel, so it stays un-reported — the next "
+                    "occurrence will alert instead of being de-duplicated against a delivery "
+                    "that failed.", title)
         except Exception as exc:  # noqa: BLE001 — the rollback must not break the caller either
-            log.warning("could not un-record %r after a failed delivery (%s) — its next "
-                        "occurrence may be suppressed", title, type(exc).__name__)
+            lg.warning("could not un-record %r after a failed delivery (%s) — its next "
+                       "occurrence may be suppressed", title, type(exc).__name__)
 
     def _should_send(self, severity: str, title: str, escalating: bool,
                      clears: object = None) -> bool:
@@ -2320,19 +2645,20 @@ class Alerter:
         timestamp, an exception string), so keying on it would make every occurrence look new and
         nothing would ever be de-duplicated.
         """
+        lg = self._log
         state = self._read_state()
-        resolved = _clears_list(clears)
+        resolved = _clears_list(clears, logger=self._log)
 
         if resolved and severity != OK:
             # Refused rather than honoured. `notify(ERROR, "x", …, clears="x")` inside a retry
             # loop would delete its own escalation bookkeeping on every attempt, so a condition
             # that never recovers would page at the base gap forever and never escalate — and the
             # caller would have no way to tell, because the alerts still arrive.
-            log.error("alerting: clears=%r was passed with severity %s and is IGNORED — a "
-                      "condition is resolved by an OK, not by another alert. Those conditions "
-                      "stay firing. To downgrade a condition rather than end it, emit the OK "
-                      "that clears it and then the WARN describing what remains.", clears,
-                      severity)
+            lg.error("alerting: clears=%r was passed with severity %s and is IGNORED — a "
+                     "condition is resolved by an OK, not by another alert. Those conditions "
+                     "stay firing. To downgrade a condition rather than end it, emit the OK "
+                     "that clears it and then the WARN describing what remains.", clears,
+                     severity)
 
         if severity == OK:
             # Never suppressed — an OK is a confirmation, not a condition, and for a service that
@@ -2346,7 +2672,7 @@ class Alerter:
             if cleared:
                 for name in cleared:
                     state.pop(name, None)
-                log.info("alerting: recovery — re-arming %s", ", ".join(cleared))
+                lg.info("alerting: recovery — re-arming %s", ", ".join(cleared))
                 self._write_state(state)
             return True
 
@@ -2356,9 +2682,9 @@ class Alerter:
             # count, so an unresolved condition pages at full rate instead of tapering.
             problem = self.state_file_problem()
             if problem:
-                log.warning("alerting: %s. This condition is escalating, so without durable "
-                            "state it will re-page at the base cadence rather than backing off.",
-                            problem)
+                lg.warning("alerting: %s. This condition is escalating, so without durable "
+                           "state it will re-page at the base cadence rather than backing off.",
+                           problem)
 
         entry = state.get(title)
         if not isinstance(entry, dict):
@@ -2367,15 +2693,15 @@ class Alerter:
                 # Junk is SAID. An entry that is not a record is something else's write or a
                 # hand edit, and replacing it in silence hides that from the one log that
                 # would explain the extra page.
-                log.warning("alerting: the state entry for %r is a JSON %s, not a record — "
-                            "treating the condition as new", title, type(entry).__name__)
+                lg.warning("alerting: the state entry for %r is a JSON %s, not a record — "
+                           "treating the condition as new", title, type(entry).__name__)
             state[title] = {"first": _now(), "last": _now(), "count": 1}
             self._write_state(state)
             return True
 
         if not escalating:
-            log.info("alerting: %r is already firing and has not cleared — not re-sending "
-                     "(edge-trigger). It will alert again after the next OK.", title)
+            lg.info("alerting: %r is already firing and has not cleared — not re-sending "
+                    "(edge-trigger). It will alert again after the next OK.", title)
             return False
 
         try:
@@ -2384,26 +2710,27 @@ class Alerter:
         except (TypeError, ValueError):
             count, last = 1, 0.0  # junk in the file must not decide to stay silent
 
-        gap_h = _escalate_gap_hours(count)
+        gap_h = escalate_gap_hours(count)
         waited_h = (_now() - last) / 3600
         if 0 <= waited_h < gap_h:
             # `0 <=` on purpose: a clock that jumped BACKWARDS makes waited_h negative, and
             # treating that as "not long enough" would suppress an escalating alert for as long
             # as the skew lasts. Send it instead.
-            log.info("alerting: %r still firing; next escalation in %.1fh", title,
-                     gap_h - waited_h)
+            lg.info("alerting: %r still firing; next escalation in %.1fh", title,
+                    gap_h - waited_h)
             return False
 
         entry["last"] = _now()
         entry["count"] = count + 1
         state[title] = entry
         self._write_state(state)
-        log.info("alerting: %r still firing after %.1fh — escalating (send #%d)",
-                 title, waited_h, count + 1)
+        lg.info("alerting: %r still firing after %.1fh — escalating (send #%d)",
+                title, waited_h, count + 1)
         return True
 
     # --- dispatch -------------------------------------------------------------------------
     def _dispatch(self, spec: SeveritySpec, title: str, message: str) -> dict[str, str]:
+        lg = self._log
         cfg = self.config()
         # ⭐ THE PREFIX IS APPLIED AT THE SEND BOUNDARY AND NOWHERE ELSE. Everything upstream (the
         # de-duplication key, the error record, the log line) has already used the raw title,
@@ -2440,15 +2767,15 @@ class Alerter:
                 # operator is most likely to paste into a bug report. See `_redact` for what that
                 # backstop does and does not reach.
                 detail = _redact(_safe_text(exc), cfg)
-                if _is_cert_failure(exc):
+                if is_cert_failure(exc):
                     # Louder than a transient outage on purpose: a certificate that does not
                     # verify is the signature of something sitting between this service and the
                     # server.
-                    log.error("%s alert failed TLS VERIFICATION — the server's certificate did "
-                              "not validate, which is what an intercepted connection looks "
-                              "like: %s", name, detail)
+                    lg.error("%s alert failed TLS VERIFICATION — the server's certificate did "
+                             "not validate, which is what an intercepted connection looks "
+                             "like: %s", name, detail)
                 else:
-                    log.warning("%s alert failed: %s: %s", name, type(exc).__name__, detail)
+                    lg.warning("%s alert failed: %s: %s", name, type(exc).__name__, detail)
         return results
 
     def notify(self, severity: str, title: str, message: str, escalating: bool = False,
@@ -2473,6 +2800,7 @@ class Alerter:
         NEVER raises: an unknown severity, an unreachable SMTP server and a 500 from ntfy all end
         up as a log line. The caller's loop must not die because a notification did.
         """
+        lg = self._log
         try:
             spec = SEVERITIES.get(severity)
         except Exception:  # noqa: BLE001 — not only TypeError: `dict.get` propagates whatever the
@@ -2483,13 +2811,13 @@ class Alerter:
         if spec is None:
             # Fail LOUD, not silent: an unrecognised severity is a bug, and the safe assumption is
             # that whatever the caller was reporting mattered.
-            log.error("unknown alert severity %r — treating as %s", severity, ERROR)
+            lg.error("unknown alert severity %r — treating as %s", severity, ERROR)
             spec = SEVERITIES[ERROR]
 
         # The log line goes out FIRST and outside every guard below: whatever happens to the
         # channels, and whether or not this is a repeat, the process log has the message.
         # Logging is not paging.
-        log.log(spec.log_level, "%s %s — %s", spec.prefix, title, message)
+        lg.log(spec.log_level, "%s %s — %s", spec.prefix, title, message)
 
         # And into the retrievable error log, for the same reason and at the same point: BEFORE
         # the de-duplication decision, so a suppressed repeat is still recorded. De-duplication
@@ -2537,14 +2865,15 @@ class Alerter:
                 # unrelated early returns that a later edit could silently take away.
                 send = (True if not self._dedup_enabled()
                         else self._should_send(severity, title, escalating, clears))
-            except Exception as exc:  # de-duplication must fail OPEN, always
+            # Suppressed as in `AlertConfig.load` — the handler logs with `exc_info`.
+            except Exception as exc:  # noqa: BLE001 — de-duplication must fail OPEN, always
                 # Its own boundary, not the one below, because the two failures need opposite
                 # defaults: a broken channel means "report failed", a broken de-duplicator means
                 # "SEND IT". An accidental silence here is indistinguishable from nothing being
                 # wrong, which is the single outcome this module exists to prevent.
-                log.error("alert de-duplication failed (%s) — sending anyway. This is a bug in "
-                          "the escalation bookkeeping; the traceback says where.",
-                          type(exc).__name__, exc_info=True)
+                lg.error("alert de-duplication failed (%s) — sending anyway. This is a bug in "
+                         "the escalation bookkeeping; the traceback says where.",
+                         type(exc).__name__, exc_info=True)
                 send = True
         if not send:
             return {name: "suppressed" for name, _ in _CHANNELS}
@@ -2565,8 +2894,8 @@ class Alerter:
                 partial = AlertConfig(ntfy_url=str(getattr(self.settings, "ntfy_url", "") or ""))
             except Exception:  # noqa: BLE001 — the settings object is why we are already here
                 partial = AlertConfig()
-            log.error("alerting failed before any channel could be tried: %s: %s",
-                      type(exc).__name__, _redact(_safe_text(exc), partial))
+            lg.error("alerting failed before any channel could be tried: %s: %s",
+                     type(exc).__name__, _redact(_safe_text(exc), partial))
             results = {name: "failed" for name, _ in _CHANNELS}
 
         if recognised and severity != OK and not any(r == "sent" for r in results.values()):

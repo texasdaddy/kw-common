@@ -328,6 +328,56 @@ def test_the_env_layer_reads_shared_root_and_builds_the_documented_subpath(
     assert settings.ntfy_url == GOOD_CONFIG["NTFY_URL_DEV"]
 
 
+def test_BOTH_loaders_pass_the_injected_logger_name_through(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """⛔ A FIELD THE CONVENTION LAYER CANNOT SET IS A FIELD THE FLEET CANNOT USE.
+
+    `load_alert_settings*` is the call every app in this deployment makes, and it builds
+    `AlertSettings(...)` explicitly — so a new field is not passed through unless somebody passes
+    it. The verification gate caught exactly that: the changelog announced `logger_name` on both
+    loaders while the edits adding it had silently failed to apply, so an adopter following the
+    release notes would have got a `TypeError` on the boot path and the feature would have been
+    unreachable for the one population it was written for.
+
+    Both loaders and the DEFAULT in both, because a pass-through that only works when you ask is
+    still one that can be dropped without a test noticing.
+    """
+    write_shared(tmp_path)
+    explicit = load_alert_settings(config_file_for(tmp_path), "dev", "feed-poller",
+                                   logger_name="feed-poller.alerts")
+    assert explicit.logger_name == "feed-poller.alerts"
+    assert load_alert_settings(config_file_for(tmp_path), "dev", "feed-poller").logger_name == ""
+
+    monkeypatch.setenv(SHARED_ROOT_VAR, str(tmp_path))
+    monkeypatch.setenv(DEPLOY_ENV_VAR, "dev")
+    assert load_alert_settings_from_env(
+        "feed-poller", logger_name="feed-poller.alerts").logger_name == "feed-poller.alerts"
+    assert load_alert_settings_from_env("feed-poller").logger_name == ""
+
+    # ...and it reaches the thing that logs, which is the only reason the field exists.
+    assert Alerter(explicit)._log.name == "feed-poller.alerts"
+
+    # KEYWORD-ONLY, so the three positional arguments every adopter already passes are unchanged.
+    with pytest.raises(TypeError):
+        load_alert_settings(config_file_for(tmp_path), "dev", "feed-poller",  # type: ignore[misc]
+                            "feed-poller.alerts")
+
+    # ⛔ AND A BAD NAME IS REFUSED AS `AlertEnvError`, NOT AS THE CONSTRUCTOR'S `ValueError`.
+    # This layer's whole contract is that a boot refusal is an `AlertEnvError` an adopter catches
+    # to print its own one-liner; `AlertSettings.__post_init__` would refuse a control character
+    # anyway, so without this the process still stops — with a bare traceback, which is the
+    # outcome `_refuse` exists to prevent. The mutation matrix found it unpinned: deleting the
+    # loader's check left the suite green, because the constructor caught it under another name.
+    # Reachable straight from a CRLF-bearing environment variable.
+    for bad in ("feed-poller\r", "feed\npoller", "feed\x00poller"):
+        with pytest.raises(AlertEnvError):
+            load_alert_settings(config_file_for(tmp_path), "dev", "feed-poller",
+                                logger_name=bad)
+    with pytest.raises(AlertEnvError):
+        load_alert_settings(config_file_for(tmp_path), "dev", "feed-poller",
+                            logger_name=None)          # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize("value", ["", "staging", "production", "DEV ELOPMENT", "1"])
 def test_an_environment_that_is_not_dev_or_prod_is_refused_rather_than_guessed(value: str) -> None:
     with pytest.raises(AlertEnvError):
@@ -724,6 +774,20 @@ def test_a_directory_where_the_file_should_be_is_reported_as_unreadable(tmp_path
 
 
 # ======================================================== acceptance 6 & 7: boot validation
+def marker_facts(marker: Path) -> tuple[str, object]:
+    """The marker's two facts — the digest line, and the service it records.
+
+    ⭐ PARSED HERE RATHER THAN THROUGH `_recorded_service`, deliberately. The module's own
+    reader and its own writer agreeing proves nothing about the FORMAT: a writer that stopped
+    emitting the `service:` line and a reader that stopped requiring one would agree perfectly,
+    and #18 would be open again with every test green. This asks the file what it says.
+    """
+    digest_line, _, service_line = marker.read_text(encoding="utf-8").strip().partition("\n")
+    if not service_line.startswith("service:"):
+        return digest_line, None
+    return digest_line, json.loads(service_line[len("service:"):])
+
+
 def _validated(tmp_path: Path, service: str = "feed-poller",
                env: str = "prod") -> tuple[AlertSettings, Path, Path]:
     write_shared(tmp_path)
@@ -745,7 +809,7 @@ def test_a_good_config_records_ITS_DIGEST_in_the_marker_and_alerts_exactly_once(
     assert validate_boot(settings, "prod", marker_dir, alerter=alerter) is True
     assert marker.is_file()
     expected = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
-    assert marker.read_text(encoding="utf-8").strip() == f"sha256:{expected}"
+    assert marker_facts(marker) == (f"sha256:{expected}", settings.service)
     assert len(channels["ntfy"].calls) == 1
     assert channels["ntfy"].calls[0][1] is alerting.SEVERITIES[OK]
 
@@ -977,7 +1041,7 @@ def test_the_marker_records_the_config_that_was_CHECKED_not_the_one_on_disk_afte
     # nothing ever rewrote — the test would pass while proving nothing, which is the vacuous-setup
     # shape rather than a defect in the code. Its sibling below carries the same guard.
     assert config.read_bytes() == broken, "the alerter never ran, so no race was created"
-    recorded = marker.read_text(encoding="utf-8").strip()
+    recorded, _ = marker_facts(marker)
     assert recorded == "sha256:" + hashlib.sha256(good).hexdigest(), (
         "the marker records the file as it stands AFTER validation, so a config rewritten during "
         "the announce is recorded as validated although nothing checked it")
@@ -1021,7 +1085,7 @@ def test_the_digest_is_taken_BEFORE_the_file_is_parsed_so_the_window_fails_SAFE(
     assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
     assert config.read_bytes() == rewritten, "the stand-in did not actually rewrite the file"
 
-    recorded = marker.read_text(encoding="utf-8").strip()
+    recorded, _ = marker_facts(marker)
     assert recorded == "sha256:" + hashlib.sha256(original).hexdigest(), (
         "the digest is taken AFTER the parse, so a file written in between is recorded as "
         "validated — and the next boot skips it")
@@ -1477,15 +1541,18 @@ def test_the_upgrade_repair_rewrites_the_marker_without_revalidating(
 
 
 @posix_only
-def test_a_matching_marker_left_wide_open_by_1_3_0_is_narrowed_without_revalidating(
+def test_a_matching_marker_left_wide_open_is_narrowed_without_revalidating(
         tmp_path: Path, channels: dict[str, Spy]) -> None:
-    """⭐⭐ THE UPGRADE PATH THAT THE WRITE PATH ALONE DOES NOT REACH, AND THE ONE EVERY DEPLOYED
-    SERVICE TAKES.
+    """⭐⭐ THE REPAIR THE WRITE PATH ALONE DOES NOT REACH: a marker that MATCHES is a marker
+    `_write_marker` is never called for, so an exposed one stays exposed.
 
-    A service already running the previous release has a marker recording the CORRECT digest at
-    the wrong mode. So it matches, validation skips, and `_write_marker` is never called —
-    narrowing only the write would have fixed new installations and left every existing one
-    exposed until somebody happened to edit the shared config. Fixing the instance, not the class.
+    ⚠️ THIS TEST WAS NAMED FOR THE 1.3.0 UPGRADE AND IS NOT ABOUT IT ANY MORE. It was written
+    when a marker from an earlier release matched — the digest was right, so validation skipped
+    and the narrowing never ran, and narrowing only the write path would have fixed new
+    installations while leaving every existing one exposed. Since #18 such a marker records no
+    service, matches nothing, and is replaced at 0600 by the validation path instead. What is
+    left here is a marker THIS release wrote whose mode was widened afterwards — a restore, a
+    permissive umask, a hand-edit — which is what the body actually builds, and always was.
 
     The other half of the assertion is that the repair is free: the marker's contents are
     unchanged, the boot still returns `False`, and no confirmation alert is sent. A repair that
@@ -1517,7 +1584,7 @@ def test_the_restricted_marker_is_still_the_thing_that_suppresses_the_next_boot(
     assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False
     assert silence(channels) == []
     expected = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
-    assert marker.read_text(encoding="utf-8").strip() == f"sha256:{expected}"
+    assert marker_facts(marker) == (f"sha256:{expected}", settings.service)
 
 
 def test_a_successful_marker_write_says_nothing(
@@ -1548,7 +1615,7 @@ def test_a_stale_temporary_file_is_not_reused_as_the_marker(
 
     assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
     expected = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
-    assert marker.read_text(encoding="utf-8").strip() == f"sha256:{expected}"
+    assert marker_facts(marker) == (f"sha256:{expected}", settings.service)
     assert list(marker_dir.glob("*.tmp")) == [], "a temporary file survived the write"
     if os.name == "posix":
         assert stat.S_IMODE(marker.stat().st_mode) & 0o077 == 0
@@ -2416,10 +2483,17 @@ def test_every_document_that_describes_the_MARKER_describes_the_mechanism_the_co
 
     settings, marker_dir, marker = _validated(tmp_path)
     assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
-    written = marker.read_text(encoding="utf-8").strip()
+    written, service = marker_facts(marker)
     assert _re.fullmatch(r"sha256:[0-9a-f]{64}", written), (
-        f"the marker's content is {written!r}, which is not the `sha256:<hex>` line every "
+        f"the marker's first line is {written!r}, which is not the `sha256:<hex>` line every "
         f"document below tells a reader to expect")
+    # ⭐ AND THE SECOND FACT IS PINNED HERE TOO, because the documents now promise both (#18).
+    # The first line stayed exactly what it was, so anything reading the FIRST LINE reads the
+    # digest correctly. That is NOT the same as backward compatible and the comment here used
+    # to say it was - the rollback direction has its own test below.
+    assert service == settings.service, (
+        f"the marker records the service as {service!r}, and the documents say it records "
+        f"{settings.service!r} — a rename is exactly what it exists to notice")
     assert marker.name == f"{MARKER_NAME}-prod", (
         f"the marker is written as {marker.name!r}; the documents name "
         f"`{MARKER_NAME}-<env>`")
@@ -2439,6 +2513,527 @@ def test_every_document_that_describes_the_MARKER_describes_the_mechanism_the_co
             f"{name} describes the boot marker without naming the mechanism the code actually "
             f"uses. It was a timestamp comparison until 1.3.0, and a document still saying so "
             f"tells an operator to `touch` a file that no longer needs touching.")
+        # ⛔ AND THE CLAIM THAT WAS FALSE DOES NOT COME BACK. It was written in four documents,
+        # corrected in four, and a verification pass then found a FIFTH copy in one of them.
+        # The marker's first line is unchanged; the release that reads it compares the WHOLE
+        # text, so a 1.5.0 marker matches nothing there and a rollback costs one re-validation
+        # per service. Anything asserting otherwise is the sentence that was measured false.
+        assert "reader that knows only the older format" not in text, (
+            f"{name} has the backward-compatibility claim back. It was measured against the "
+            f"published 1.4.1 and is false: that reader compares the marker's whole text.")
+
+
+# ============================================================ #18: the marker knows the service
+def test_a_renamed_service_does_not_skip_the_refusal_a_fresh_marker_dir_produces(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐⭐ ISSUE #18, ITS OWN REPRO. The marker keyed on (config bytes, environment), and
+    `_check_usable` validates settings DERIVED FROM THE SERVICE NAME — so renaming the service
+    while `CONFIG_PATH`, `DEPLOY_ENV` and the config's bytes stayed put skipped a refusal the
+    service should have got, and it came up with a title prefix that fails every ntfy send.
+
+    The prefix is `[<env>][<service>] `, and `http.client` encodes ntfy's `Title` header as
+    latin-1, so a service name outside latin-1 is the reachable case. The euro sign is assembled
+    from its code point rather than written as a literal so that nothing here depends on this
+    file's own encoding surviving a round trip.
+
+    ⚠️ THE MIDDLE ASSERTION IS THE ONE THAT MATTERS. Without it this test would pass on a build
+    where validation simply never skips — the refusal would fire because NOTHING is ever skipped,
+    which is a different behaviour with the same symptom. So the first name is asserted to skip on
+    its second boot, and only then is the rename shown to break through that skip.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert marker_facts(marker)[1] == "feed-poller"
+
+    # The same service still skips — so the skip is real and the refusal below is not an artefact
+    # of validation running every time.
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False
+
+    euro_named = "feed" + chr(0x20AC) + "poller"
+    renamed = load_alert_settings(config_file_for(tmp_path), "prod", euro_named)
+    with pytest.raises(AlertEnvError) as exc:
+        validate_boot(renamed, "prod", marker_dir, alerter=Alerter(renamed))
+    assert "latin-1" in str(exc.value), (
+        "the refusal fired, but not the service-derived one this test is about")
+
+
+def test_the_marker_an_earlier_release_wrote_records_no_service_so_one_boot_revalidates(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """The migration, asserted rather than assumed. A marker written by 1.3.0-1.4.1 is a single
+    `sha256:<hex>` line with the RIGHT digest — so it used to match — and it now matches nothing,
+    which costs exactly one validation and one confirmation alert per service.
+
+    ⚠️ And then it stops. A format change that re-validated forever would be the loud failure
+    `_write_marker` documents, so the third boot is asserted to skip.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
+    marker.write_text(f"sha256:{digest}\n", encoding="utf-8")   # the shape 1.3.0-1.4.1 wrote
+    assert marker_facts(marker) == (f"sha256:{digest}", None)
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert len(channels["ntfy"].calls) == 1, "the one-off migration alert"
+    assert marker_facts(marker) == (f"sha256:{digest}", "feed-poller")
+
+    reset(channels)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False
+    assert silence(channels) == []
+
+
+def test_a_service_name_outside_ascii_round_trips_through_the_marker(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⚠️ THE ENCODING IS LOAD-BEARING, AND THIS IS THE REACHABLE CASE FOR IT.
+
+    A service name may carry non-ASCII: `ntfy_key` reduces it for the environment key it
+    derives (`café-poller` -> `NTFY_URL_CAF_POLLER`) but does not refuse the NAME, and the
+    title prefix carries it as written. So the marker has to record such a name and read it
+    back byte for byte, or the service re-validates and re-announces on EVERY boot — the loud
+    failure the deleted `_outrank` existed to prevent, reintroduced through the fix for #18.
+
+    `json.dumps` escapes it to one ASCII line, so the marker stays ASCII whatever the name is.
+    The name is assembled from its code point rather than written as a literal so that nothing
+    here depends on this file's own encoding surviving a round trip.
+    """
+    write_shared(tmp_path)
+    name = "caf" + chr(0xE9) + "-poller"
+    settings = load_alert_settings(config_file_for(tmp_path), "prod", name)
+    marker_dir = tmp_path / "appconfig"
+    marker = marker_dir / marker_name("prod")
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert marker_facts(marker)[1] == name
+    assert marker.read_text(encoding="utf-8").isascii(), (
+        "the marker is no longer ASCII, so what it says now depends on the encoding whoever "
+        "reads it happens to use")
+
+    reset(channels)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False, (
+        "the marker no longer matches its own writer, so this service re-announces every boot")
+    assert silence(channels) == []
+
+
+def test_the_marker_body_round_trips_a_name_no_caller_can_currently_supply() -> None:
+    """⭐ DEFENCE IN DEPTH, LABELLED AS SUCH RATHER THAN DRESSED UP AS A REACHABLE DEFECT.
+
+    `AlertSettings` requires `service` to be a non-blank string and strips it; it does NOT
+    refuse control characters the way `title_prefix` does, because a service name is not a
+    header value. Two OTHER things refuse one today, both measured while writing this test:
+    `load_alert_settings` refuses it outright, and `validate_boot` cannot reach the marker
+    writer with such a name because `_announce` asks `ntfy_key` for the topic key first and
+    `ntfy_key` refuses it too.
+
+    So this pins the marker FORMAT rather than a live path: a name written raw would split
+    into a line the parser could never put back together, and the marker would match nothing
+    forever. The cost of the guarantee is one `json.dumps`; the cost of relying on a refusal
+    two modules away is a silent re-announce loop the day that refusal moves.
+    """
+    from kw_common.alerting_env import _marker_body, _recorded_service
+
+    digest = "sha256:" + "a" * 64
+    for name in ("feed-poller", "caf" + chr(0xE9), "feed" + chr(92) + "npoller",
+                 chr(10).join(("feed", "poller")), chr(9) + "tabbed", chr(34) + "quoted" + chr(34)):
+        body = _marker_body(digest, name)
+        assert chr(10) not in body.partition(chr(10))[2], (
+            f"the body for {name!r} spans three lines, so the parser cannot read it back")
+        assert body.startswith(digest + chr(10)), "line one stopped being the digest alone"
+        assert body.isascii(), f"the body for {name!r} is not ASCII"
+        assert _recorded_service(body) == name
+
+
+def test_a_marker_whose_service_line_is_junk_revalidates_rather_than_crashing(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """Every unparseable shape answers "not validated", which is the safe direction. Truncation is
+    the reachable one: `os.replace` is atomic, but a volume restore or a hand-edit is not."""
+    settings, marker_dir, marker = _validated(tmp_path)
+    digest = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    for junk in ('service:"feed-poll', "service:", "service:12", "service:null", "notservice:x"):
+        marker.write_text(f"sha256:{digest}\n{junk}\n", encoding="utf-8")
+        reset(channels)
+        assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True, (
+            f"a marker whose service line is {junk!r} was treated as validated")
+        assert marker_facts(marker) == (f"sha256:{digest}", "feed-poller")
+
+
+def test_a_deeply_nested_service_payload_does_not_escape_as_a_bare_traceback() -> None:
+    """⛔ `json.loads` IS RECURSIVE AND `RecursionError` IS NOT A `ValueError`.
+
+    A marker whose service line is a couple of thousand open brackets used to take the whole
+    process out: `_recorded_service` caught `ValueError` only, so the error walked out of a
+    function documented to answer `None` for anything malformed, out of `validate_boot` - which is
+    documented to raise `AlertEnvError` and nothing else - and past the `except AlertEnvError` the
+    setup document tells every adopter to write.
+
+    ⚠️ THE DEPTH IS NOT A CONSTANT. Measured at 1000 it answered `None` and at 2000 it raised, and
+    the threshold moves with whatever stack the caller has already used, which is exactly why the
+    fix is a refusal on the payload's first character rather than a depth limit. This asserts the
+    refusal at several depths so it cannot pass by happening to sit under the limit.
+    """
+    from kw_common.alerting_env import _recorded_service
+
+    digest = "sha256:" + "a" * 64
+    for depth in (100, 1000, 2000, 20000):
+        body = digest + chr(10) + "service:" + "[" * depth
+        assert _recorded_service(body) is None, f"depth {depth} did not answer None"
+
+
+def test_a_deeply_nested_service_payload_revalidates_rather_than_crashing_the_boot(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """The same input through the documented entry point, which is where it mattered."""
+    settings, marker_dir, marker = _validated(tmp_path)
+    digest = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"sha256:{digest}" + chr(10) + "service:" + "[" * 20000 + chr(10),
+                      encoding="utf-8")
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert marker_facts(marker) == (f"sha256:{digest}", "feed-poller")
+
+
+def test_rolling_BACK_costs_one_revalidation_and_the_release_notes_say_so(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⚠️ THE CLAIM THIS TEST EXISTS FOR WAS WRITTEN AS "backward compatible" AND WAS FALSE.
+
+    Line one is unchanged, so anything reading the FIRST LINE reads the digest. The only reader
+    that exists is this module's own, and 1.3.0-1.4.1 compared the WHOLE stripped text - which a
+    two-line marker cannot equal. So a rollback re-validates and re-announces once per service,
+    exactly as the upgrade does.
+
+    The older comparison is spelled out here rather than imported, because the point is to measure
+    a reader that no longer exists in this tree. It is three lines, and they are the three lines
+    `_marker_matches` had — transcribed from the PUBLISHED 1.4.1 wheel rather than from memory,
+    and checked against it: `read_text(errors="replace").strip()`, refuse anything not opening
+    `sha256:`, then `recorded == current`.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    written = marker.read_text(encoding="utf-8", errors="replace").strip()
+    digest = "sha256:" + hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
+
+    def matches_1_4_1(recorded: str) -> bool:
+        if not recorded.startswith("sha256:"):
+            return False
+        return bool(digest) and recorded == digest
+
+    assert written.splitlines()[0] == digest, "line one is not the digest a 1.4.1 reader wants"
+    assert matches_1_4_1(written) is False, (
+        "a 1.4.1 reader matched this marker, so the rollback cost recorded in the CHANGELOG and "
+        "in `_marker_body` is wrong in the other direction")
+    # ⚠️ NOT `written != digest`. That was the first replacement for a tautology here, and a
+    # verification pass showed it DOMINATED: given line one is the digest, `matches_1_4_1` is
+    # `written == digest`, so the assertion above already asserts it and this one could never
+    # be the first to fail. The second line's SHAPE is the independent fact.
+    assert written.splitlines()[1].startswith("service:"), (
+        f"line two is {written.splitlines()[1]!r}, so what a 1.4.1 reader trips over is not "
+        f"the service record this rollback cost is attributed to")
+
+
+def test_two_services_sharing_one_marker_dir_are_named_in_the_log_every_boot(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
+    """⚠️ THE ONE CALLER MISTAKE WHOSE COST THIS RELEASE CHANGED.
+
+    `validate_boot` requires `marker_dir` to be the app's OWN directory and always has. Sharing one
+    used to be quietly wrong - the second service skipped on the first's marker, so its own
+    service-derived settings were never checked, which is #18 from the other side. It is now loudly
+    wrong: each service rewrites the other's record, so both re-validate and both announce, every
+    boot.
+
+    Nothing can tell that apart from a rename, so the behaviour is the same for both and the LOG is
+    what separates them: a rename replaces the record once, a shared directory replaces it on every
+    boot. This asserts the line names both services and that six boots produce six of them.
+
+    ⛔ AND THE MIGRATION CASE IS SILENT, asserted in the same test. A marker recording no service is
+    every service's first boot after this release, and warning about that would put the line in
+    front of every operator in the fleet exactly once, teaching them to ignore it.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    other = load_alert_settings(config_file_for(tmp_path), "prod", "log-shipper")
+
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
+    marker.write_text(f"sha256:{digest}" + chr(10), encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert [r for r in caplog.records if "CONFIG_PATH" in r.getMessage()] == [], (
+        "the first boot after the upgrade warned, which every service in the fleet would see once")
+
+    lines = []
+    for _ in range(3):
+        for who in (other, settings):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+                assert validate_boot(who, "prod", marker_dir, alerter=Alerter(who)) is True
+            lines += [r.getMessage() for r in caplog.records
+                      if "share this CONFIG_PATH" in r.getMessage()]
+
+    assert len(lines) == 6, f"six boots, {len(lines)} warnings - the line does not repeat"
+    assert "feed-poller" in lines[0] and "log-shipper" in lines[0], (
+        f"the line names one service only: {lines[0]!r}")
+
+
+def test_a_rename_is_reported_once_and_then_never_again(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
+    """The other half of the repeat-count claim, and the half that makes it a claim at all.
+
+    The line tells an operator that a rename says this once and a shared directory says it every
+    boot. That sentence is only true if a rename really does go quiet, so it is asserted rather
+    than asserted-about: one rename, then three more boots under the new name, then zero further
+    lines.
+    """
+    settings, marker_dir, _marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    renamed = load_alert_settings(config_file_for(tmp_path), "prod", "feed-poller-2")
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        assert validate_boot(renamed, "prod", marker_dir, alerter=Alerter(renamed)) is True
+    said = [r.getMessage() for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()]
+    assert len(said) == 1, f"the rename was reported {len(said)} times"
+    assert "feed-poller" in said[0] and "feed-poller-2" in said[0]
+
+    for _ in range(3):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+            validate_boot(renamed, "prod", marker_dir, alerter=Alerter(renamed))
+        assert [r for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()] == [], (
+            "the line repeated after a rename, so its own repeat-count advice is a lie")
+
+
+def test_a_rename_with_NO_alerter_accuses_nobody(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
+    """⛔ THE STATE THAT MADE THE FIRST VERSION OF THIS LINE A LIE, and it is a documented one.
+
+    With no `Alerter` available the marker is deliberately WITHHELD, so the confirmation is not
+    lost to a boot that could not send it. Asked BEFORE the write, the line then fired on every
+    boot after a single rename - accusing the operator of a shared `CONFIG_PATH` and telling them
+    to go and split a directory layout that was not the problem. Measured at five boots, five
+    accusations.
+
+    Asked after the write and OF THE FILE, a boot that wrote nothing says nothing: it has taken
+    nothing from anybody. The withheld marker has its own warning, which is not this one.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    renamed = load_alert_settings(config_file_for(tmp_path), "prod", "feed-poller-2")
+
+    for _ in range(5):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+            assert validate_boot(renamed, "prod", marker_dir, alerter=None) is True
+        assert [r for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()] == [], (
+            "a boot that withheld the marker still accused somebody of taking their record")
+    assert marker_facts(marker)[1] == "feed-poller", "the marker was written after all"
+
+
+def test_a_boot_that_REFUSES_does_not_accuse_anybody_on_its_way_out(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
+    """⛔ THE ORDERING THE FIRST VERSION GOT WRONG. Asked before `_check_layout`, the line landed
+    immediately above a refusal that had nothing to do with it - a `CONFIG_PATH` accusation printed
+    on top of "the shared root is not a directory", and the marker never rewritten, so it repeated
+    forever. The refusal is the only thing an operator should see here."""
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    renamed = load_alert_settings(config_file_for(tmp_path), "prod", "log-shipper")
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"), \
+            pytest.raises(AlertEnvError):
+        validate_boot(renamed, "prod", marker_dir, shared_root=tmp_path / "no-such-mount",
+                      alerter=Alerter(renamed))
+    assert [r for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()] == [], (
+        "the refusal was preceded by an accusation about a different thing entirely")
+    assert marker_facts(marker)[1] == "feed-poller", "the refusing boot rewrote the marker"
+
+
+def test_a_marker_write_that_did_not_LAND_accuses_nobody(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """⛔ THE MUTATION MATRIX FOUND THIS ONE, and it is the difference between two questions that
+    look the same: "did we call the writer" and "did the write land".
+
+    `_write_marker` cannot fail a boot and does not raise - an unwritable `CONFIG_PATH` costs a
+    warning and nothing else, deliberately, because refusing to start over a marker would turn a
+    missing volume into an outage. So a report keyed on having CALLED it would accuse the operator
+    of taking another service's record on a boot that took nothing: the marker still says what it
+    said, and the next boot will do the same thing again, forever.
+
+    ⚠️ A STAND-IN RATHER THAN A MODE, and that is not laziness. The reachable causes are an
+    unwritable directory and a marker whose mode a restore left read-only, and those two need
+    opposite things on the two platforms this library runs on - `os.replace` needs the DIRECTORY on
+    POSIX and is stopped by the FILE's read-only attribute on Windows. The state being tested is
+    "the write did not land", which is the same state however it was reached. Its POSIX-native
+    sibling below reaches it for real.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    other = load_alert_settings(config_file_for(tmp_path), "prod", "log-shipper")
+    assert validate_boot(other, "prod", marker_dir, alerter=Alerter(other)) is True
+    assert marker_facts(marker)[1] == "log-shipper"
+    before = marker.read_bytes()
+
+    monkeypatch.setattr(alerting_env, "_write_marker", lambda *a, **k: None)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert marker.read_bytes() == before, "the stand-in wrote after all, so this proves nothing"
+    assert [r for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()] == [], (
+        "a boot whose marker write did not land still accused another service of losing its record")
+
+
+@posix_only
+def test_an_unwritable_marker_directory_accuses_nobody_either(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
+    """The same state, reached the way an operator reaches it: `CONFIG_PATH` not writable.
+
+    `os.replace` needs the DIRECTORY, so removing its write bit is what stops the marker landing on
+    POSIX - and this workstation is not POSIX, which is exactly why the sibling above exists rather
+    than this test alone. This one runs on CI.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    other = load_alert_settings(config_file_for(tmp_path), "prod", "log-shipper")
+    assert validate_boot(other, "prod", marker_dir, alerter=Alerter(other)) is True
+    before = marker.read_bytes()
+
+    os.chmod(marker_dir, 0o500)
+    try:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+            assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+        assert marker.read_bytes() == before, "the write landed, so the directory was writable"
+        assert [r for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()] == [], (
+            "an unwritable CONFIG_PATH produced an accusation about a shared CONFIG_PATH")
+        assert [r for r in caplog.records if "could not write the validation marker" in
+                r.getMessage()], "the write failed silently, so this test measured nothing"
+    finally:
+        os.chmod(marker_dir, 0o700)
+
+
+def test_the_replacement_is_reported_even_when_the_config_ALSO_changed(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
+    """⚠️ THIS IS THE OPPOSITE OF WHAT THE FIRST VERSION DID, deliberately.
+
+    That version suppressed the line whenever the config's digest had moved, reasoning that a
+    re-validation caused by an edit says nothing about who wrote the marker. True of the question
+    it was asking - "what do I find here" - and false of the question this one asks: the record WAS
+    replaced, whatever else was going on, and a shared `CONFIG_PATH` does not stop being shared
+    because somebody edited the file.
+    """
+    settings, marker_dir, _marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+
+    config = Path(settings.config_file)
+    config.write_text(config.read_text(encoding="utf-8") + "# an edit" + chr(10), encoding="utf-8")
+    other = load_alert_settings(config_file_for(tmp_path), "prod", "log-shipper")
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        assert validate_boot(other, "prod", marker_dir, alerter=Alerter(other)) is True
+    said = [r.getMessage() for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()]
+    assert len(said) == 1, f"the replacement was reported {len(said)} times"
+
+
+
+def test_the_recursion_catch_is_LOAD_BEARING_and_not_redundant_with_the_quote_guard() -> None:
+    """⚠️⚠️ THE CLAIM THIS TEST EXISTS FOR WAS WRITTEN THE OTHER WAY ROUND AND WAS FALSE.
+
+    The two halves of the guard in `_recorded_service` were declared mutually redundant. A
+    verification pass falsified that for the `RecursionError` half: `json.loads` runs in PYTHON
+    frames, so its recursion check trips as a function of the CALLER'S remaining stack rather than
+    of the payload - and with a few frames of headroom the ordinary payload this module itself
+    writes raises inside `json.loads`. The quote guard cannot help, because that payload DOES open
+    with a quote.
+
+    Stubbed rather than measured, deliberately. The reachable version of this depends on how many
+    frames the caller has already burnt, which is not a property a test should assert against - its
+    sibling below probes the real thing and skips when it cannot establish a window. This one is
+    the deterministic pin: whatever `json.loads` raises, this function answers `None`.
+    """
+    import json as _json
+
+    from kw_common import alerting_env as env
+
+    body = env._marker_body("sha256:" + "a" * 64, "feed-poller")
+    assert env._recorded_service(body) == "feed-poller", "the fixture is not a readable marker"
+
+    real = _json.loads
+    try:
+        _json.loads = lambda *_a, **_k: (_ for _ in ()).throw(RecursionError("stack"))
+        assert env._recorded_service(body) is None, (
+            "a RecursionError from the parser escaped a function documented to answer None for "
+            "anything it cannot read")
+    finally:
+        _json.loads = real
+    assert env._recorded_service(body) == "feed-poller", "the stub was not undone"
+
+
+def test_the_recursion_catch_FIRES_for_a_well_formed_marker_read_by_a_deep_caller() -> None:
+    """The same arm reached for real rather than stubbed, and asserting only what it can promise.
+
+    ⚠️ THE FIRST VERSION OF THIS TEST ASSERTED TOO MUCH and failed honestly: it probed depths where
+    `_recorded_service` cannot be ENTERED at all, and no guard inside a function survives not having
+    the frame to call it. That is not this arm's job and no code can make it so.
+
+    What the arm does promise is narrower and is what is measured here: there is a band of caller
+    depths where the function is entered fine and `json.loads` INSIDE it runs out of stack - and in
+    that band the answer is `None` rather than a traceback. So the probe walks the depth up until
+    the call itself becomes impossible, and requires that at least one answer along the way was
+    `None`. A `None` there can only have come from the parser failing and being caught, because the
+    payload is the ordinary one this module writes and parses correctly at depth 0.
+
+    Skips rather than fails when the interpreter gives no such band - a stack-depth probe that
+    cannot find its window is a test with nothing to say, not a defect.
+    """
+    import sys
+
+    from kw_common import alerting_env as env
+
+    body = env._marker_body("sha256:" + "a" * 64, "feed-poller")
+    assert env._recorded_service(body) == "feed-poller", "the fixture is not a readable marker"
+
+    def at_depth(n: int, fn):  # type: ignore[no-untyped-def]
+        return fn() if n <= 0 else at_depth(n - 1, fn)
+
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(400)
+    answers = []
+    try:
+        for depth in range(1, 400):
+            try:
+                answers.append(at_depth(depth, lambda: env._recorded_service(body)))
+            except RecursionError:
+                break
+    finally:
+        sys.setrecursionlimit(limit)
+
+    if None not in answers:
+        pytest.skip(f"no depth band where the parser alone ran out of stack "
+                    f"({len(answers)} depths probed)")
+    assert answers[0] == "feed-poller", "the shallowest call did not read the marker"
+
+
+def test_an_ordinary_revalidation_of_the_SAME_service_accuses_nobody(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
+    """⛔ THE MOST COMMON VALIDATING BOOT IN THE FLEET, and the mutation matrix found it unpinned.
+
+    One service, its config edited, booting again: the marker records the same name, so nothing was
+    replaced and there is nothing to say. Weakening the guard to `if was is None:` leaves the whole
+    suite green while EVERY such boot emits the shared-`CONFIG_PATH` accusation - and the
+    repeat-count claim the line makes ("on every boot means a shared directory") depends entirely
+    on this arm, because an edited config is the ordinary reason to re-validate.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+
+    config = Path(settings.config_file)
+    for i in range(4):
+        config.write_text(config.read_text(encoding="utf-8") + f"# edit {i}" + chr(10),
+                          encoding="utf-8")
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+            assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+        assert [r for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()] == [], (
+            f"boot {i} accused this service of taking its own record")
+    assert marker_facts(marker)[1] == "feed-poller"
 
 
 # ============================================================ the package's own boundaries
