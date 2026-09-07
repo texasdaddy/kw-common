@@ -3538,8 +3538,8 @@ def test_a_refused_SMTP_PORT_complains_ONCE_per_distinct_value_not_once_per_send
     assert AlertConfig(email={"SMTP_PORT": "65536"}).setting_faults() != []
 
 
-def test_the_SMTP_PORT_memo_is_per_CONFIG_so_one_service_cannot_silence_another(
-        caplog: pytest.LogCaptureFixture) -> None:
+def test_the_SMTP_PORT_memo_tells_EACH_SERVICES_operator_once(
+        caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
     """⛔⛔ THE FIRST VERSION OF THIS MEMO WAS A SINGLE GLOBAL HOLDING "the last raw value seen",
     and the verification gate measured it wrong in BOTH directions:
 
@@ -3549,29 +3549,85 @@ def test_the_SMTP_PORT_memo_is_per_CONFIG_so_one_service_cannot_silence_another(
       * a HEALTHY config sharing the process evicted the broken one's memo on every call, because
         the success path wrote it too: 50 sends produced 50 lines, the flood this exists to remove.
 
-    Three properties, all asserted here, because any one alone is satisfiable by a wrong design.
+    ⚠️ AND IT GOES THROUGH THE REAL SHAPE, not a hand-built one. The first version of this test
+    gave the two services DIFFERENT `config_file` values — which no supported call path in this
+    package produces, because `alerting_env.config_file_for()` hands every service in a process
+    the same `<shared_root>/configs/alerting.env`. It passed while the scenario it named was still
+    broken, which the confirming pass caught. Two services, ONE shared file, their own loggers.
     """
-    broken = [AlertConfig(email={"SMTP_PORT": "0"}, config_file=f"/etc/{name}.env")
-              for name in ("svcA", "svcB")]
-    healthy = AlertConfig(email={"SMTP_PORT": "587"}, config_file="/etc/healthy.env")
+    records: dict[str, int] = {"svcA.alerts": 0, "svcB.alerts": 0}
 
-    with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
+    class Count(logging.Handler):
+        def __init__(self, key: str) -> None:
+            super().__init__()
+            self.key = key
+
+        def emit(self, record: logging.LogRecord) -> None:
+            if "SMTP_PORT" in record.getMessage():
+                records[self.key] += 1
+
+    for key in records:
+        logger = logging.getLogger(key)
+        logger.addHandler(Count(key))
+        monkeypatch.setattr(logger, "level", logging.DEBUG)
+        monkeypatch.setattr(logger, "propagate", False)
+    try:
+        shared = "/srv/shared/configs/alerting.env"      # ONE file, as the convention gives it
+        broken = [AlertConfig(email={"SMTP_PORT": "0"}, config_file=shared, logger_name=name)
+                  for name in records]
+        # A genuinely SEPARATE healthy config — its own file and its own logger, which is the only
+        # way a healthy one differs from a broken one when the port comes from a shared file. It
+        # must evict neither entry; the old global was evicted by exactly this.
+        healthy = AlertConfig(email={"SMTP_PORT": "587"}, config_file="/srv/other/alerting.env",
+                              logger_name="other.alerts")
         for _ in range(25):
             for cfg in broken:
                 cfg.smtp_port()
             healthy.smtp_port()
-    assert caplog.text.count("SMTP_PORT") == 2, (
-        f"two services with the same bad port must each be told ONCE, and a healthy config in "
-        f"the same process must evict neither — got {caplog.text.count('SMTP_PORT')} line(s) "
-        f"across 25 rounds:\n{caplog.text}")
+    finally:
+        for key in records:
+            for handler in list(logging.getLogger(key).handlers):
+                if isinstance(handler, Count):
+                    logging.getLogger(key).removeHandler(handler)
 
-    # ...and the same config, corrected and then re-broken, complains AFRESH — the property that
-    # made "once per distinct value" preferable to "once per process".
+    assert records == {"svcA.alerts": 1, "svcB.alerts": 1}, (
+        f"each service's own operator must be told exactly ONCE about the shared file's bad port, "
+        f"and a healthy read must evict neither — got {records} across 25 rounds")
+
+    # ...and the same config+logger, corrected then re-broken, complains AFRESH — the property
+    # that made "once per distinct value" preferable to "once per process".
     caplog.clear()
     with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
-        AlertConfig(email={"SMTP_PORT": "587"}, config_file="/etc/svcA.env").smtp_port()
-        AlertConfig(email={"SMTP_PORT": "0"}, config_file="/etc/svcA.env").smtp_port()
+        AlertConfig(email={"SMTP_PORT": "587"}, config_file="/etc/svc.env").smtp_port()
+        AlertConfig(email={"SMTP_PORT": "0"}, config_file="/etc/svc.env").smtp_port()
     assert caplog.text.count("SMTP_PORT") == 1, caplog.text
+
+    # ...and a hand-built config with an UNHASHABLE config_file does not raise out of an accessor
+    # that has never raised for one.
+    assert AlertConfig(email={"SMTP_PORT": "0"},
+                       config_file=["/etc/a.env"]).smtp_port() == alerting.DEFAULT_SMTP_PORT
+
+
+def test_the_two_module_level_loggers_are_KEYWORD_ONLY(tmp_path: Path) -> None:
+    """⚠️ THE CHANGELOG PROMISES THIS AND NOTHING ASSERTED IT — the confirming pass reverted the
+    `*` on `read_jsonl_tail` and the entire suite stayed green.
+
+    It matters less than it looks (the parameter is new in 1.5.0, so no released caller can be
+    passing it positionally) and it is asserted anyway, because a promise in the release notes
+    that the signature does not keep is exactly the defect this release already shipped once with
+    `logger_name`. Both spellings, since the same sentence names both.
+    """
+    log = logging.getLogger("kw_common.alerting")
+    assert alerting.read_jsonl_tail(str(tmp_path / "none.log"), 5, logger=log) == []
+    with pytest.raises(TypeError):
+        alerting.read_jsonl_tail(str(tmp_path / "none.log"), 5, "", None, 1,  # type: ignore[misc]
+                                 log)
+
+    config = tmp_path / "some.env"
+    config.write_text("A=1\n", encoding="utf-8")
+    assert alerting.parse_env_file(str(config), logger=log) == {"A": "1"}
+    with pytest.raises(TypeError):
+        alerting.parse_env_file(str(config), log)   # type: ignore[misc]
 
 
 def test_a_hostile_str_subclass_as_the_logger_name_cannot_cost_the_config_load() -> None:

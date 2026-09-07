@@ -402,6 +402,19 @@ def load_alert_settings(config_path: str | os.PathLike[str], deploy_env: str,
     """
     env = normalise_env(deploy_env)
     key = ntfy_key(service)          # validates `service` before anything else is read
+    # ⛔ THIS LAYER'S REFUSAL TYPE IS `AlertEnvError`, and a pass-through must not smuggle another
+    # one out. `AlertSettings.__post_init__` refuses a control character in `logger_name` with a
+    # `ValueError`, which is right for the constructor and wrong here: an adopter catches
+    # `AlertEnvError` at boot to print its own one-liner, and would have got a bare traceback
+    # instead — the outcome `_refuse` exists to prevent. Reachable straight from a CRLF-bearing
+    # environment variable. Asked BEFORE the file is read, like every other refusal here.
+    if not isinstance(logger_name, str):
+        raise _refuse(f"logger_name must be a string, got {type(logger_name).__name__}")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in str.__str__(logger_name)):
+        raise _refuse(
+            "logger_name contains a control character. It is interpolated into every log record "
+            "as %(name)s, so a newline in it forges log lines, and it is not a name any logging "
+            "configuration can be written against.")
     # ⭐ NORMALISED ONCE, HERE, AND USED EVERYWHERE BELOW. `AlertSettings` strips the service name
     # in its own constructor, so building the prefix from the RAW argument produced two different
     # spellings of the same service — and the prefix is the one that reaches an HTTP header and a

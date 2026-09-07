@@ -2002,16 +2002,22 @@ def changed_paths(root: Path, *revs: str) -> list[str]:
     # died with a traceback naming an argument the operator never typed. The separator says
     # "everything before this is a revision" and settles it.
     #
-    # ⛔⛔ EVERY GIT CALL THAT TAKES A REVISION CARRIES ONE — `diff`, `rev-list` AND `show`. The
-    # first version of this comment said "every diff whose revision can be a NAME rather than a
-    # full sha", and that scoping was FALSE IN BOTH HALVES: git's ambiguity check fires on a FULL
-    # 40-hex sha too, as soon as a filesystem entry of that name exists, and reasoning that a
-    # full sha was safe is exactly what left `commit_identity` and `commit_message` — which run
-    # `git show <sha>` — without one. The verification gate planted a single UNTRACKED file named
-    # after an in-range commit and the whole range scan died `exited 128`, printing "Fetch the
-    # base ref", a remedy for a cause that had nothing to do with it. A repository that keeps a
-    # `format-patch` scratch file or a sha-named dump at its root reaches that. Fixed the CLASS:
-    # no call here reasons about whether its revision could collide.
+    # ⛔⛔ THE THREE AMBIGUITY-CHECKED VERBS THIS FILE RUNS CARRY ONE — `diff`, `rev-list` and
+    # `show`. The first version of this comment said "every diff whose revision can be a NAME
+    # rather than a full sha", and that scoping was FALSE IN BOTH HALVES: git's ambiguity check
+    # fires on a FULL 40-hex sha too, as soon as a filesystem entry of that name exists, and
+    # reasoning that a full sha was safe is exactly what left `commit_identity` and
+    # `commit_message` — which run `git show <sha>` — without one. The verification gate planted a
+    # single UNTRACKED file named after an in-range commit and the whole range scan died
+    # `exited 128`, printing "Fetch the base ref", a remedy for a cause with nothing to do with
+    # it. A repository keeping a `format-patch` scratch file or a sha-named dump reaches that.
+    #
+    # ⚠️ NAMED RATHER THAN GENERALISED, deliberately, because the confirming pass caught THIS
+    # comment over-claiming the same way its predecessor did. `rev-parse --verify` and `cat-file`
+    # also take revisions here and carry no separator — measured with a sha-named file planted,
+    # neither is ambiguity-checked, so nothing is wrong — but "every git call that takes a
+    # revision" was a sentence wider than the diff, in a comment whose entire subject is an
+    # over-scoped sentence hiding a bug. Say which verbs, not which class.
     out = _git(root, *_DIFF_CONFIG, "diff", *_DIFF_FLAGS, "--name-only", "-z",
                "--diff-filter=d", *revs, "--")
     return [p for p in out.split("\0") if p]

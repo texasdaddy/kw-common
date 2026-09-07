@@ -328,10 +328,10 @@ def _settings_logger_name(settings: object) -> str:
 # produced one identical ERROR line per alert, forever. A service alerting every few minutes filled
 # its log with a single sentence.
 #
-# ⛔⛔ KEYED ON WHICH CONFIG THE VALUE CAME FROM, AND WRITTEN ONLY WHEN A FAULT IS REPORTED. The
-# first version of this was a single global holding "the last raw value seen", on the reasoning
-# that the config it memoises is the one shared file. That reasoning is wrong twice over, and the
-# verification gate measured both:
+# ⛔⛔ KEYED ON (WHERE THE VALUE CAME FROM, WHERE THE COMPLAINT GOES), AND WRITTEN ONLY WHEN A
+# FAULT IS REPORTED. The first version was a single global holding "the last raw value seen", on
+# the reasoning that the config it memoises is the one shared file. That reasoning was wrong twice
+# over, and the verification gate measured both:
 #
 #   * TWO SERVICES IN ONE PROCESS with the same bad port: the first complained, and the second was
 #     silenced FOREVER by the first service's memo — with the per-service loggers this release also
@@ -341,15 +341,22 @@ def _settings_logger_name(settings: object) -> str:
 #     success path wrote it too: 50 sends produced 50 lines, which is the flood this exists to
 #     remove.
 #
-# So the key is the config's own file and the entry is cleared when THAT config reads healthy —
-# which is what keeps the property that beat "log once per process": a value corrected and then
-# re-broken complains again, while a value left broken is quiet after the first line.
+# ⚠️ AND THE LOGGER IS PART OF THE KEY, WHICH THE SECOND VERSION MISSED. Keyed on `config_file`
+# alone it still failed the first case for THIS LIBRARY'S OWN DEPLOYMENT SHAPE: `config_file_for()`
+# hands every service in a process the same `<shared_root>/configs/alerting.env`, so two services
+# share one key and the second one's operator — watching their own logger — still never sees the
+# fault. The confirming pass caught that, and it is the same mistake one level up: reasoning about
+# the key from what the value IS rather than from who needs to be told. One line per audience.
 #
-# Bounded by the number of distinct config files in a process, i.e. the number of services. ⚠️ Not
+# So the entry is cleared when THAT config reads healthy, which keeps the property that beat "log
+# once per process": a value corrected and then re-broken complains again, while a value left
+# broken is quiet after the first line.
+#
+# Bounded by (config files x logger names) in a process, i.e. the number of services. ⚠️ Not
 # synchronised, like the rest of this module: two threads racing the same key can produce a
 # duplicate line, which is stated rather than claimed away. The boot report (`setting_faults`)
 # never consults this, so an operator who pages on it sees the fault whatever this does.
-_COMPLAINED_SMTP_PORT: dict[str | None, str] = {}
+_COMPLAINED_SMTP_PORT: dict[tuple[str | None, str], str] = {}
 
 # --- severity ------------------------------------------------------------------------------
 OK = "OK"
@@ -833,7 +840,12 @@ class AlertSettings:
         # class `_parse_env_text`'s own comment warns about; and a name carrying one is not the
         # name any logging configuration was written against, so the records silently land
         # somewhere nobody is watching — this field's whole failure mode.
-        if any(ord(ch) < 32 or ord(ch) == 127 for ch in self.logger_name):
+        # ⚠️ `str(...)` FIRST. `isinstance` above admits a `str` SUBCLASS, and this module designs
+        # for hostile ones elsewhere — one whose `__iter__` raises would otherwise escape this
+        # scan as a `RuntimeError` where every other refusal in this constructor is a `ValueError`.
+        # The confirming pass found the two repairs in one diff taking opposite stances on the
+        # same input class; this is the one that had to move.
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in str.__str__(self.logger_name)):
             raise ValueError(
                 "AlertSettings.logger_name contains a control character. It is interpolated into "
                 "every log record as %(name)s, so a newline in it forges log lines — and it is "
@@ -1522,27 +1534,33 @@ class AlertConfig:
         about a channel that sends.
         """
         lg = self._log
+        # ⚠️ `_usable_path`, not the raw field: this is a PUBLIC dataclass a consumer may build by
+        # hand, and an unhashable `config_file` would otherwise raise out of an accessor that has
+        # never raised for one. It normalises to `str | None`, which is what `AlertConfig.load`
+        # always produces anyway.
+        key = (_usable_path(self.config_file), lg.name)
         raw = (self.email or {}).get("SMTP_PORT", "").strip()
         if not raw:
-            # ⚠️ A HEALTHY READ CLEARS ONLY THIS CONFIG'S ENTRY. Clearing more — or writing a
-            # "last seen" value here — is what let one service's good port silence another's bad
-            # one, and let a healthy config evict a broken one's memo on every send.
-            _COMPLAINED_SMTP_PORT.pop(self.config_file, None)
+            # ⚠️ A HEALTHY READ CLEARS ONLY THIS KEY. Clearing more — or writing a "last seen"
+            # value here — is what let one service's good port silence another's bad one, and let
+            # a healthy config evict a broken one's memo on every send.
+            _COMPLAINED_SMTP_PORT.pop(key, None)
             return DEFAULT_SMTP_PORT
         # The DECISION is `smtp_port_fault`'s, so that a boot report and a config dump reach the
         # same verdict without provoking a send-time log line to find it out. What stays here is
         # the REPORTING, which is what makes this the send-time accessor.
         fault = smtp_port_fault(raw)
         if not fault:
-            _COMPLAINED_SMTP_PORT.pop(self.config_file, None)
+            _COMPLAINED_SMTP_PORT.pop(key, None)
             return int(raw)
-        # ⭐ ONCE PER DISTINCT VALUE, PER CONFIG (consumer#46) — see `_COMPLAINED_SMTP_PORT`. The
-        # same fault on the same value, send after send, is one line; a different value, or the
-        # same value in a DIFFERENT service's config, complains on its own account.
+        # ⭐ ONCE PER DISTINCT VALUE, PER CONFIG, PER LOGGER (consumer#46) — see
+        # `_COMPLAINED_SMTP_PORT`. The same fault on the same value, send after send, is one line;
+        # a different value complains afresh, and so does the SAME value reported to a different
+        # service's logger, because that is a different operator who has not been told.
         # `%s` with the complaint already assembled, so nothing in the message is re-interpreted
         # as a format string. The SHAPE of the rejected value, never the value.
-        if _COMPLAINED_SMTP_PORT.get(self.config_file) != raw:
-            _COMPLAINED_SMTP_PORT[self.config_file] = raw
+        if _COMPLAINED_SMTP_PORT.get(key) != raw:
+            _COMPLAINED_SMTP_PORT[key] = raw
             lg.error("%s", fault)
         return DEFAULT_SMTP_PORT
 

@@ -142,12 +142,17 @@ def _reset_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """`configure()` installs a process-wide default; no test may leave one behind.
 
     ⭐ AND THE `SMTP_PORT` MEMO, WHICH IS THE SAME KIND OF THING. It is process-global state that
-    decides whether a complaint is LOGGED, so a test that provoked one would otherwise silence it
-    for the next test that expects it — and such a failure is order-dependent, which is the worst
-    shape a test can fail in. The verification gate measured exactly that: two tests that pass
-    individually and pass as a whole file, and FAIL when run as a pair, because the file's other
-    tests happened to clear the memo in between. Any `-k` selection, a reordering plugin or an
-    xdist shard would have flipped it.
+    decides whether a complaint is LOGGED, so a test that provoked one could silence it for the
+    next test that expects it — an order-dependent failure, which is the worst shape a test can
+    fail in. The verification gate measured exactly that against the FIRST version of that memo (a
+    single global): two tests that passed individually and as a whole file, and FAILED when run as
+    a pair, because the file's other tests happened to clear it in between.
+
+    ⚠️ STATED IN THE PAST TENSE ON PURPOSE. The memo is keyed per (config file, logger) now, so no
+    test in this suite currently collides and deleting this line leaves the suite green — the
+    confirming pass checked. It stays as INSURANCE, because the property it protects is "a global
+    that decides whether something is logged is reset between tests", and the next test to provoke
+    a complaint should not have to rediscover that.
 
     A fresh dict rather than `.clear()`: `monkeypatch` rebinds the module attribute and restores
     it afterwards, so the real one is never mutated.

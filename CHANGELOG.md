@@ -140,11 +140,15 @@ in the range and `--staged` scans. It is mentioned only so nobody attributes it 
   The two halves of one hand-edited file were held to different rules. ⚠️ **A new boot refusal**,
   for a configuration that was not delivering. Two addresses in `EMAIL_FROM` still truncate to the
   first and deliver, which is a misconfiguration with a reasonable outcome and is left alone.
-- **A refused `SMTP_PORT` complains once per DISTINCT VALUE, not once per send.** The config is
-  re-read on every delivered notification — deliberately, so a rotated password takes effect
-  without a restart — so one mistyped port produced one identical ERROR line per alert, forever.
-  Measured: 5 calls, 5 lines. A value corrected and then re-broken complains afresh, so a real
-  recurrence is not swallowed; the boot report (`setting_faults()`) carries the fault regardless.
+- **A refused `SMTP_PORT` complains once per DISTINCT VALUE — per config file, per logger — rather
+  than once per send.** The config is re-read on every delivered notification, deliberately, so a
+  rotated password takes effect without a restart; one mistyped port therefore produced one
+  identical ERROR line per alert, forever. Measured: 5 calls, 5 lines. A value corrected and then
+  re-broken complains afresh, so a real recurrence is not swallowed, and the boot report
+  (`setting_faults()`) carries the fault regardless. ⚠️ Two services in one process share the
+  fleet's single `alerting.env`, so they share the FAULT — the logger is part of the key precisely
+  so each service's own operator is told once, rather than the first one to ask taking the only
+  line. On the fleet's shape that means N services, N lines, then silence.
 - **A failed email send no longer logs the RECIPIENT ADDRESS verbatim.** `SMTPRecipientsRefused`
   carries the recipient dict in its `str()`, so a broken channel printed the address on every
   alert — in the log an operator is told to fetch and paste into an issue, and in exactly the
