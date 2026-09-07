@@ -2834,6 +2834,68 @@ def test_a_boot_that_REFUSES_does_not_accuse_anybody_on_its_way_out(
     assert marker_facts(marker)[1] == "feed-poller", "the refusing boot rewrote the marker"
 
 
+def test_a_marker_write_that_did_not_LAND_accuses_nobody(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture,
+        monkeypatch: pytest.MonkeyPatch) -> None:
+    """⛔ THE MUTATION MATRIX FOUND THIS ONE, and it is the difference between two questions that
+    look the same: "did we call the writer" and "did the write land".
+
+    `_write_marker` cannot fail a boot and does not raise - an unwritable `CONFIG_PATH` costs a
+    warning and nothing else, deliberately, because refusing to start over a marker would turn a
+    missing volume into an outage. So a report keyed on having CALLED it would accuse the operator
+    of taking another service's record on a boot that took nothing: the marker still says what it
+    said, and the next boot will do the same thing again, forever.
+
+    ⚠️ A STAND-IN RATHER THAN A MODE, and that is not laziness. The reachable causes are an
+    unwritable directory and a marker whose mode a restore left read-only, and those two need
+    opposite things on the two platforms this library runs on - `os.replace` needs the DIRECTORY on
+    POSIX and is stopped by the FILE's read-only attribute on Windows. The state being tested is
+    "the write did not land", which is the same state however it was reached. Its POSIX-native
+    sibling below reaches it for real.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    other = load_alert_settings(config_file_for(tmp_path), "prod", "log-shipper")
+    assert validate_boot(other, "prod", marker_dir, alerter=Alerter(other)) is True
+    assert marker_facts(marker)[1] == "log-shipper"
+    before = marker.read_bytes()
+
+    monkeypatch.setattr(alerting_env, "_write_marker", lambda *a, **k: None)
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert marker.read_bytes() == before, "the stand-in wrote after all, so this proves nothing"
+    assert [r for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()] == [], (
+        "a boot whose marker write did not land still accused another service of losing its record")
+
+
+@posix_only
+def test_an_unwritable_marker_directory_accuses_nobody_either(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
+    """The same state, reached the way an operator reaches it: `CONFIG_PATH` not writable.
+
+    `os.replace` needs the DIRECTORY, so removing its write bit is what stops the marker landing on
+    POSIX - and this workstation is not POSIX, which is exactly why the sibling above exists rather
+    than this test alone. This one runs on CI.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    other = load_alert_settings(config_file_for(tmp_path), "prod", "log-shipper")
+    assert validate_boot(other, "prod", marker_dir, alerter=Alerter(other)) is True
+    before = marker.read_bytes()
+
+    os.chmod(marker_dir, 0o500)
+    try:
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+            assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+        assert marker.read_bytes() == before, "the write landed, so the directory was writable"
+        assert [r for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()] == [], (
+            "an unwritable CONFIG_PATH produced an accusation about a shared CONFIG_PATH")
+        assert [r for r in caplog.records if "could not write the validation marker" in
+                r.getMessage()], "the write failed silently, so this test measured nothing"
+    finally:
+        os.chmod(marker_dir, 0o700)
+
+
 def test_the_replacement_is_reported_even_when_the_config_ALSO_changed(
         tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
     """⚠️ THIS IS THE OPPOSITE OF WHAT THE FIRST VERSION DID, deliberately.
