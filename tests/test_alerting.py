@@ -3596,11 +3596,24 @@ def test_the_SMTP_PORT_memo_tells_EACH_SERVICES_operator_once(
 
     # ...and the same config+logger, corrected then re-broken, complains AFRESH — the property
     # that made "once per distinct value" preferable to "once per process".
-    caplog.clear()
-    with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
-        AlertConfig(email={"SMTP_PORT": "587"}, config_file="/etc/svc.env").smtp_port()
-        AlertConfig(email={"SMTP_PORT": "0"}, config_file="/etc/svc.env").smtp_port()
-    assert caplog.text.count("SMTP_PORT") == 1, caplog.text
+    #
+    # ⚠️ BOTH HEALTHY READS CLEAR, and the mutation matrix is what found the second one unpinned:
+    # a port can be corrected to a VALID value or REMOVED ALTOGETHER (blank, which falls back to
+    # the default silently), and each takes its own branch. Testing only the valid one let
+    # "the blank path never clears" survive the whole suite — so a port fixed by deleting it and
+    # then mistyped again would have been swallowed forever.
+    for healthy in ("587", "", "   "):
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
+            # ⚠️ EACH ROUND STARTS FROM A HEALTHY READ, not from a broken one. `caplog.clear()`
+            # empties the LOG and not the memo, so an iteration beginning with the same broken
+            # value the previous one ended on is legitimately silent — and a test that counted
+            # that would be measuring its own carry-over rather than the code.
+            for port in (healthy, "0", healthy, "0"):
+                AlertConfig(email={"SMTP_PORT": port}, config_file="/etc/svc.env").smtp_port()
+        assert caplog.text.count("SMTP_PORT") == 2, (
+            f"a port corrected to {healthy!r} and then re-broken must complain again — a real "
+            f"recurrence was swallowed:\n{caplog.text}")
 
     # ...and a hand-built config with an UNHASHABLE config_file does not raise out of an accessor
     # that has never raised for one.
