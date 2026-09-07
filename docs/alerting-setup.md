@@ -172,7 +172,16 @@ both derived from the service name.
 
 ⚠️ **A marker written before v1.5.0 records no service**, so the first boot after that upgrade
 re-validates and sends one confirmation alert per service. Then it stops. An operator upgrading a
-fleet should expect that alert rather than read it as a configuration that broke.
+fleet should expect that alert rather than read it as a configuration that broke. Rolling back
+costs the same one alert per service, for the mirror-image reason: the older release compares the
+marker's whole text to a bare `sha256:<hex>`, which a two-line marker cannot equal.
+
+⛔ **Two services may not share one `CONFIG_PATH`.** That has always been the rule — the marker
+directory is the app's OWN read-write directory — and since v1.5.0 breaking it is expensive
+rather than merely wrong: each service overwrites the other's record, so both re-validate and
+both send their confirmation alert on EVERY boot. The process log names both services when this
+happens; a line that repeats every boot is a shared directory, a line that appears once is a
+service that was renamed.
 
 To force a re-check without editing the file, delete the marker: `CONFIG_PATH/.alerting-validated-<env>`.
 

@@ -150,7 +150,14 @@ two. Later boots skip while both still match. The marker is **per environment**:
 for all of them, promoting a service from dev to prod — which does not touch the shared file —
 skipped validation entirely and the service came up with no topic at all. The service is recorded
 for the same reason and it was the same defect: validation checks settings **derived from the
-service name**, so a rename on an unchanged config used to skip a refusal it should have got. **On failure it logs and raises and does not attempt to alert** — it cannot report a broken
+service name**, so a rename on an unchanged config used to skip a refusal it should have got.
+
+⚠️ **Two services must not share one `CONFIG_PATH`.** That was always the rule — `marker_dir` is
+the app's own read-write directory — and the cost of breaking it changed: each service now
+overwrites the other's record, so both re-validate and both announce on every boot. The process
+log names both services when it happens, so a line that repeats is the diagnosis.
+
+**On failure it logs and raises and does not attempt to alert** — it cannot report a broken
 alerting channel through that channel — and with no `Alerter` installed it validates but withholds
 the marker, so the confirmation is not lost to a boot that could not send it.
 
@@ -161,9 +168,11 @@ booted clean and the service came up alerting nobody. A digest answers that what
 says, in both directions — a restore with different bytes re-validates, an identical one does not.
 Upgrading from a version that wrote an empty marker, or from one whose marker recorded no
 service, costs exactly one re-validation — **and one confirmation alert per service**, since a
-re-validation announces. That is not silent: an operator
-upgrading a fleet should expect that alert to arrive on every channel the service has configured,
-so one email and one push per service rather than none.
+re-validation announces. That is not silent: an operator upgrading a fleet should expect that
+alert to arrive on every channel the service has configured, so one email and one push per
+service rather than none. ⚠️ **Rolling BACK costs the same**, and symmetry is the reason: an
+older release compared the marker's whole text to a bare digest, so a two-line marker does not
+match there either.
 
 ⭐ **And the marker is created `0600`, because contents that decide are contents somebody can
 read.** The digest is taken over the file holding the SMTP password, so a marker the rest of a

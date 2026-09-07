@@ -64,6 +64,24 @@ service has configured, so an operator upgrading the fleet should expect one ema
 per service rather than none. It is the same migration 1.3.0 made when the marker stopped being
 empty, and it needs no operator step.
 
+⚠️ **Rolling BACK costs the same, and the first draft of this section said it cost nothing.**
+Line one is still `sha256:<hex>`, so anything reading the FIRST LINE reads the digest — but the
+only reader that exists is this library's own, and 1.3.0–1.4.1 compares the marker's WHOLE text
+to a bare digest, which a two-line marker cannot equal. Measured, not reasoned about. So a
+rollback re-validates and re-announces once per service, exactly as the upgrade does. Cheap and
+symmetric, but a cost rather than the absence of one.
+
+⛔ **Check that no two services share a `CONFIG_PATH` before you bump.** That has always been
+against the rule — `marker_dir` is documented as the app's OWN read-write directory — and the
+COST of breaking it changed here. It used to be quiet and wrong: the second service skipped
+validation on the first service's marker, so its own service-derived settings were never
+checked, which is #18 arriving from the other side. It is now loud: each service overwrites the
+other's record, so both re-validate and both announce on EVERY boot — measured at four alerts
+per boot for two services. Nothing in the library can tell that apart from a legitimate rename,
+which produces the identical marker state and must re-validate, so the behaviour is the same for
+both and the process log is what separates them: **a warning naming both services that repeats
+every boot is a shared directory; one that appears once is a rename.**
+
 **Nothing in any module's `__all__` was removed or renamed.** Four names were added.
 
 **Unchanged, and worth knowing if you have a large tracked asset:** the tree scan reads every
@@ -188,8 +206,13 @@ in the range and `--staged` scans. It is mentioned only so nobody attributes it 
   nothing else, and a reader that knows only the older format still reads the digest correctly.
   Line two is `service:"<name>"`, JSON-encoded so that a name carrying a quote, a non-ASCII
   letter or a control character cannot split into a line the parser could never read back — which
-  would be a marker that matches nothing forever, re-announcing on every boot. See the migration
-  note above: this is what makes every service re-validate once.
+  would be a marker that matches nothing forever, re-announcing on every boot. `json.loads` is
+  also recursive and `RecursionError` is not a `ValueError`, so the reader refuses any payload
+  that does not open with a quote before the parser sees it — a marker of two thousand `[` used
+  to leave `validate_boot` as a bare traceback, past the `except AlertEnvError` the setup
+  document tells adopters to write. See the migration note above: this is what makes every
+  service re-validate once, and the two notes beside it for the rollback and the shared
+  `CONFIG_PATH`.
 - **A `logger_name` that raises cannot cost a config load.** Found while adding the field: a
   bare `getattr(settings, "logger_name", "")` suppresses only `AttributeError`, so a property
   raising anything else propagated out of `AlertConfig.load` and turned a boot report that said

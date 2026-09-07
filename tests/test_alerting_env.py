@@ -1541,15 +1541,18 @@ def test_the_upgrade_repair_rewrites_the_marker_without_revalidating(
 
 
 @posix_only
-def test_a_matching_marker_left_wide_open_by_1_3_0_is_narrowed_without_revalidating(
+def test_a_matching_marker_left_wide_open_is_narrowed_without_revalidating(
         tmp_path: Path, channels: dict[str, Spy]) -> None:
-    """⭐⭐ THE UPGRADE PATH THAT THE WRITE PATH ALONE DOES NOT REACH, AND THE ONE EVERY DEPLOYED
-    SERVICE TAKES.
+    """⭐⭐ THE REPAIR THE WRITE PATH ALONE DOES NOT REACH: a marker that MATCHES is a marker
+    `_write_marker` is never called for, so an exposed one stays exposed.
 
-    A service already running the previous release has a marker recording the CORRECT digest at
-    the wrong mode. So it matches, validation skips, and `_write_marker` is never called —
-    narrowing only the write would have fixed new installations and left every existing one
-    exposed until somebody happened to edit the shared config. Fixing the instance, not the class.
+    ⚠️ THIS TEST WAS NAMED FOR THE 1.3.0 UPGRADE AND IS NOT ABOUT IT ANY MORE. It was written
+    when a marker from an earlier release matched — the digest was right, so validation skipped
+    and the narrowing never ran, and narrowing only the write path would have fixed new
+    installations while leaving every existing one exposed. Since #18 such a marker records no
+    service, matches nothing, and is replaced at 0600 by the validation path instead. What is
+    left here is a marker THIS release wrote whose mode was widened afterwards — a restore, a
+    permissive umask, a hand-edit — which is what the body actually builds, and always was.
 
     The other half of the assertion is that the repair is free: the marker's contents are
     unchanged, the boot still returns `False`, and no confirmation alert is sent. A repair that
@@ -2485,8 +2488,9 @@ def test_every_document_that_describes_the_MARKER_describes_the_mechanism_the_co
         f"the marker's first line is {written!r}, which is not the `sha256:<hex>` line every "
         f"document below tells a reader to expect")
     # ⭐ AND THE SECOND FACT IS PINNED HERE TOO, because the documents now promise both (#18).
-    # The first line stayed exactly what it was so that a reader who knows only the older
-    # format still reads the digest correctly; that is a claim worth a failing test.
+    # The first line stayed exactly what it was, so anything reading the FIRST LINE reads the
+    # digest correctly. That is NOT the same as backward compatible and the comment here used
+    # to say it was - the rollback direction has its own test below.
     assert service == settings.service, (
         f"the marker records the service as {service!r}, and the documents say it records "
         f"{settings.service!r} — a rename is exactly what it exists to notice")
@@ -2642,6 +2646,132 @@ def test_a_marker_whose_service_line_is_junk_revalidates_rather_than_crashing(
         assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True, (
             f"a marker whose service line is {junk!r} was treated as validated")
         assert marker_facts(marker) == (f"sha256:{digest}", "feed-poller")
+
+
+def test_a_deeply_nested_service_payload_does_not_escape_as_a_bare_traceback() -> None:
+    """⛔ `json.loads` IS RECURSIVE AND `RecursionError` IS NOT A `ValueError`.
+
+    A marker whose service line is a couple of thousand open brackets used to take the whole
+    process out: `_recorded_service` caught `ValueError` only, so the error walked out of a
+    function documented to answer `None` for anything malformed, out of `validate_boot` - which is
+    documented to raise `AlertEnvError` and nothing else - and past the `except AlertEnvError` the
+    setup document tells every adopter to write.
+
+    ⚠️ THE DEPTH IS NOT A CONSTANT. Measured at 1000 it answered `None` and at 2000 it raised, and
+    the threshold moves with whatever stack the caller has already used, which is exactly why the
+    fix is a refusal on the payload's first character rather than a depth limit. This asserts the
+    refusal at several depths so it cannot pass by happening to sit under the limit.
+    """
+    from kw_common.alerting_env import _recorded_service
+
+    digest = "sha256:" + "a" * 64
+    for depth in (100, 1000, 2000, 20000):
+        body = digest + chr(10) + "service:" + "[" * depth
+        assert _recorded_service(body) is None, f"depth {depth} did not answer None"
+
+
+def test_a_deeply_nested_service_payload_revalidates_rather_than_crashing_the_boot(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """The same input through the documented entry point, which is where it mattered."""
+    settings, marker_dir, marker = _validated(tmp_path)
+    digest = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker.write_text(f"sha256:{digest}" + chr(10) + "service:" + "[" * 20000 + chr(10),
+                      encoding="utf-8")
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert marker_facts(marker) == (f"sha256:{digest}", "feed-poller")
+
+
+def test_rolling_BACK_costs_one_revalidation_and_the_release_notes_say_so(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⚠️ THE CLAIM THIS TEST EXISTS FOR WAS WRITTEN AS "backward compatible" AND WAS FALSE.
+
+    Line one is unchanged, so anything reading the FIRST LINE reads the digest. The only reader
+    that exists is this module's own, and 1.3.0-1.4.1 compared the WHOLE stripped text - which a
+    two-line marker cannot equal. So a rollback re-validates and re-announces once per service,
+    exactly as the upgrade does.
+
+    The older comparison is spelled out here rather than imported, because the point is to measure
+    a reader that no longer exists in this tree. It is three lines, and they are the three lines
+    `_marker_matches` had.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    written = marker.read_text(encoding="utf-8", errors="replace").strip()
+    digest = "sha256:" + hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
+
+    def matches_1_4_1(recorded: str) -> bool:
+        if not recorded.startswith("sha256:"):
+            return False
+        return bool(digest) and recorded == digest
+
+    assert written.splitlines()[0] == digest, "line one is not the digest a 1.4.1 reader wants"
+    assert matches_1_4_1(written) is False, (
+        "a 1.4.1 reader matched this marker, so the rollback cost recorded in the CHANGELOG and "
+        "in `_marker_body` is wrong in the other direction")
+    assert matches_1_4_1(digest) is True, "the stand-in does not model 1.4.1's own marker either"
+
+
+def test_two_services_sharing_one_marker_dir_are_named_in_the_log_every_boot(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
+    """⚠️ THE ONE CALLER MISTAKE WHOSE COST THIS RELEASE CHANGED.
+
+    `validate_boot` requires `marker_dir` to be the app's OWN directory and always has. Sharing one
+    used to be quietly wrong - the second service skipped on the first's marker, so its own
+    service-derived settings were never checked, which is #18 from the other side. It is now loudly
+    wrong: each service rewrites the other's record, so both re-validate and both announce, on
+    every boot.
+
+    Nothing can tell that apart from a rename, so the behaviour is the same for both and the LOG is
+    what distinguishes them: a rename says it once, a shared directory says it every boot. This
+    asserts the line names both services, and that three boots produce three of them.
+
+    ⛔ AND THE MIGRATION CASE IS SILENT, asserted in the same test. A marker recording no service is
+    every service's first boot after this release, and warning about that would put the line in
+    front of every operator in the fleet exactly once, teaching them to ignore it.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    other = load_alert_settings(config_file_for(tmp_path), "prod", "log-shipper")
+
+    # The migration case first: a marker recording NO service must not warn.
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
+    marker.write_text(f"sha256:{digest}" + chr(10), encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert [r for r in caplog.records if "CONFIG_PATH" in r.getMessage()] == [], (
+        "the first boot after the upgrade warned, which every service in the fleet would see once")
+
+    lines = []
+    for _ in range(3):
+        for who in (other, settings):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+                assert validate_boot(who, "prod", marker_dir, alerter=Alerter(who)) is True
+            lines += [r.getMessage() for r in caplog.records
+                      if "share this CONFIG_PATH" in r.getMessage()]
+
+    assert len(lines) == 6, f"six boots, {len(lines)} warnings - the line does not repeat"
+    assert "feed-poller" in lines[0] and "log-shipper" in lines[0], (
+        f"the line names one service only: {lines[0]!r}")
+
+
+def test_the_shared_dir_line_is_not_logged_when_the_config_ITSELF_changed(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
+    """A re-validation caused by an edited config says nothing about who wrote the marker, so the
+    line would be a false accusation. The rename is still there; only the reason is different."""
+    settings, marker_dir, _marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+
+    config = Path(settings.config_file)
+    config.write_text(config.read_text(encoding="utf-8") + "# an edit" + chr(10), encoding="utf-8")
+    other = load_alert_settings(config_file_for(tmp_path), "prod", "log-shipper")
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        assert validate_boot(other, "prod", marker_dir, alerter=Alerter(other)) is True
+    assert [r for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()] == []
 
 
 # ============================================================ the package's own boundaries

@@ -583,8 +583,15 @@ def _marker_body(digest: str, service: str) -> str:
     ⭐ IN THE CONTENTS, NOT IN THE FILENAME, and that is the ops-alerting standard's own
     direction rather than a choice made here. The standard fixes the marker's NAME at
     `.alerting-validated-<env>` in `CONFIG_PATH`; it says nothing about how many facts the file
-    inside may carry. Line one is still `sha256:<hex>` and nothing else, so a reader that knows
-    only the older format reads the digest correctly.
+    inside may carry. Line one is still `sha256:<hex>` and nothing else, so anything that reads
+    the FIRST LINE reads the digest correctly.
+
+    ⚠️ THAT IS NOT THE SAME AS BACKWARD COMPATIBLE, and the first version of this docstring said
+    it was. The only reader that exists is this module's own, and 1.3.0-1.4.1 compared the WHOLE
+    stripped text to `sha256:<hex>` — see the comment in `_marker_matches` — so a marker written
+    here does not match there. A ROLLBACK therefore costs exactly what the upgrade costs: one
+    re-validation and one confirmation alert per service, once. Symmetric and cheap, but a cost
+    rather than the absence of one, and it was worth measuring rather than asserting.
 
     ⚠️ THE NAME IS JSON-ENCODED, WHICH IS NOT DECORATION. `AlertSettings` requires `service` to
     be a non-blank string and strips it; it does NOT refuse control characters the way
@@ -602,21 +609,84 @@ def _recorded_service(recorded: str) -> str | None:
     """The service name a marker records, or `None` if it records none this parser trusts.
 
     `None` for every unparseable shape — an older release's digest-only marker, a truncated
-    line, a JSON value that is not a string — and `None` never equals a real service name, so
+    line, a payload that is not a JSON string — and `None` never equals a real service name, so
     every one of those re-validates. That is the safe direction and it is the SAME migration
     the digest change itself made: one validation and one confirmation alert per service on the
     first boot after the upgrade, then silence.
+
+    ⛔ THE PAYLOAD MUST OPEN WITH A QUOTE BEFORE `json.loads` SEES IT, and that guard is a
+    REFUSAL rather than a shortcut. `json.loads` is a recursive-descent parser: a payload of two
+    thousand `[` raises `RecursionError`, which is NOT a `ValueError` — so it walked out of a
+    function documented to answer `None` for anything malformed, out of `validate_boot`, which
+    is documented to raise `AlertEnvError` and nothing else, past the `except AlertEnvError` the
+    setup document tells every adopter to write, and out as a bare traceback at boot. Measured:
+    depth 1000 answered `None`, depth 2000 raised, and the threshold moves with whatever stack
+    the caller has already used — so it is not a depth to pick a limit against. `_marker_body`
+    only ever writes `json.dumps(<str>)`, which always opens with `"`, so nothing this module
+    writes is refused by the guard, and nothing that opens with `"` can nest.
+
+    `RecursionError` is caught as well, because a guard whose whole job is "this cannot happen"
+    is worth one more name in an except clause.
     """
     for line in recorded.splitlines()[1:]:
         head, sep, payload = line.strip().partition("service:")
         if head or not sep:
             continue
+        if not payload.startswith('"'):
+            return None
         try:
             value = json.loads(payload)
-        except ValueError:
+        except (ValueError, RecursionError):
             return None
+        # A payload that opened with a quote and parsed is a `str` by construction. The check
+        # stays because it is what narrows `json.loads`' `Any` to this function's return type,
+        # and because it is the invariant the guard above exists to keep.
         return value if isinstance(value, str) else None
     return None
+
+
+def _diagnose_shared_marker_dir(marker: Path, config: Path, service: str) -> None:
+    """Name the one caller mistake whose COST this release changed, at the moment it happens.
+
+    ⚠️ TWO SERVICES POINTED AT ONE `CONFIG_PATH` NOW RE-ANNOUNCE ON EVERY BOOT. `validate_boot`
+    requires `marker_dir` to be the app's OWN read-write directory and always has; sharing one
+    used to be quietly wrong — the second service skipped on the first's marker and its own
+    service-derived settings were never checked, which is #18 arriving from the other side — and
+    is now loudly wrong: each service rewrites the other's record, so both re-validate and both
+    announce, on every boot. Measured at four alerts per boot for two services.
+
+    ⛔ NOTHING HERE CAN TELL THAT APART FROM A LEGITIMATE RENAME, which produces exactly the
+    same marker state and must re-validate. So this does not change the decision — it states
+    what the state IS, once per boot, naming both services. A rename logs it once and never
+    again; a shared directory logs it every boot, and that difference is the thing an operator
+    can act on. A sentence in a document is not read at 03:00; this line is in the log beside
+    the alert that woke them.
+
+    Silent for the migration case — a marker recording no service at all — which is every
+    service's first boot after this release and is not a mistake. Silent too when the config
+    itself changed, because then re-validating says nothing about who wrote the marker.
+
+    Costs one extra read of a small file, on the path that is about to re-read the config,
+    round-trip SMTP and POST to a topic.
+    """
+    try:
+        recorded = marker.read_text(encoding="utf-8", errors="replace").strip()
+    except (OSError, ValueError):
+        return
+    was = _recorded_service(recorded)
+    if was is None or was == service:
+        return
+    if not recorded.startswith("sha256:"):
+        return
+    if recorded.splitlines()[0].strip() != _config_digest(config):
+        return
+    log.warning(
+        "alerting: %s records service %r and this process is %r, while %s is unchanged. Either "
+        "this service was RENAMED - expected once, and this line will not repeat - or two "
+        "services share this CONFIG_PATH, which is not supported: each overwrites the other's "
+        "record, so both re-validate and both send their confirmation alert on EVERY boot. If "
+        "this line repeats, give each service its own CONFIG_PATH directory.",
+        marker, was, service, config)
 
 
 def _marker_matches(marker: Path, config: Path, service: str) -> bool:
@@ -739,6 +809,7 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
         _reharden(marker)
         return False
 
+    _diagnose_shared_marker_dir(marker, config, settings.service)
     _check_layout(config, shared_root)
     # ⭐⭐ THE DIGEST IS TAKEN HERE AND CARRIED TO THE MARKER — before anything whose RESULT is
     # used to validate has read the file. Not before every read: `_marker_matches` above may hash
@@ -1069,10 +1140,18 @@ def _can_be_read_back(path: Path) -> bool:
 def _reharden(marker: Path) -> None:
     """Re-write an already-correct marker that is readable beyond its owner, keeping its contents.
 
-    This is the upgrade path and nothing else. A marker written by an earlier release records the
-    right digest at the wrong mode, so it MATCHES and validation skips — and the write that would
-    narrow it never runs. Rewriting it here costs one file write on the first boot after the
-    upgrade, changes nothing about what the marker says, and does not re-validate or re-announce.
+    A marker that MATCHES is a marker `_write_marker` never reaches, so the write that would
+    narrow it never runs and an exposed one stays exposed. Rewriting it here costs one file
+    write, changes nothing about what the marker says, and does not re-validate or re-announce.
+
+    ⚠️ THIS WAS WRITTEN AS "THE UPGRADE PATH AND NOTHING ELSE" AND THAT IS NO LONGER TRUE, which
+    is worth a sentence rather than a silent edit. It was reached by a marker an earlier release
+    wrote at 0644: the digest was right, so it matched, so it skipped. Since #18 a marker written
+    before 1.5.0 records no service and matches nothing, so it never gets here — it re-validates,
+    and `_write_marker` creates a fresh 0600 file, which closes the same exposure by the other
+    door. What is left for this function is a marker THIS release wrote whose mode was widened
+    afterwards: a volume restore, an archive unpacked with a permissive umask, a hand-edit. That
+    is rarer than the upgrade it was written for and it is not hypothetical, so the repair stays.
 
     Does nothing at all when the marker is already restricted, which is every boot after the
     first, and on every platform where these bits are not the access-control mechanism.
