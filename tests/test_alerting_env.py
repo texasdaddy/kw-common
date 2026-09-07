@@ -2513,6 +2513,14 @@ def test_every_document_that_describes_the_MARKER_describes_the_mechanism_the_co
             f"{name} describes the boot marker without naming the mechanism the code actually "
             f"uses. It was a timestamp comparison until 1.3.0, and a document still saying so "
             f"tells an operator to `touch` a file that no longer needs touching.")
+        # ⛔ AND THE CLAIM THAT WAS FALSE DOES NOT COME BACK. It was written in four documents,
+        # corrected in four, and a verification pass then found a FIFTH copy in one of them.
+        # The marker's first line is unchanged; the release that reads it compares the WHOLE
+        # text, so a 1.5.0 marker matches nothing there and a rollback costs one re-validation
+        # per service. Anything asserting otherwise is the sentence that was measured false.
+        assert "reader that knows only the older format" not in text, (
+            f"{name} has the backward-compatibility claim back. It was measured against the "
+            f"published 1.4.1 and is false: that reader compares the marker's whole text.")
 
 
 # ============================================================ #18: the marker knows the service
@@ -2712,9 +2720,13 @@ def test_rolling_BACK_costs_one_revalidation_and_the_release_notes_say_so(
     assert matches_1_4_1(written) is False, (
         "a 1.4.1 reader matched this marker, so the rollback cost recorded in the CHANGELOG and "
         "in `_marker_body` is wrong in the other direction")
-    assert written != digest, (
-        "the marker is one line, so there is no second line for a whole-text reader to trip "
-        "over and nothing above proves anything")
+    # ⚠️ NOT `written != digest`. That was the first replacement for a tautology here, and a
+    # verification pass showed it DOMINATED: given line one is the digest, `matches_1_4_1` is
+    # `written == digest`, so the assertion above already asserts it and this one could never
+    # be the first to fail. The second line's SHAPE is the independent fact.
+    assert written.splitlines()[1].startswith("service:"), (
+        f"line two is {written.splitlines()[1]!r}, so what a 1.4.1 reader trips over is not "
+        f"the service record this rollback cost is attributed to")
 
 
 def test_two_services_sharing_one_marker_dir_are_named_in_the_log_every_boot(
@@ -2919,6 +2931,109 @@ def test_the_replacement_is_reported_even_when_the_config_ALSO_changed(
     said = [r.getMessage() for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()]
     assert len(said) == 1, f"the replacement was reported {len(said)} times"
 
+
+
+def test_the_recursion_catch_is_LOAD_BEARING_and_not_redundant_with_the_quote_guard() -> None:
+    """⚠️⚠️ THE CLAIM THIS TEST EXISTS FOR WAS WRITTEN THE OTHER WAY ROUND AND WAS FALSE.
+
+    The two halves of the guard in `_recorded_service` were declared mutually redundant. A
+    verification pass falsified that for the `RecursionError` half: `json.loads` runs in PYTHON
+    frames, so its recursion check trips as a function of the CALLER'S remaining stack rather than
+    of the payload - and with a few frames of headroom the ordinary payload this module itself
+    writes raises inside `json.loads`. The quote guard cannot help, because that payload DOES open
+    with a quote.
+
+    Stubbed rather than measured, deliberately. The reachable version of this depends on how many
+    frames the caller has already burnt, which is not a property a test should assert against - its
+    sibling below probes the real thing and skips when it cannot establish a window. This one is
+    the deterministic pin: whatever `json.loads` raises, this function answers `None`.
+    """
+    import json as _json
+
+    from kw_common import alerting_env as env
+
+    body = env._marker_body("sha256:" + "a" * 64, "feed-poller")
+    assert env._recorded_service(body) == "feed-poller", "the fixture is not a readable marker"
+
+    real = _json.loads
+    try:
+        _json.loads = lambda *_a, **_k: (_ for _ in ()).throw(RecursionError("stack"))
+        assert env._recorded_service(body) is None, (
+            "a RecursionError from the parser escaped a function documented to answer None for "
+            "anything it cannot read")
+    finally:
+        _json.loads = real
+    assert env._recorded_service(body) == "feed-poller", "the stub was not undone"
+
+
+def test_the_recursion_catch_FIRES_for_a_well_formed_marker_read_by_a_deep_caller() -> None:
+    """The same arm reached for real rather than stubbed, and asserting only what it can promise.
+
+    ⚠️ THE FIRST VERSION OF THIS TEST ASSERTED TOO MUCH and failed honestly: it probed depths where
+    `_recorded_service` cannot be ENTERED at all, and no guard inside a function survives not having
+    the frame to call it. That is not this arm's job and no code can make it so.
+
+    What the arm does promise is narrower and is what is measured here: there is a band of caller
+    depths where the function is entered fine and `json.loads` INSIDE it runs out of stack - and in
+    that band the answer is `None` rather than a traceback. So the probe walks the depth up until
+    the call itself becomes impossible, and requires that at least one answer along the way was
+    `None`. A `None` there can only have come from the parser failing and being caught, because the
+    payload is the ordinary one this module writes and parses correctly at depth 0.
+
+    Skips rather than fails when the interpreter gives no such band - a stack-depth probe that
+    cannot find its window is a test with nothing to say, not a defect.
+    """
+    import sys
+
+    from kw_common import alerting_env as env
+
+    body = env._marker_body("sha256:" + "a" * 64, "feed-poller")
+    assert env._recorded_service(body) == "feed-poller", "the fixture is not a readable marker"
+
+    def at_depth(n: int, fn):  # type: ignore[no-untyped-def]
+        return fn() if n <= 0 else at_depth(n - 1, fn)
+
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(400)
+    answers = []
+    try:
+        for depth in range(1, 400):
+            try:
+                answers.append(at_depth(depth, lambda: env._recorded_service(body)))
+            except RecursionError:
+                break
+    finally:
+        sys.setrecursionlimit(limit)
+
+    if None not in answers:
+        pytest.skip(f"no depth band where the parser alone ran out of stack "
+                    f"({len(answers)} depths probed)")
+    assert answers[0] == "feed-poller", "the shallowest call did not read the marker"
+
+
+def test_an_ordinary_revalidation_of_the_SAME_service_accuses_nobody(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
+    """⛔ THE MOST COMMON VALIDATING BOOT IN THE FLEET, and the mutation matrix found it unpinned.
+
+    One service, its config edited, booting again: the marker records the same name, so nothing was
+    replaced and there is nothing to say. Weakening the guard to `if was is None:` leaves the whole
+    suite green while EVERY such boot emits the shared-`CONFIG_PATH` accusation - and the
+    repeat-count claim the line makes ("on every boot means a shared directory") depends entirely
+    on this arm, because an edited config is the ordinary reason to re-validate.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+
+    config = Path(settings.config_file)
+    for i in range(4):
+        config.write_text(config.read_text(encoding="utf-8") + f"# edit {i}" + chr(10),
+                          encoding="utf-8")
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+            assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+        assert [r for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()] == [], (
+            f"boot {i} accused this service of taking its own record")
+    assert marker_facts(marker)[1] == "feed-poller"
 
 
 # ============================================================ the package's own boundaries

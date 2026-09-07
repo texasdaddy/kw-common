@@ -625,15 +625,22 @@ def _recorded_service(recorded: str) -> str | None:
     only ever writes `json.dumps(<str>)`, which always opens with `"`, so nothing this module
     writes is refused by the guard, and nothing that opens with `"` can nest.
 
-    ⚠️ `RecursionError` IS CAUGHT AS WELL, AND THE TWO ARE DELIBERATELY REDUNDANT — stated
-    rather than implied, because a verification pass measured it: on CPython 3.12 removing
-    EITHER one alone changes no observable behaviour, so neither can have a test of its own
-    that fails. What is pinned is the PAIR, and that is the honest claim. They are kept both
-    because they answer different questions — "is this payload the shape we write" and "did
-    the parser survive" — and the day a payload that opens with a quote can nest, or a future
-    parser raises before the first character is examined, the surviving one is the one that
-    holds. This is the same shape as the mutually-redundant opt-out gates in `alerting`, and it
-    is recorded here for the same reason: so nobody removes one as dead code.
+    ⚠️⚠️ `RecursionError` IS CAUGHT AS WELL, AND IT IS LOAD-BEARING RATHER THAN REDUNDANT. An
+    earlier version of this docstring declared the two halves mutually redundant; a
+    verification pass falsified that, and the correction matters more than the original claim
+    did. `json.loads` runs in PYTHON frames, so its recursion check trips as a function of the
+    CALLER'S remaining stack rather than of the payload — and with a few frames of headroom the
+    perfectly ordinary payload this module itself writes, `service:"feed-poller"`, raises
+    inside `json.loads`. Measured on CPython 3.12: at a depth 993 frames into a 997-frame
+    budget it answered, at 994 it raised. The quote guard cannot help there — the payload DOES
+    open with a quote. So this arm is what keeps a bare traceback out of `validate_boot` for a
+    WELL-FORMED marker read by a deep caller, and it has its own tests.
+
+    The quote guard is the half that no test can distinguish today: removing it alone changes
+    no observable behaviour, because everything it refuses `json.loads` also refuses. It is
+    kept because it answers a different question — is this payload the SHAPE we write — and
+    because it makes the pathological case cheap instead of merely survivable. That asymmetry
+    is stated rather than smoothed over: one arm is pinned, one is declared.
     """
     for line in recorded.splitlines()[1:]:
         head, sep, payload = line.strip().partition("service:")
@@ -694,6 +701,15 @@ def _report_a_replaced_service(marker: Path, was: str | None, service: str) -> N
     cannot fail a boot and does not raise, so "we called it" is not "it landed" — an
     unwritable `CONFIG_PATH` would otherwise produce the same false accusation from the other
     direction. It has its own warning for that; this one stays quiet.
+
+    ⚠️ WHICH BUYS ITS ACCURACY WITH ONE BLIND SPOT, stated because a diagnostic that implies
+    coverage it lacks is worse than none. On a mount where the marker LANDS but cannot be read
+    back — the `file_mode=0200` CIFS shape `_can_be_read_back` exists for — two services really
+    sharing one `CONFIG_PATH` replace each other's record and announce on every boot, and this
+    line never appears, because the read-back cannot confirm what was written. The operator is
+    not blind there: `_write_marker` says the marker cannot be read back and that this service
+    will re-validate and re-announce on EVERY boot. What is missing is the second service's
+    name. Measured, not reasoned about.
 
     Silent for the migration case, a marker recording no service at all, which is every
     service's first boot after this release and is not a mistake.

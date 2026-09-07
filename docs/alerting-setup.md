@@ -185,6 +185,13 @@ directory, a line that appears once is a service that was renamed. A boot that w
 — no `Alerter` installed, or a refusal — says nothing, because it has taken nothing from
 anybody.
 
+⚠️ **One blind spot, stated rather than implied away.** On a mount where the marker lands but
+cannot be read back — a `file_mode` that removes the owner's read bit, which some CIFS mounts
+do — the line never appears, because nothing can confirm what was written. Two services sharing
+a `CONFIG_PATH` there re-announce on every boot with no line naming the second one. You are not
+blind: the process log says the marker **cannot be read back** and that this service will
+re-validate and re-announce on every boot. Fix that first; it is upstream of everything here.
+
 To force a re-check without editing the file, delete the marker: `CONFIG_PATH/.alerting-validated-<env>`.
 
 ⭐ **The marker is created `0600`, and that is a security property rather than tidiness.** Its
