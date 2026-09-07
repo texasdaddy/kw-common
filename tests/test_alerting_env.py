@@ -774,6 +774,20 @@ def test_a_directory_where_the_file_should_be_is_reported_as_unreadable(tmp_path
 
 
 # ======================================================== acceptance 6 & 7: boot validation
+def marker_facts(marker: Path) -> tuple[str, object]:
+    """The marker's two facts — the digest line, and the service it records.
+
+    ⭐ PARSED HERE RATHER THAN THROUGH `_recorded_service`, deliberately. The module's own
+    reader and its own writer agreeing proves nothing about the FORMAT: a writer that stopped
+    emitting the `service:` line and a reader that stopped requiring one would agree perfectly,
+    and #18 would be open again with every test green. This asks the file what it says.
+    """
+    digest_line, _, service_line = marker.read_text(encoding="utf-8").strip().partition("\n")
+    if not service_line.startswith("service:"):
+        return digest_line, None
+    return digest_line, json.loads(service_line[len("service:"):])
+
+
 def _validated(tmp_path: Path, service: str = "feed-poller",
                env: str = "prod") -> tuple[AlertSettings, Path, Path]:
     write_shared(tmp_path)
@@ -795,7 +809,7 @@ def test_a_good_config_records_ITS_DIGEST_in_the_marker_and_alerts_exactly_once(
     assert validate_boot(settings, "prod", marker_dir, alerter=alerter) is True
     assert marker.is_file()
     expected = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
-    assert marker.read_text(encoding="utf-8").strip() == f"sha256:{expected}"
+    assert marker_facts(marker) == (f"sha256:{expected}", settings.service)
     assert len(channels["ntfy"].calls) == 1
     assert channels["ntfy"].calls[0][1] is alerting.SEVERITIES[OK]
 
@@ -1027,7 +1041,7 @@ def test_the_marker_records_the_config_that_was_CHECKED_not_the_one_on_disk_afte
     # nothing ever rewrote — the test would pass while proving nothing, which is the vacuous-setup
     # shape rather than a defect in the code. Its sibling below carries the same guard.
     assert config.read_bytes() == broken, "the alerter never ran, so no race was created"
-    recorded = marker.read_text(encoding="utf-8").strip()
+    recorded, _ = marker_facts(marker)
     assert recorded == "sha256:" + hashlib.sha256(good).hexdigest(), (
         "the marker records the file as it stands AFTER validation, so a config rewritten during "
         "the announce is recorded as validated although nothing checked it")
@@ -1071,7 +1085,7 @@ def test_the_digest_is_taken_BEFORE_the_file_is_parsed_so_the_window_fails_SAFE(
     assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
     assert config.read_bytes() == rewritten, "the stand-in did not actually rewrite the file"
 
-    recorded = marker.read_text(encoding="utf-8").strip()
+    recorded, _ = marker_facts(marker)
     assert recorded == "sha256:" + hashlib.sha256(original).hexdigest(), (
         "the digest is taken AFTER the parse, so a file written in between is recorded as "
         "validated — and the next boot skips it")
@@ -1567,7 +1581,7 @@ def test_the_restricted_marker_is_still_the_thing_that_suppresses_the_next_boot(
     assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False
     assert silence(channels) == []
     expected = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
-    assert marker.read_text(encoding="utf-8").strip() == f"sha256:{expected}"
+    assert marker_facts(marker) == (f"sha256:{expected}", settings.service)
 
 
 def test_a_successful_marker_write_says_nothing(
@@ -1598,7 +1612,7 @@ def test_a_stale_temporary_file_is_not_reused_as_the_marker(
 
     assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
     expected = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
-    assert marker.read_text(encoding="utf-8").strip() == f"sha256:{expected}"
+    assert marker_facts(marker) == (f"sha256:{expected}", settings.service)
     assert list(marker_dir.glob("*.tmp")) == [], "a temporary file survived the write"
     if os.name == "posix":
         assert stat.S_IMODE(marker.stat().st_mode) & 0o077 == 0
@@ -2466,10 +2480,16 @@ def test_every_document_that_describes_the_MARKER_describes_the_mechanism_the_co
 
     settings, marker_dir, marker = _validated(tmp_path)
     assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
-    written = marker.read_text(encoding="utf-8").strip()
+    written, service = marker_facts(marker)
     assert _re.fullmatch(r"sha256:[0-9a-f]{64}", written), (
-        f"the marker's content is {written!r}, which is not the `sha256:<hex>` line every "
+        f"the marker's first line is {written!r}, which is not the `sha256:<hex>` line every "
         f"document below tells a reader to expect")
+    # ⭐ AND THE SECOND FACT IS PINNED HERE TOO, because the documents now promise both (#18).
+    # The first line stayed exactly what it was so that a reader who knows only the older
+    # format still reads the digest correctly; that is a claim worth a failing test.
+    assert service == settings.service, (
+        f"the marker records the service as {service!r}, and the documents say it records "
+        f"{settings.service!r} — a rename is exactly what it exists to notice")
     assert marker.name == f"{MARKER_NAME}-prod", (
         f"the marker is written as {marker.name!r}; the documents name "
         f"`{MARKER_NAME}-<env>`")
@@ -2489,6 +2509,139 @@ def test_every_document_that_describes_the_MARKER_describes_the_mechanism_the_co
             f"{name} describes the boot marker without naming the mechanism the code actually "
             f"uses. It was a timestamp comparison until 1.3.0, and a document still saying so "
             f"tells an operator to `touch` a file that no longer needs touching.")
+
+
+# ============================================================ #18: the marker knows the service
+def test_a_renamed_service_does_not_skip_the_refusal_a_fresh_marker_dir_produces(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⭐⭐ ISSUE #18, ITS OWN REPRO. The marker keyed on (config bytes, environment), and
+    `_check_usable` validates settings DERIVED FROM THE SERVICE NAME — so renaming the service
+    while `CONFIG_PATH`, `DEPLOY_ENV` and the config's bytes stayed put skipped a refusal the
+    service should have got, and it came up with a title prefix that fails every ntfy send.
+
+    The prefix is `[<env>][<service>] `, and `http.client` encodes ntfy's `Title` header as
+    latin-1, so a service name outside latin-1 is the reachable case. The euro sign is assembled
+    from its code point rather than written as a literal so that nothing here depends on this
+    file's own encoding surviving a round trip.
+
+    ⚠️ THE MIDDLE ASSERTION IS THE ONE THAT MATTERS. Without it this test would pass on a build
+    where validation simply never skips — the refusal would fire because NOTHING is ever skipped,
+    which is a different behaviour with the same symptom. So the first name is asserted to skip on
+    its second boot, and only then is the rename shown to break through that skip.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert marker_facts(marker)[1] == "feed-poller"
+
+    # The same service still skips — so the skip is real and the refusal below is not an artefact
+    # of validation running every time.
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False
+
+    euro_named = "feed" + chr(0x20AC) + "poller"
+    renamed = load_alert_settings(config_file_for(tmp_path), "prod", euro_named)
+    with pytest.raises(AlertEnvError) as exc:
+        validate_boot(renamed, "prod", marker_dir, alerter=Alerter(renamed))
+    assert "latin-1" in str(exc.value), (
+        "the refusal fired, but not the service-derived one this test is about")
+
+
+def test_the_marker_an_earlier_release_wrote_records_no_service_so_one_boot_revalidates(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """The migration, asserted rather than assumed. A marker written by 1.3.0-1.4.1 is a single
+    `sha256:<hex>` line with the RIGHT digest — so it used to match — and it now matches nothing,
+    which costs exactly one validation and one confirmation alert per service.
+
+    ⚠️ And then it stops. A format change that re-validated forever would be the loud failure
+    `_write_marker` documents, so the third boot is asserted to skip.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
+    marker.write_text(f"sha256:{digest}\n", encoding="utf-8")   # the shape 1.3.0-1.4.1 wrote
+    assert marker_facts(marker) == (f"sha256:{digest}", None)
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert len(channels["ntfy"].calls) == 1, "the one-off migration alert"
+    assert marker_facts(marker) == (f"sha256:{digest}", "feed-poller")
+
+    reset(channels)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False
+    assert silence(channels) == []
+
+
+def test_a_service_name_outside_ascii_round_trips_through_the_marker(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """⚠️ THE ENCODING IS LOAD-BEARING, AND THIS IS THE REACHABLE CASE FOR IT.
+
+    A service name may carry non-ASCII: `ntfy_key` reduces it for the environment key it
+    derives (`café-poller` -> `NTFY_URL_CAF_POLLER`) but does not refuse the NAME, and the
+    title prefix carries it as written. So the marker has to record such a name and read it
+    back byte for byte, or the service re-validates and re-announces on EVERY boot — the loud
+    failure the deleted `_outrank` existed to prevent, reintroduced through the fix for #18.
+
+    `json.dumps` escapes it to one ASCII line, so the marker stays ASCII whatever the name is.
+    The name is assembled from its code point rather than written as a literal so that nothing
+    here depends on this file's own encoding surviving a round trip.
+    """
+    write_shared(tmp_path)
+    name = "caf" + chr(0xE9) + "-poller"
+    settings = load_alert_settings(config_file_for(tmp_path), "prod", name)
+    marker_dir = tmp_path / "appconfig"
+    marker = marker_dir / marker_name("prod")
+
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    assert marker_facts(marker)[1] == name
+    assert marker.read_text(encoding="utf-8").isascii(), (
+        "the marker is no longer ASCII, so what it says now depends on the encoding whoever "
+        "reads it happens to use")
+
+    reset(channels)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is False, (
+        "the marker no longer matches its own writer, so this service re-announces every boot")
+    assert silence(channels) == []
+
+
+def test_the_marker_body_round_trips_a_name_no_caller_can_currently_supply() -> None:
+    """⭐ DEFENCE IN DEPTH, LABELLED AS SUCH RATHER THAN DRESSED UP AS A REACHABLE DEFECT.
+
+    `AlertSettings` requires `service` to be a non-blank string and strips it; it does NOT
+    refuse control characters the way `title_prefix` does, because a service name is not a
+    header value. Two OTHER things refuse one today, both measured while writing this test:
+    `load_alert_settings` refuses it outright, and `validate_boot` cannot reach the marker
+    writer with such a name because `_announce` asks `ntfy_key` for the topic key first and
+    `ntfy_key` refuses it too.
+
+    So this pins the marker FORMAT rather than a live path: a name written raw would split
+    into a line the parser could never put back together, and the marker would match nothing
+    forever. The cost of the guarantee is one `json.dumps`; the cost of relying on a refusal
+    two modules away is a silent re-announce loop the day that refusal moves.
+    """
+    from kw_common.alerting_env import _marker_body, _recorded_service
+
+    digest = "sha256:" + "a" * 64
+    for name in ("feed-poller", "caf" + chr(0xE9), "feed" + chr(92) + "npoller",
+                 chr(10).join(("feed", "poller")), chr(9) + "tabbed", chr(34) + "quoted" + chr(34)):
+        body = _marker_body(digest, name)
+        assert chr(10) not in body.partition(chr(10))[2], (
+            f"the body for {name!r} spans three lines, so the parser cannot read it back")
+        assert body.startswith(digest + chr(10)), "line one stopped being the digest alone"
+        assert body.isascii(), f"the body for {name!r} is not ASCII"
+        assert _recorded_service(body) == name
+
+
+def test_a_marker_whose_service_line_is_junk_revalidates_rather_than_crashing(
+        tmp_path: Path, channels: dict[str, Spy]) -> None:
+    """Every unparseable shape answers "not validated", which is the safe direction. Truncation is
+    the reachable one: `os.replace` is atomic, but a volume restore or a hand-edit is not."""
+    settings, marker_dir, marker = _validated(tmp_path)
+    digest = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    for junk in ('service:"feed-poll', "service:", "service:12", "service:null", "notservice:x"):
+        marker.write_text(f"sha256:{digest}\n{junk}\n", encoding="utf-8")
+        reset(channels)
+        assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True, (
+            f"a marker whose service line is {junk!r} was treated as validated")
+        assert marker_facts(marker) == (f"sha256:{digest}", "feed-poller")
 
 
 # ============================================================ the package's own boundaries

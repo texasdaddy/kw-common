@@ -161,11 +161,18 @@ check first. `validate_boot_from_env` additionally reads `CONFIG_PATH` and check
   `SMTP_USER` to stand in for it** all refuse here rather than failing silently on the first real
   alert. (With `SMTP_USER` set explicitly, a display-name `EMAIL_FROM` is perfectly fine.)
 
-Then it sends **one** confirmation alert and writes a marker into `CONFIG_PATH` recording the
-config file's **sha256** — one line, `sha256:<hex>`. Later boots skip the check while that digest
-still matches, so any edit to the file is what makes the next boot re-validate. The marker is
-**per environment**, so promoting a service from `dev` to `prod` re-validates even though the
-shared file did not change.
+Then it sends **one** confirmation alert and writes a marker into `CONFIG_PATH` recording two
+facts — the config file's **sha256** on line one, `sha256:<hex>`, and the **service** that
+validated it on line two, `service:"<name>"`. Later boots skip the check while both still match,
+so any edit to the file is what makes the next boot re-validate. The marker is **per
+environment**, so promoting a service from `dev` to `prod` re-validates even though the shared
+file did not change — and it records the service, so **renaming** a service re-validates too. The
+checks are not a function of the file alone: an unusable title prefix and the ntfy topic key are
+both derived from the service name.
+
+⚠️ **A marker written before v1.5.0 records no service**, so the first boot after that upgrade
+re-validates and sends one confirmation alert per service. Then it stops. An operator upgrading a
+fleet should expect that alert rather than read it as a configuration that broke.
 
 To force a re-check without editing the file, delete the marker: `CONFIG_PATH/.alerting-validated-<env>`.
 

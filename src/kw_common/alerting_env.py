@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import logging
 import os
 import re
@@ -533,8 +534,13 @@ def marker_name(deploy_env: str) -> str:
 
     The environment is what the check is ABOUT — `required_keys` differs per environment and so
     does the topic — so "this configuration has been validated" is not a fact about the file alone.
-    The marker lives in `CONFIG_PATH`, one per environment, exactly as the standard specifies; it
-    constrains neither the filename nor the count.
+    It is not a fact about the file and the environment alone either, which is #18: the SERVICE is
+    the third thing the check depends on, and it is recorded in the marker's CONTENTS rather than
+    in its name — see `_marker_body`.
+
+    ⚠️ THE FILENAME IS THE STANDARD'S, NOT THIS FUNCTION'S. The ops-alerting standard fixes it at
+    `.alerting-validated-<env>` in `CONFIG_PATH`, so the fix for #18 could not go here even though
+    the environment's did. What the standard does not constrain is how many facts the file holds.
     """
     return f"{MARKER_NAME}-{normalise_env(deploy_env)}"
 
@@ -562,8 +568,59 @@ def _config_digest(config: str | os.PathLike[str]) -> str:
         return ""
 
 
-def _marker_matches(marker: Path, config: Path) -> bool:
-    """Whether this exact config file has already been validated, i.e. this boot may skip.
+def _marker_body(digest: str, service: str) -> str:
+    """The marker's contents: the config digest, then the service that validated it (#18).
+
+    ⭐⭐ THE SERVICE IS PART OF WHAT WAS VALIDATED, SO IT IS PART OF WHAT IS RECORDED.
+    `_check_usable` validates settings DERIVED FROM THE SERVICE NAME — the ntfy key that is
+    looked up, and the title prefix that becomes an HTTP header — so "this configuration has
+    been validated" was never a fact about the file and the environment alone. Rename the
+    service while `CONFIG_PATH`, `DEPLOY_ENV` and the config's bytes stay put and the marker
+    still matched, so a refusal a fresh marker directory produces was skipped: the service came
+    up with a prefix that fails every ntfy send. The environment fix (`marker_name`) and this
+    one are the same defect with `service` in the place of `env`.
+
+    ⭐ IN THE CONTENTS, NOT IN THE FILENAME, and that is the ops-alerting standard's own
+    direction rather than a choice made here. The standard fixes the marker's NAME at
+    `.alerting-validated-<env>` in `CONFIG_PATH`; it says nothing about how many facts the file
+    inside may carry. Line one is still `sha256:<hex>` and nothing else, so a reader that knows
+    only the older format reads the digest correctly.
+
+    ⚠️ THE NAME IS JSON-ENCODED, WHICH IS NOT DECORATION. `AlertSettings` requires `service` to
+    be a non-blank string and strips it; it does NOT refuse control characters the way
+    `title_prefix` does, because a service name is not a header value. So a name carrying a
+    newline would split into a line this parser could not put back together — and a marker that
+    can never match again is the loud failure `_write_marker` documents: re-validate and
+    re-announce on EVERY boot, forever. `json.dumps` escapes it to one ASCII line that round
+    trips exactly, so the pathological name costs nothing and the ordinary one stays readable
+    (`service:"feed-poller"`) to an operator who opens the file.
+    """
+    return f'{digest}\nservice:{json.dumps(service)}'
+
+
+def _recorded_service(recorded: str) -> str | None:
+    """The service name a marker records, or `None` if it records none this parser trusts.
+
+    `None` for every unparseable shape — an older release's digest-only marker, a truncated
+    line, a JSON value that is not a string — and `None` never equals a real service name, so
+    every one of those re-validates. That is the safe direction and it is the SAME migration
+    the digest change itself made: one validation and one confirmation alert per service on the
+    first boot after the upgrade, then silence.
+    """
+    for line in recorded.splitlines()[1:]:
+        head, sep, payload = line.strip().partition("service:")
+        if head or not sep:
+            continue
+        try:
+            value = json.loads(payload)
+        except ValueError:
+            return None
+        return value if isinstance(value, str) else None
+    return None
+
+
+def _marker_matches(marker: Path, config: Path, service: str) -> bool:
+    """Whether this exact config file has already been validated BY THIS SERVICE (#18).
 
     ⭐⭐ THE DIGEST, NOT THE TIMESTAMP (#15). The marker used to be empty and the question used to
     be "is the marker NEWER than the config". `rsync -a`, `cp -p`, `tar -x` and a volume restore
@@ -584,6 +641,11 @@ def _marker_matches(marker: Path, config: Path) -> bool:
         it needs no operator step — but it is not silent, and an operator upgrading a fleet should
         expect one confirmation per service rather than none.
 
+    ⚠️ AND A MARKER WRITTEN BY 1.3.0-1.4.1 RECORDS NO SERVICE, so it matches nothing either and
+    the same one-off migration happens again on the first boot after THIS upgrade. Stated here
+    rather than left to be discovered: an operator who reads a confirmation alert per service
+    after a bump is seeing the marker format change, not a configuration that broke.
+
     Anything unreadable, absent, empty or malformed answers False: the safe reading of "I cannot
     establish that this file was validated" is to validate it.
     """
@@ -594,12 +656,18 @@ def _marker_matches(marker: Path, config: Path) -> bool:
         return False
     if not recorded.startswith("sha256:"):
         return False
+    # ⭐ ASKED BEFORE THE FILE IS HASHED, because it is the cheaper question and it is the one
+    # that is false on every marker an older release wrote. A rename answers here.
+    if _recorded_service(recorded) != service:
+        return False
     current = _config_digest(config)
     # ⚠️ `and` on a non-empty current, because `_config_digest` answers `""` for an unreadable
     # config — and `"" == ""` would make an unreadable config match an unreadable marker. It
     # cannot happen through the branch above, which already required the `sha256:` prefix, and it
     # is written out anyway: this is the comparison that decides whether validation runs at all.
-    return bool(current) and recorded == current
+    # ⭐ THE FIRST LINE, not the whole text: the marker carries a `service:` line below the
+    # digest now, and comparing the whole body to a bare `sha256:<hex>` would never match.
+    return bool(current) and recorded.splitlines()[0].strip() == current
 
 
 def validate_boot(settings: AlertSettings, deploy_env: str,
@@ -656,7 +724,7 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
             "with load_alert_settings() or load_alert_settings_from_env().")
 
     marker = Path(marker_dir) / marker_name(env)
-    if _marker_matches(marker, config):
+    if _marker_matches(marker, config, settings.service):
         log.info("alerting: %s configuration validated on an earlier boot (%s records the current "
                  "digest of %s); skipping. Any edit to the config file forces a re-check; delete "
                  "the marker to force one without editing it.",
@@ -702,7 +770,8 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
         # would send one either, because the marker suppresses them, so the proof was lost until
         # somebody edited the file. The next boot after `configure()` validates and announces.
         return True
-    _write_marker(marker, digest, consequence=_WROTE_NOTHING_AFTER_VALIDATING)
+    _write_marker(marker, _marker_body(digest, settings.service),
+                  consequence=_WROTE_NOTHING_AFTER_VALIDATING)
     return True
 
 
@@ -1049,12 +1118,13 @@ _COULD_NOT_NARROW_AN_EXISTING_MARKER = (
     "with this volume mounted, and it records a digest of the file holding the SMTP password.")
 
 
-def _write_marker(marker: Path, digest: str, *, consequence: str) -> None:
-    """Record a config digest in the app's own read-write directory, restricted to this process.
+def _write_marker(marker: Path, body: str, *, consequence: str) -> None:
+    """Record a marker body in the app's own read-write directory, restricted to this process.
 
-    ⭐ ONE LINE, `sha256:<hex>`, AND NOTHING ELSE. The marker used to be empty and its whole
-    meaning lived in its modification time; it now carries the answer itself, so nothing about the
-    ORDER of these two writes matters any more. That deleted a real defect rather than a nicety:
+    ⭐ LINE ONE IS `sha256:<hex>` AND NOTHING ELSE; `_marker_body` builds what goes below it.
+    The marker used to be empty and its whole meaning lived in its modification time; it now
+    carries the answer itself, so nothing about the ORDER of these two writes matters any
+    more. That deleted a real defect rather than a nicety:
     on a one-second-granularity filesystem — an ext4 with 128-byte inodes, which several CI
     runners' scratch disks are — the config and the marker landed on the same second, the marker
     could never be strictly newer, and every boot re-validated and re-alerted forever. Measured
@@ -1067,7 +1137,7 @@ def _write_marker(marker: Path, digest: str, *, consequence: str) -> None:
     recorded must be what was CHECKED; `validate_boot` takes it before anything reads the file.
 
     ⚠️ AND THE CALLER NOW OWNS THE FORMAT, which the old signature guaranteed by computing it. A
-    digest without the `sha256:` prefix would be written happily and then match nothing forever —
+    body not opening with the `sha256:` prefix would be written happily and then match nothing —
     a marker that re-validates and re-announces on EVERY boot, silently, which is precisely the
     failure the deleted `_outrank` existed to prevent. So it is checked here rather than trusted.
 
@@ -1113,7 +1183,7 @@ def _write_marker(marker: Path, digest: str, *, consequence: str) -> None:
     itself is equally readable there, and it holds the password in the clear rather than a digest
     of it.
     """
-    if not digest.startswith("sha256:"):
+    if not body.startswith("sha256:"):
         # Empty means the CONFIG could not be read when the digest was taken, one statement before
         # `read_config` read it successfully — a flap on the shared mount. Anything else means a
         # caller passed a shape this file does not write. Both end the same way: no marker, one
@@ -1122,7 +1192,7 @@ def _write_marker(marker: Path, digest: str, *, consequence: str) -> None:
                     "marker was written to %s. Whatever the marker held before is unchanged, so "
                     "the next boot decides for itself whether to validate. An empty digest means "
                     "the shared config could not be read at the moment it was hashed; anything "
-                    "else is a caller passing a shape this file does not write.", digest, marker)
+                    "else is a caller passing a shape this file does not write.", body, marker)
         return
     tmp = marker.with_name(marker.name + ".tmp")
     try:
@@ -1133,7 +1203,7 @@ def _write_marker(marker: Path, digest: str, *, consequence: str) -> None:
         _discard(tmp)
         fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(digest + "\n")
+            fh.write(body + "\n")
         os.replace(tmp, marker)
     except (OSError, ValueError) as exc:
         # `ValueError` too: a NUL in `CONFIG_PATH` raises it from `mkdir` and `os.open`, and it

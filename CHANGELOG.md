@@ -38,11 +38,16 @@ and WHEN it lands.
   the channel down immediately — and `alerting_env.validate_boot*` RAISES `AlertEnvError`, which
   the setup document tells adopters to let stop the process. So this is not only "a channel is
   disabled": a service configured either way **does not start**.
-* *When:* not necessarily on the first boot after the bump. `validate_boot` returns early while
-  the marker records the current config file's digest, so a deployment whose `configs/alerting.env`
-  is untouched skips re-validation and meets the refusal later — at a fresh install, an edited
-  config, or a deleted marker — where it will look unrelated to the bump. (This is the same
-  sentence 1.4.1 wrote for its own new refusal, and it applies unchanged.)
+* *When:* **on the first boot after the bump, for every service.** ⚠️ This is the one paragraph
+  that changed late and it changed in the safer direction, so read it rather than skimming it.
+  1.4.1's new refusal was met LATER — `validate_boot` returns early while the marker records the
+  current config's digest, so a deployment whose `configs/alerting.env` was untouched skipped
+  re-validation and met the refusal at some unrelated later moment. The marker now records the
+  SERVICE as well (#18, below), so no marker written before 1.5.0 matches: every service
+  re-validates exactly once on its first boot after the bump, and that is where both refusals
+  land. A migration that fails is far better than one that fails three months later looking
+  like something else — but it means **the bump itself is when to be watching**, not the next
+  config edit. Roll one service first.
 * *Which:* an `EMAIL_FROM` that normalises to nothing (`";"`), and an ntfy URL with something
   before the `[` of a bracketed IPv6 host — the shape `urlsplit`'s IPv6 hardening was the only
   thing refusing, on the interpreters that have it. Real userinfo (`user:pass@[::1]`) was already
@@ -51,6 +56,13 @@ and WHEN it lands.
   absolutely: an `EMAIL_FROM` of `";"` produces a NULL return-path, which **most** submission
   servers refuse — a relay that accepts one was delivering, and for that deployment this is a
   behaviour change rather than a fix. Nothing else that was delivering stops.
+
+**One re-validation and one confirmation alert per service, once.** The marker's contents grew a
+line, so every marker an earlier release wrote is now unmatched — which costs exactly one
+validation and one announcement per service, then silence. That alert reaches every channel the
+service has configured, so an operator upgrading the fleet should expect one email and one push
+per service rather than none. It is the same migration 1.3.0 made when the marker stopped being
+empty, and it needs no operator step.
 
 **Nothing in any module's `__all__` was removed or renamed.** Four names were added.
 
@@ -164,6 +176,20 @@ in the range and `--staged` scans. It is mentioned only so nobody attributes it 
   hand-written host-shape predicate, so the two cannot disagree about a URL. ⚠️ A new boot
   refusal on the interpreters that lacked the check; an ordinary `https://[::1]/topic` is
   unaffected.
+- **The validation marker records the SERVICE that validated, not only the config and the
+  environment (#18).** `_check_usable` validates settings DERIVED FROM THE SERVICE NAME — the ntfy
+  key it looks up, and the title prefix that becomes an HTTP header — so "this configuration has
+  been validated" was never a fact about the file and the environment alone. Renaming a service
+  while `CONFIG_PATH`, `DEPLOY_ENV` and the config's bytes stayed put left the marker matching, so
+  the refusal a fresh marker directory produces was skipped and the service came up with a title
+  prefix that fails every ntfy send. It is the same defect the per-environment marker fixed, with
+  `service` in the place of `env`. ⚠️ **In the CONTENTS, not the filename** — the ops-alerting
+  standard fixes the name at `.alerting-validated-<env>`, so line one is still `sha256:<hex>` and
+  nothing else, and a reader that knows only the older format still reads the digest correctly.
+  Line two is `service:"<name>"`, JSON-encoded so that a name carrying a quote, a non-ASCII
+  letter or a control character cannot split into a line the parser could never read back — which
+  would be a marker that matches nothing forever, re-announcing on every boot. See the migration
+  note above: this is what makes every service re-validate once.
 - **A `logger_name` that raises cannot cost a config load.** Found while adding the field: a
   bare `getattr(settings, "logger_name", "")` suppresses only `AttributeError`, so a property
   raising anything else propagated out of `AlertConfig.load` and turned a boot report that said
