@@ -3594,6 +3594,20 @@ def test_the_SMTP_PORT_memo_tells_EACH_SERVICES_operator_once(
         f"each service's own operator must be told exactly ONCE about the shared file's bad port, "
         f"and a healthy read must evict neither — got {records} across 25 rounds")
 
+    # ⭐ AND THE MIRROR, which the mutation matrix found unpinned: TWO CONFIG FILES, ONE LOGGER.
+    # That is every consumer who has not set `logger_name` — it defaults to `""`, so they all
+    # share the library's own logger — and dropping the config file from the key silences the
+    # second file's fault for exactly them. Both halves of the key are load-bearing, on opposite
+    # populations, so both need a case.
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
+        for _ in range(25):
+            for path in ("/srv/one/alerting.env", "/srv/two/alerting.env"):
+                AlertConfig(email={"SMTP_PORT": "0"}, config_file=path).smtp_port()
+    assert caplog.text.count("SMTP_PORT") == 2, (
+        f"two DIFFERENT config files on the library's own logger must each be reported once — "
+        f"got {caplog.text.count('SMTP_PORT')} line(s):\n{caplog.text}")
+
     # ...and the same config+logger, corrected then re-broken, complains AFRESH — the property
     # that made "once per distinct value" preferable to "once per process".
     #

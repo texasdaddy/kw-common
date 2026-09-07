@@ -362,6 +362,21 @@ def test_BOTH_loaders_pass_the_injected_logger_name_through(
         load_alert_settings(config_file_for(tmp_path), "dev", "feed-poller",  # type: ignore[misc]
                             "feed-poller.alerts")
 
+    # ⛔ AND A BAD NAME IS REFUSED AS `AlertEnvError`, NOT AS THE CONSTRUCTOR'S `ValueError`.
+    # This layer's whole contract is that a boot refusal is an `AlertEnvError` an adopter catches
+    # to print its own one-liner; `AlertSettings.__post_init__` would refuse a control character
+    # anyway, so without this the process still stops — with a bare traceback, which is the
+    # outcome `_refuse` exists to prevent. The mutation matrix found it unpinned: deleting the
+    # loader's check left the suite green, because the constructor caught it under another name.
+    # Reachable straight from a CRLF-bearing environment variable.
+    for bad in ("feed-poller\r", "feed\npoller", "feed\x00poller"):
+        with pytest.raises(AlertEnvError):
+            load_alert_settings(config_file_for(tmp_path), "dev", "feed-poller",
+                                logger_name=bad)
+    with pytest.raises(AlertEnvError):
+        load_alert_settings(config_file_for(tmp_path), "dev", "feed-poller",
+                            logger_name=None)          # type: ignore[arg-type]
+
 
 @pytest.mark.parametrize("value", ["", "staging", "production", "DEV ELOPMENT", "1"])
 def test_an_environment_that_is_not_dev_or_prod_is_refused_rather_than_guessed(value: str) -> None:
