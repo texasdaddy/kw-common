@@ -9,6 +9,149 @@ exported symbol that changed. ⛔ It does NOT name the consumers that need a cod
 repository is public, and honouring that older promise would publish the fleet's inventory at
 exactly the moment the release notes are read most widely.
 
+## [1.5.0] - 2026-09-06
+
+**This release is a migration brief as much as a changelog.** Five repositories still carry their
+own copy of the leak guard, and the four scan-coverage defects a sibling fixed in ITS copy are
+fixed here instead — so the fleet gets them by moving a pin rather than by five hand-ports that
+each get a chance to diverge. Six library-side defects the first adopter could only work around
+are fixed with them.
+
+### ⚠️ WHAT A CONSUMER SHOULD EXPECT WHEN IT BUMPS
+
+**New findings are the fix working, not a regression.** Three of the changes below make a scan
+read something it previously skipped, so a repository whose tree scanned clean on 1.4.1 may
+scan RED on 1.5.0 — a plain-text file wearing an asset's name, a leak on a readable line of a
+file that carries a NUL further in. That is a leak that was always there and was never read.
+Fix the value; do not reach for an allowance.
+
+**And one change makes a scan STOP reddening a tree that is correct.** A repository whose tracked
+files are all genuine assets — an icon set, a fonts package — was refused by 1.4.1 with "ZERO were
+read as text" and no remedy its operator could apply. It passes now.
+
+**Two boot-time refusals are new** and both disable a channel that was already dead: an
+`EMAIL_FROM` that normalises to nothing, and an ntfy URL whose bracketed IPv6 host carries
+userinfo. A deployment relying on either was not delivering; it now says so at boot instead of on
+every send. Nothing that was DELIVERING stops.
+
+**Nothing in any module's `__all__` was removed or renamed.** Four names were added.
+
+### Added
+
+- **`AlertSettings(logger_name=...)`, and `load_alert_settings(..., logger_name=...)` /
+  `load_alert_settings_from_env(..., logger_name=...)`.** A logger NAME is an operator-facing
+  surface — a per-logger level, a filter, a shipper's routing are all written against it — so a
+  service that has always emitted its alerting records on its own name could not adopt this
+  library without silently relocating every one of them. The first adopter kept its name by
+  REBINDING this module's `log` global: correct for one consumer in one process, and
+  last-writer-wins the moment there are two. It is injected configuration now, like everything
+  else. `""` (the default) means this module's own logger, and it is inert for every existing
+  caller. ⚠️ A blank or non-string name means the module's logger and never the ROOT one —
+  `logging.getLogger("")` IS the root, which is what an unset container Variable would have
+  produced.
+- **Four pure helpers are exported and under semver: `recipients`, `parse_env_file`,
+  `escalate_gap_hours`, `is_cert_failure`.** The first adopter imported all four by their
+  `_`-prefixed spellings because its own suite tested them directly, so four behaviours a
+  consumer depends on sat outside the contract and any rename would have been a surprise at
+  runtime rather than a red build. The `_`-prefixed spellings survive as ALIASES of the same
+  objects, so existing imports keep working; they are not themselves promised. `_CHANNELS` and
+  `_now` are deliberately NOT exported — one is a private structure a consumer should not read,
+  the other a test seam.
+- **`parse_env_file(..., logger=...)` and `read_jsonl_tail(..., logger=...)`**, keyword-only, so
+  the two module-level functions that log can be told where. Positional shapes are unchanged.
+
+### Fixed — the leak guard reads what it claimed to read
+
+- **The TREE scan missed a leak that `--range` and `--staged` both caught.** Its binary test asked
+  "is there a NUL ANYWHERE, or does this fail to decode"; git asks "is there a NUL in the first
+  8000 bytes". So a file named `.pdf` holding 9 KB of plain ASCII with one NUL at the end was
+  served as TEXT by git — reported by the range and staged scans, and SKIPPED WHOLE by the tree
+  scan, which is the layer a pre-commit hook runs and the one that runs most often. Measured on
+  1.4.1: `--staged` and `--range` exit 1 naming the line, tree scan exit 0, "1 tracked text files
+  scanned". The window is git's own now, so all three classify a file the same way. A NUL-bearing
+  LINE in such a file is blanked rather than removed, so a finding after it keeps its true line
+  number, and the tree scan discloses the partial read (`PARTLY read`) instead of counting the
+  file as fully scanned.
+- **A latin-1 file under an asset's name is scanned rather than skipped in silence.** A failed
+  UTF-8 decode was treated as "binary", but git serves such a file as text and the range scan has
+  always scanned it with replacement characters — so a latin-1 runbook named `.pdf` was reported
+  by `--range` and cleared by the tree scan. Same file, same verdict, from every scan.
+- **`--staged` no longer resolves one file's name to another file's bytes.** It asked git for
+  `:<path>`, which is a REVISION expression in which `:0:`/`:1:`/`:2:`/`:3:` name a merge STAGE —
+  so a path beginning with one of those prefixes was vouched for by a DIFFERENT file's content and
+  the scan reported clean. It asks for `:0:<path>` now, which makes the remainder unambiguously a
+  path. (Not reachable on Windows, where git refuses a colon in a filename, which is exactly why
+  it had to be ported rather than waited for.)
+- **Anything named `HEAD` beside the repository root no longer kills a scan with a traceback.**
+  git resolves a revision NAME against the filesystem as well as the refs, so a file, an untracked
+  file or a DIRECTORY of that name produced `fatal: ambiguous argument 'HEAD'`, exit 128 — and
+  `--staged` died with a stack trace naming an argument the operator never typed. Every diff and
+  every `rev-list` this engine runs now carries the `--` separator.
+- **The zero-file floor is RETIRED, and that is a repair rather than a removal.** It refused any
+  tree with tracked files where none was read as text — written for the `.pdf`-of-ASCII case,
+  which the change above now READS. What it was left catching was a repository of nothing but
+  genuine assets: a correct tree, reddened, with "add a README" as the only remedy, which is
+  precisely how a guard gets switched off. Every tracked PATH is scanned, so such a run has not
+  looked at nothing, and the verdict says so: `no internal info found (N tracked text files
+  scanned, M tracked path(s) examined)`. ⚠️ **The success line's wording changed** — anything
+  matching on it needs updating. The empty tree still passes (`git commit --allow-empty` is how a
+  repository is started), which is the one decision here taken differently from the sibling's.
+
+### Fixed — alerting
+
+- **`email_ready()` asks `EMAIL_FROM` the question it already asked `EMAIL_TO`.** A
+  separators-only value is non-empty, so it passed the presence check — and `smtplib` derives the
+  ENVELOPE SENDER from that header, which for `;` is the empty string. Most submission servers
+  refuse a null return-path, so every send failed while the boot line said "email + ntfy ready".
+  The two halves of one hand-edited file were held to different rules. ⚠️ **A new boot refusal**,
+  for a configuration that was not delivering. Two addresses in `EMAIL_FROM` still truncate to the
+  first and deliver, which is a misconfiguration with a reasonable outcome and is left alone.
+- **A refused `SMTP_PORT` complains once per DISTINCT VALUE, not once per send.** The config is
+  re-read on every delivered notification — deliberately, so a rotated password takes effect
+  without a restart — so one mistyped port produced one identical ERROR line per alert, forever.
+  Measured: 5 calls, 5 lines. A value corrected and then re-broken complains afresh, so a real
+  recurrence is not swallowed; the boot report (`setting_faults()`) carries the fault regardless.
+- **A failed email send no longer logs the RECIPIENT ADDRESS verbatim.** `SMTPRecipientsRefused`
+  carries the recipient dict in its `str()`, so a broken channel printed the address on every
+  alert — in the log an operator is told to fetch and paste into an issue, and in exactly the
+  shape this package's own leak guard exists to catch. The resolved `EMAIL_TO`/`EMAIL_FROM`
+  addresses join the redaction set, in both the header form an operator typed and the bare form an
+  exception quotes. `SMTP_USER` stays out, documented unsecret: it is often a bare word such as
+  `apikey`, and redacting that from every diagnostic is pure cost.
+- **`ntfy_ready()` refuses a bracketed IPv6 host carrying userinfo on EVERY interpreter (#8).**
+  That URL was refused only because `urlsplit` raises `Invalid IPv6 URL`, and that check shipped
+  in CPython PATCH releases — which `requires-python = ">=3.10"` does not constrain. Measured:
+  present on 3.10.20 and 3.14.7, absent on 3.12.0, where the channel reported READY and was dead
+  on every send. The refusal mirrors the stdlib's own rule rather than adding a fourth
+  hand-written host-shape predicate, so the two cannot disagree about a URL. ⚠️ A new boot
+  refusal on the interpreters that lacked the check; an ordinary `https://[::1]/topic` is
+  unaffected.
+- **A `logger_name` that raises cannot cost a config load.** Found while adding the field: a
+  bare `getattr(settings, "logger_name", "")` suppresses only `AttributeError`, so a property
+  raising anything else propagated out of `AlertConfig.load` and turned a boot report that said
+  "ALERTING UNCONFIGURED" into "ALERTING CONFIG UNREADABLE". Read through a helper that never
+  raises, the same contract `_title_prefix` has had for the same reason.
+
+### Changed
+
+- `repr(AlertConfig)` prints the new `logger_name` field. `SMTP_PASSWORD` stays masked.
+
+### Declared rather than closed
+
+- **#26** — a binary suffix plus ONE NUL inside git's 8000-byte window still hides plain text from
+  every scan. The residual of the narrowed suffix rule, measured, with the three ways to close it
+  and what each costs.
+- **#27** — the range and `--staged` scans blank a NUL-bearing line without disclosing it, where
+  the tree scan says so. `parse_diff` cannot currently tell that case from an ordinary binary
+  diff.
+- **The annotated-tag SCOPE differs from the sibling's, deliberately.** This engine scans the tag
+  object the RANGE NAMES; the sibling scans a tag pointing at a commit in the range. Neither is a
+  defect and the difference is measurable: a tag cut at an ALREADY-PUSHED commit (the ordinary
+  release gesture, where the range covers zero commits) is scanned here and is a stated gap there,
+  while a tag on an in-range commit that the push does not send is scanned there and not here.
+  CI passes `$GITHUB_REF`, so the release path is covered. Ref NAMES are scanned by no layer —
+  see the note in `refs_being_published`.
+
 ## [1.4.1] - 2026-09-05
 
 The audit pass: the open issue list measured against the published wheel and burned down, and a
@@ -794,6 +937,7 @@ every service runs the same code instead of a copy that drifts.
   cannot disagree. Calling the function directly with `backups=None` raises; see issue #5.
   *(Superseded: 1.4.1 accepts `None` as that sentinel again.)*
 
+[1.5.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.5.0
 [1.4.1]: https://github.com/texasdaddy/kw-common/releases/tag/v1.4.1
 [1.4.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.4.0
 [1.3.0]: https://github.com/texasdaddy/kw-common/releases/tag/v1.3.0

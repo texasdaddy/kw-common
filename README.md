@@ -16,13 +16,13 @@ no port, no alignment audit, and no "which copy is the good one" question to ans
 Consumers install from git at an **exact tag** — never a branch:
 
 ```
-pip install git+https://github.com/texasdaddy/kw-common@v1.4.1
+pip install git+https://github.com/texasdaddy/kw-common@v1.5.0
 ```
 
 In a `requirements.in` / `requirements.txt`:
 
 ```
-kw-common @ git+https://github.com/texasdaddy/kw-common@v1.4.1
+kw-common @ git+https://github.com/texasdaddy/kw-common@v1.5.0
 ```
 
 ⛔ **Never pin a branch.** `@main` makes every rebuild of every consumer a silent, unreviewed
@@ -58,6 +58,7 @@ configure(AlertSettings(
     ntfy_url="https://ntfy.example.com/my-topic",     # https only; "" = no ntfy channel
     state_file="/data/my-service/alert-state.json",   # None = de-duplication OFF
     error_log="/data/my-service/logs/errors.log",     # None = no error-log sink
+    logger_name="my-service.alerts",                  # "" = this library's own logger
 ))
 
 warn_if_unconfigured("my-service")   # at boot: says loudly if alerts would go nowhere
@@ -69,6 +70,14 @@ notify(OK, "my-service: backup ok", "12.4 GB", clears="my-service: backup failed
 Everything the module needs is passed in. It reads no environment variable and has no default
 path — see the contract below, and the module's own docstring for the full behaviour (severities,
 `escalating=`, `clears=`, and the error log's exposure warning).
+
+⭐ **`logger_name` is configuration like everything else.** A logger name is an operator-facing
+surface: a per-logger level, a filter, or a log shipper's routing is written against it, so a
+service that has always emitted its alerting on its own name would otherwise have every record
+silently relocated to `kw_common.alerting` the day it adopted this library. Set it and the records
+stay where the operator's configuration expects them. `""` — the default — means this library's
+own logger, and a blank or non-string name means the same thing rather than the ROOT logger, which
+is what `logging.getLogger("")` would otherwise hand back for an unset container Variable.
 
 ⚠️ **An ntfy topic URL must be `https://`.** It is a *write capability*, not an address: anyone who
 observes it can page you from then on, and over cleartext the URL, the alert `Title` and the body
