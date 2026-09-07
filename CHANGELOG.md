@@ -12,10 +12,10 @@ exactly the moment the release notes are read most widely.
 ## [1.5.0] - 2026-09-06
 
 **This release is a migration brief as much as a changelog.** Five repositories still carry their
-own copy of the leak guard, and the four scan-coverage defects a sibling fixed in ITS copy are
-fixed here instead — so the fleet gets them by moving a pin rather than by five hand-ports that
-each get a chance to diverge. Six library-side defects the first adopter could only work around
-are fixed with them.
+own copy of the leak guard, and the scan-coverage defects a sibling fixed in ITS copy are fixed
+here instead — so the fleet gets them by moving a pin rather than by five hand-ports that each get
+a chance to diverge. Six library-side defects the first adopter could only work around are fixed
+with them.
 
 ### ⚠️ WHAT A CONSUMER SHOULD EXPECT WHEN IT BUMPS
 
@@ -25,16 +25,39 @@ scan RED on 1.5.0 — a plain-text file wearing an asset's name, a leak on a rea
 file that carries a NUL further in. That is a leak that was always there and was never read.
 Fix the value; do not reach for an allowance.
 
-**And one change makes a scan STOP reddening a tree that is correct.** A repository whose tracked
+**And two changes make a scan STOP reddening a tree that is correct.** A repository whose tracked
 files are all genuine assets — an icon set, a fonts package — was refused by 1.4.1 with "ZERO were
-read as text" and no remedy its operator could apply. It passes now.
+read as text" and no remedy its operator could apply. And a repository that keeps a file named
+after a commit sha at its root (a `format-patch` scratch file, a `git show <sha> > <sha>` dump)
+had its whole `--range` scan die `exited 128`, printing a remedy for a cause that had nothing to
+do with it. Both pass now.
 
-**Two boot-time refusals are new** and both disable a channel that was already dead: an
-`EMAIL_FROM` that normalises to nothing, and an ntfy URL whose bracketed IPv6 host carries
-userinfo. A deployment relying on either was not delivering; it now says so at boot instead of on
-every send. Nothing that was DELIVERING stops.
+**Two boot-time refusals are new**, and this is the one to read carefully because of WHAT it does
+and WHEN it lands.
+* *What:* both are refusals in `email_ready()` / `ntfy_ready()`, so `warn_if_unconfigured` reports
+  the channel down immediately — and `alerting_env.validate_boot*` RAISES `AlertEnvError`, which
+  the setup document tells adopters to let stop the process. So this is not only "a channel is
+  disabled": a service configured either way **does not start**.
+* *When:* not necessarily on the first boot after the bump. `validate_boot` returns early while
+  the marker records the current config file's digest, so a deployment whose `configs/alerting.env`
+  is untouched skips re-validation and meets the refusal later — at a fresh install, an edited
+  config, or a deleted marker — where it will look unrelated to the bump. (This is the same
+  sentence 1.4.1 wrote for its own new refusal, and it applies unchanged.)
+* *Which:* an `EMAIL_FROM` that normalises to nothing (`";"`), and an ntfy URL with something
+  before the `[` of a bracketed IPv6 host — the shape `urlsplit`'s IPv6 hardening was the only
+  thing refusing, on the interpreters that have it. Real userinfo (`user:pass@[::1]`) was already
+  refused by an older branch and is not what changed.
+* *Cost:* a deployment relying on either was not delivering. ⚠️ Stated exactly rather than
+  absolutely: an `EMAIL_FROM` of `";"` produces a NULL return-path, which **most** submission
+  servers refuse — a relay that accepts one was delivering, and for that deployment this is a
+  behaviour change rather than a fix. Nothing else that was delivering stops.
 
 **Nothing in any module's `__all__` was removed or renamed.** Four names were added.
+
+**Unchanged, and worth knowing if you have a large tracked asset:** the tree scan reads every
+tracked file's bytes before deciding anything, so peak memory is about twice the largest tracked
+file. That is not new — 1.4.1 does the same, measured — and the suffix list still avoids the read
+in the range and `--staged` scans. It is mentioned only so nobody attributes it to this release.
 
 ### Added
 
@@ -57,7 +80,9 @@ every send. Nothing that was DELIVERING stops.
   objects, so existing imports keep working; they are not themselves promised. `_CHANNELS` and
   `_now` are deliberately NOT exported — one is a private structure a consumer should not read,
   the other a test seam.
-- **`parse_env_file(..., logger=...)` and `read_jsonl_tail(..., logger=...)`**, keyword-only, so
+- **`parse_env_file(..., logger=...)` and `read_jsonl_tail(..., logger=...)`**, both keyword-only
+  (`read_jsonl_tail`'s was not, until the verification gate read this line against the signature
+  and found the claim false), so
   the two module-level functions that log can be told where. Positional shapes are unchanged.
 
 ### Fixed — the leak guard reads what it claimed to read
@@ -93,9 +118,18 @@ every send. Nothing that was DELIVERING stops.
   genuine assets: a correct tree, reddened, with "add a README" as the only remedy, which is
   precisely how a guard gets switched off. Every tracked PATH is scanned, so such a run has not
   looked at nothing, and the verdict says so: `no internal info found (N tracked text files
-  scanned, M tracked path(s) examined)`. ⚠️ **The success line's wording changed** — anything
-  matching on it needs updating. The empty tree still passes (`git commit --allow-empty` is how a
-  repository is started), which is the one decision here taken differently from the sibling's.
+  scanned, M tracked path(s) examined)`. ⚠️ **Two success lines changed wording** — that one, and
+  the empty-tree verdict, which is a different string with a semicolon and no `examined` count
+  (`no internal info found (0 tracked text files scanned; <root> has no tracked files at all -
+  check --repo if that is a surprise)`). Anything matching on either needs updating. The empty
+  tree still passes (`git commit --allow-empty` is how a repository is started), which is the one
+  decision here taken differently from the sibling's.
+- **A file named after a commit sha no longer kills the range scan.** `commit_identity` and
+  `commit_message` run `git show -s --format=… <sha>`, and git resolves a revision against the
+  FILESYSTEM as well as the refs — so one file of that name at the root, tracked or not, produced
+  `exited 128` and the scan printed "Fetch the base ref", a remedy for something else entirely.
+  The comment justifying the separator elsewhere claimed a full sha could not collide, which is
+  what left these two calls uncovered; every git call here that takes a revision carries `--` now.
 
 ### Fixed — alerting
 
@@ -144,6 +178,11 @@ every send. Nothing that was DELIVERING stops.
 - **#27** — the range and `--staged` scans blank a NUL-bearing line without disclosing it, where
   the tree scan says so. `parse_diff` cannot currently tell that case from an ordinary binary
   diff.
+- **#28** — a clean latin-1 file reds the TREE scan while `--staged` and `--range` clear it, and
+  the same bytes under a binary-hinting NAME pass all three. Measured identical on 1.4.1, so this
+  release neither introduced nor widened it; closing it means deciding whether a non-UTF-8 file at
+  an ordinary path should be scanned with replacement characters or stay refused, which is a
+  behaviour change of its own.
 - **The annotated-tag SCOPE differs from the sibling's, deliberately.** This engine scans the tag
   object the RANGE NAMES; the sibling scans a tag pointing at a commit in the range. Neither is a
   defect and the difference is measurable: a tag cut at an ALREADY-PUSHED commit (the ordinary

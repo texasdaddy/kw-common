@@ -1367,14 +1367,18 @@ def test_an_ordinary_tree_passes_and_the_verdict_prints_BOTH_counts(tmp_path: Pa
     assert "(1 tracked text files scanned, 2 tracked path(s) examined)" in _out(res), _out(res)
 
 
-def test_the_floor_does_not_refuse_an_EMPTY_tree(tmp_path: Path) -> None:
+def test_an_EMPTY_tree_passes_and_the_verdict_NAMES_the_root(tmp_path: Path) -> None:
     """⛔ AN EMPTY TRACKED LIST IS NOT "a scan that skipped everything" — it is a scan with nothing
-    to do, and `git commit --allow-empty -m initial` is the standard way to start a repository.
+    to do, and `git commit --allow-empty -m initial` is the standard way to start a repository. A
+    guard that refuses it cannot be installed in a fresh repo at all.
 
-    Without the `tracked and` guard the floor refused exactly that, so a fresh repo with the hooks
-    installed could not be bootstrapped at all. The acceptance the floor exists for says "a
-    0-files-scanned run against a NON-EMPTY tree", and the empty tree is the case it deliberately
-    does not name.
+    ⚠️ THIS TEST OUTLIVED THE MACHINERY IT WAS WRITTEN FOR, and its docstring said so for a while
+    after that stopped being true — the verification gate caught the stale text. There is no
+    zero-file floor any more (it reddened a correct assets-only tree, which is why it went), so
+    nothing here is guarding a `tracked and` condition. What is left is the property itself, which
+    is worth pinning whatever the implementation: an empty repository passes, and the verdict
+    NAMES the root, because "0 tracked text files scanned" is also what a mis-aimed `--repo`
+    looks like and the two must be distinguishable.
     """
     repo = tmp_path / "floor_empty"
     _init(repo)
@@ -1382,6 +1386,9 @@ def test_the_floor_does_not_refuse_an_EMPTY_tree(tmp_path: Path) -> None:
     assert _git(repo, "ls-files").split() == [], "vacuity guard: nothing may be tracked"
     res = _cli(repo)
     assert res.returncode == 0, f"an empty repository was refused:\n{_out(res)}"
+    assert "has no tracked files at all" in _out(res), (
+        f"the verdict does not distinguish an empty repository from a mis-aimed --repo, which is "
+        f"the only reason it is entitled to exit 0 here:\n{_out(res)}")
 
 
 def test_an_unstaged_rm_of_a_BINARY_ASSET_does_not_red(tmp_path: Path) -> None:
@@ -1492,6 +1499,73 @@ def test_a_leak_on_a_NUL_FREE_line_of_a_late_NUL_pdf_is_found_by_ALL_THREE_scans
 
     rng = _cli(repo, "--range", f"{base}..HEAD")
     assert rng.returncode == 1 and "late.pdf:6:" in _out(rng), _out(rng)
+
+
+def test_a_leak_AFTER_a_blanked_NUL_line_keeps_its_TRUE_line_number(tmp_path: Path) -> None:
+    """⭐ THE HALF THAT MAKES "BLANKED, NOT REMOVED" A CLAIM WITH TEETH — and the mutation matrix
+    is what found it unpinned.
+
+    A NUL-bearing line is emptied in place rather than dropped, so everything after it keeps its
+    own line number. The sibling test above puts its leak on line 6 and the NUL on the last line,
+    which cannot tell blanking from removal apart: `g-blank-removes-lines` (replace the blanking
+    join with one that filters those lines out) SURVIVED the whole suite. Here the NUL comes
+    FIRST, so removal would renumber every finding after it and the assertion goes red.
+    """
+    repo = tmp_path / "renumber"
+    base = _seeded(repo)
+    # ⚠️ THE PADDING COMES FIRST, so the NUL falls PAST git's 8000-byte window and the file is
+    # read at all. A NUL inside the window corroborates the name's binary claim and the whole
+    # file is skipped — the other residual, and not what this test is about.
+    lines = ["x" * 70] * 120
+    lines += ["junk\x00junk", f"host {_ADDR} is the db"]
+    body = ("\n".join(lines) + "\n").encode("ascii")
+    assert b"\x00" not in body[:8000], "the NUL must fall PAST git's window for this fixture"
+    (repo / "doc.pdf").write_bytes(body)
+    _commit(repo, "add a document whose NUL comes before the finding")
+
+    leak_line = len(lines)          # 1-based: the leak is the last line
+    for label, proc in (("tree", _cli(repo)), ("range", _cli(repo, "--range", f"{base}..HEAD"))):
+        assert proc.returncode == 1, f"the {label} scan cleared the leak:\n{_out(proc)}"
+        assert f"doc.pdf:{leak_line}:" in _out(proc), (
+            f"the {label} scan reported the leak at the wrong line — the NUL line was REMOVED "
+            f"rather than blanked, so everything after it renumbered:\n{_out(proc)}")
+
+
+def test_a_file_named_after_an_IN_RANGE_COMMIT_does_not_kill_the_range_scan(
+        tmp_path: Path) -> None:
+    """⛔ THE `--` SWEEP MISSED `git show`, and the reasoning that hid it was in a comment.
+
+    `commit_identity` and `commit_message` both run `git show -s --format=... <sha>`. The comment
+    justifying the separator elsewhere said "every diff whose revision can be a NAME rather than
+    a full sha carries one" — false in both halves: git's ambiguity check fires on a FULL 40-hex
+    sha as soon as a filesystem entry of that name exists. The verification gate planted one
+    UNTRACKED file named after an in-range commit and the whole range scan died:
+
+        could not scan 'HEAD~1..HEAD': git exited 128. Fetch the base ref ...
+
+    Fail-closed, so not a bypass — an UNCLEARABLE RED on the push path, whose printed remedy names
+    a cause that has nothing to do with it. Reachable by a `format-patch` scratch file or a
+    sha-named dump at the root. Both shapes asserted, because the collision is with the
+    FILESYSTEM and not the index.
+    """
+    repo = tmp_path / "shaname"
+    base = _seeded(repo)
+    _write(repo, "a.txt", "clean\n")
+    sha = _commit(repo, "add a")
+
+    assert _cli(repo, "--range", f"{base}..HEAD").returncode == 0, "premise: clean to start with"
+
+    (repo / sha).write_text("a dump of that commit\n", encoding="utf-8")
+    untracked = _cli(repo, "--range", f"{base}..HEAD")
+    assert "Traceback" not in _out(untracked), _out(untracked)
+    assert untracked.returncode == 0, (
+        f"an UNTRACKED file named after an in-range commit killed the range scan:\n"
+        f"{_out(untracked)}")
+
+    _commit(repo, "keep the dump")
+    tracked = _cli(repo, "--range", f"{sha}..HEAD")
+    assert tracked.returncode == 0, (
+        f"a TRACKED file named after a commit killed the range scan:\n{_out(tracked)}")
 
 
 def test_a_late_NUL_pdf_with_NO_leak_is_DISCLOSED_not_refused_and_the_residual_is_stated(

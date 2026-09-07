@@ -2000,8 +2000,18 @@ def changed_paths(root: Path, *revs: str) -> list[str]:
     # repository root — a tracked file, an untracked one, or a directory, measured all three —
     # gets `fatal: ambiguous argument 'HEAD': both revision and filename`, exit 128, and the scan
     # died with a traceback naming an argument the operator never typed. The separator says
-    # "everything before this is a revision" and settles it. Every diff this file runs whose
-    # revision can be a NAME rather than a full sha carries one.
+    # "everything before this is a revision" and settles it.
+    #
+    # ⛔⛔ EVERY GIT CALL THAT TAKES A REVISION CARRIES ONE — `diff`, `rev-list` AND `show`. The
+    # first version of this comment said "every diff whose revision can be a NAME rather than a
+    # full sha", and that scoping was FALSE IN BOTH HALVES: git's ambiguity check fires on a FULL
+    # 40-hex sha too, as soon as a filesystem entry of that name exists, and reasoning that a
+    # full sha was safe is exactly what left `commit_identity` and `commit_message` — which run
+    # `git show <sha>` — without one. The verification gate planted a single UNTRACKED file named
+    # after an in-range commit and the whole range scan died `exited 128`, printing "Fetch the
+    # base ref", a remedy for a cause that had nothing to do with it. A repository that keeps a
+    # `format-patch` scratch file or a sha-named dump at its root reaches that. Fixed the CLASS:
+    # no call here reasons about whether its revision could collide.
     out = _git(root, *_DIFF_CONFIG, "diff", *_DIFF_FLAGS, "--name-only", "-z",
                "--diff-filter=d", *revs, "--")
     return [p for p in out.split("\0") if p]
@@ -2042,9 +2052,9 @@ def added_lines(root: Path, sha: str) -> ParsedDiff:
     Skipped suffixes are filtered FIRST, so a 100 MB `.png` is never fetched only to be discarded.
     """
     parent = first_parent(root, sha)
-    # `--` for the reason `changed_paths` gives; both sides are full shas here, so the ambiguity
-    # is not reachable today — the separator is what keeps that true if a caller ever hands in
-    # a name.
+    # `--` for the reason `changed_paths` gives. ⚠️ NOT because "a full sha cannot collide" — it
+    # can, the moment a file of that name exists, which is the reasoning that left `git show`
+    # uncovered until the gate planted one.
     parsed = parse_diff(_git(root, *_DIFF_CONFIG, "diff", *_DIFF_FLAGS, parent, sha, "--"))
     return resolve_unscannable(root, parsed, (parent, sha))
 
@@ -2205,7 +2215,7 @@ def commit_identity(root: Path, sha: str) -> list[tuple[str, str]]:
     site, and a separate issue" (#35) on a measurement taken against UNSIGNED commits, where the
     setting is genuinely inert. Signing is what makes it bite.
     """
-    raw = _git(root, "show", "-s", "--no-show-signature", f"--format={_IDENT_FORMAT}", sha)
+    raw = _git(root, "show", "-s", "--no-show-signature", f"--format={_IDENT_FORMAT}", sha, "--")
     parts = raw.rstrip("\n").split("\0")
     if len(parts) != len(_IDENT_FIELDS):
         # ⚠️ NOT a silent `zip` truncation. `zip` stops at the shorter side, so a malformed or
@@ -2257,7 +2267,8 @@ def commit_message(root: Path, sha: str) -> str:
     text carries a key path (`C:/Users/<name>/.ssh/allowed_signers`) and a signer principal —
     a FABRICATED finding attributed to a commit message that is in fact clean.
     """
-    return _git(root, "show", "-s", "--no-show-signature", f"--format={_MESSAGE_FORMAT}", sha)
+    return _git(root, "show", "-s", "--no-show-signature", f"--format={_MESSAGE_FORMAT}", sha,
+                "--")
 
 
 def scan_message(sha: str, message: str) -> list[str]:

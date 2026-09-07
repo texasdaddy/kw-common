@@ -125,8 +125,9 @@ WHAT THIS MODULE WILL NOT PUT IN A LOG
 
     1. **Refusals at the source.** A URL with userinfo and a non-ASCII SMTP credential are both
        rejected before the code that would quote them is reached. Neither ever worked.
-    2. **Redaction of what remains** (`_redact`), covering `SMTP_PASSWORD` and the topic URL.
-       Read its docstring for what it does NOT catch, which is the part that matters.
+    2. **Redaction of what remains** (`_redact`), covering `SMTP_PASSWORD`, the topic URL, and
+       the resolved `EMAIL_TO` / `EMAIL_FROM` addresses. Read its docstring for what it does NOT
+       catch, which is the part that matters.
     3. **Shape, never value**, wherever this module describes a setting the ALERTING PATH
        rejected — see `_fault_shape`. Scoped deliberately: `AlertSettings.__post_init__` does
        echo the value of a rejected integer sizing knob, which is a construction-time refusal an
@@ -136,12 +137,25 @@ WHAT THIS MODULE WILL NOT PUT IN A LOG
     None of this reaches what a CALLER puts in a title or a message. Sanitise at the raise site,
     where the value is understood.
 
-    ⚠️ AND "ITS OWN CONFIGURATION" IS SCOPED TO THE TWO VALUES `_secret_values` NAMES — the
-    SMTP password and the topic URL. `EMAIL_TO`, `EMAIL_FROM` and `SMTP_USER` are NOT redacted,
-    and smtplib quotes them: `SMTPSenderRefused` carries the sender, `SMTPRecipientsRefused` the
-    recipients, and a relay that echoes the login name puts `SMTP_USER` into
-    `SMTPAuthenticationError`. Those are addresses rather than credentials, and the line is a
-    diagnostic an operator needs — stated here so the claim above is not read as wider than it is.
+    ⚠️ AND "ITS OWN CONFIGURATION" IS SCOPED TO WHAT `_secret_values` NAMES — the SMTP password,
+    the topic URL, and (since 1.5.0) the RESOLVED `EMAIL_TO` / `EMAIL_FROM` addresses. This
+    paragraph used to say the addresses were NOT redacted, on the grounds that they are addresses
+    rather than credentials and the line is a diagnostic an operator needs. That was the right
+    reading until the address turned out to repeat on EVERY alert while a channel is broken —
+    `SMTPRecipientsRefused` carries the recipient dict in its `str()` — in the log the README
+    tells an operator to fetch and paste into an issue, which is the freemail shape this
+    package's own leak guard exists to catch (consumer#58).
+
+    ⚠️ ONE CONSEQUENCE WORTH KNOWING, because the obvious summary of it is wrong. `SMTP_USER` is
+    not in the set as a KEY, deliberately: it is often a bare word such as `apikey`, and redacting
+    that from every diagnostic is pure cost. But `AlertConfig.load` defaults `SMTP_USER` to
+    `EMAIL_FROM` when that is a bare mailbox — the documented, recommended shape — so in the
+    ordinary deployment its VALUE is in the set via the `EMAIL_FROM` entry, and a relay that
+    echoes the login name has it redacted out of `SMTPAuthenticationError`. The exception TYPE
+    and everything else in the line survive.
+
+    The HOST is still not redacted, which is what keeps the TLS branch diagnostic — see
+    `_secret_values`.
 
 INVARIANTS
     - `notify()` NEVER raises. Alerting that can crash its caller is worse than no alerting.
@@ -264,11 +278,26 @@ def _logger_named(name: object) -> logging.Logger:
     global points at the moment of the call. Not a promise — the injected name is the contract —
     but not broken either, on purpose.
 
-    A non-string or blank name means the module logger, never the root logger: `getLogger("")`
+    A non-string or blank name means the module logger, and NOT the root logger: `getLogger("")`
     IS the root, and routing every alerting record to the root because a settings object carried
-    an empty string would be the silent-relocation failure this exists to prevent.
+    an empty string — which is what an unset container Variable looks like — would be the
+    silent-relocation failure this exists to prevent. ⚠️ Scoped exactly: `logger_name="root"` is
+    the root logger, because that is what `logging` means by the name, and this refuses a BLANK
+    rather than pretending to police which logger a consumer may deliberately choose.
+
+    ⛔ THE `try` IS NOT DECORATION. `isinstance(name, str)` admits a `str` SUBCLASS, which
+    `AlertSettings` accepts and which this module explicitly designs for elsewhere (`_usable_path`
+    is written around "a `str` subclass whose `strip()` lies"). One whose `strip()` RAISES made
+    this function raise, inside `AlertConfig.load`, outside any guard — turning a boot report that
+    said "ALERTING UNCONFIGURED" into "ALERTING CONFIG UNREADABLE" and every channel into
+    `"failed"`. That is verbatim the outcome `_settings_logger_name` was written to prevent, one
+    call further on, and the verification gate found it there. Where the alert goes is cosmetic;
+    nothing about it may cost a delivery.
     """
-    return logging.getLogger(name) if isinstance(name, str) and name.strip() else log
+    try:
+        return logging.getLogger(name) if isinstance(name, str) and name.strip() else log
+    except Exception:  # noqa: BLE001 — resolving a logger must never be the failure
+        return log
 
 
 def _settings_logger_name(settings: object) -> str:
@@ -293,16 +322,34 @@ def _settings_logger_name(settings: object) -> str:
     return name if isinstance(name, str) else ""
 
 
-# ⭐ THE `SMTP_PORT` COMPLAINT IS MADE ONCE PER DISTINCT VALUE, NOT ONCE PER SEND (consumer#46).
-# The config file is re-read on every delivered notification — deliberately, so a rotated
-# password takes effect without a restart — and `smtp_port()` is asked on every send, so one
-# mistyped port produced one identical ERROR line per alert, forever. A service alerting every few
-# minutes filled its log with a single sentence. This remembers the LAST raw value seen (good, bad
-# or blank) and complains only when a faulty value is not the one it last saw: a value corrected
-# and then re-broken complains again, a value left broken does not. Process-global, because the
-# config it memoises is the one shared file; the boot report (`setting_faults`) carries the fault
-# regardless, so nothing is lost when this stays quiet.
-_LAST_SMTP_PORT_SEEN: str | None = None
+# ⭐ THE `SMTP_PORT` COMPLAINT IS MADE ONCE PER DISTINCT VALUE, PER CONFIG (consumer#46).
+# The config file is re-read on every delivered notification — deliberately, so a rotated password
+# takes effect without a restart — and `smtp_port()` is asked on every send, so one mistyped port
+# produced one identical ERROR line per alert, forever. A service alerting every few minutes filled
+# its log with a single sentence.
+#
+# ⛔⛔ KEYED ON WHICH CONFIG THE VALUE CAME FROM, AND WRITTEN ONLY WHEN A FAULT IS REPORTED. The
+# first version of this was a single global holding "the last raw value seen", on the reasoning
+# that the config it memoises is the one shared file. That reasoning is wrong twice over, and the
+# verification gate measured both:
+#
+#   * TWO SERVICES IN ONE PROCESS with the same bad port: the first complained, and the second was
+#     silenced FOREVER by the first service's memo — with the per-service loggers this release also
+#     ships, its operator had no stream in which the fault ever appeared. The message names neither
+#     the service nor the file, so even the surviving line could not be attributed.
+#   * A HEALTHY CONFIG SHARING THE PROCESS evicted the broken one's memo on every call, because the
+#     success path wrote it too: 50 sends produced 50 lines, which is the flood this exists to
+#     remove.
+#
+# So the key is the config's own file and the entry is cleared when THAT config reads healthy —
+# which is what keeps the property that beat "log once per process": a value corrected and then
+# re-broken complains again, while a value left broken is quiet after the first line.
+#
+# Bounded by the number of distinct config files in a process, i.e. the number of services. ⚠️ Not
+# synchronised, like the rest of this module: two threads racing the same key can produce a
+# duplicate line, which is stated rather than claimed away. The boot report (`setting_faults`)
+# never consults this, so an operator who pages on it sees the fault whatever this does.
+_COMPLAINED_SMTP_PORT: dict[str | None, str] = {}
 
 # --- severity ------------------------------------------------------------------------------
 OK = "OK"
@@ -480,13 +527,18 @@ def _safe_text(exc: BaseException) -> str:
 def _secret_values(cfg: AlertConfig) -> list[str]:
     """Every value in THIS config that must not appear in a log line.
 
-    Two things, and the reasoning differs for each:
+    Three things, and the reasoning differs for each:
 
     * **`SMTP_PASSWORD`** — a secret in the ordinary sense.
     * **The ntfy topic URL, its path and any userinfo** — a topic URL is a WRITE CAPABILITY, not
       an address: whoever holds it can page the operator. The module already refuses to echo it
       from `ntfy_ready()`'s own failure branches; this is the same rule applied to text that
       arrives from somewhere else.
+    * **The resolved `EMAIL_TO` / `EMAIL_FROM` addresses** — NOT capabilities, and included on a
+      different argument: `SMTPRecipientsRefused` and `SMTPSenderRefused` quote them, so a broken
+      channel repeated a personal address once per alert into the log an operator is told to paste
+      into an issue (consumer#58). Both the raw setting and each bare address inside it, because
+      the exception quotes the bare form and the operator wrote the header form.
 
     The HOST is deliberately NOT in the set: it is not itself the capability, and it is the half
     of the URL an operator needs in order to act. The example this used to give was wrong and is
@@ -775,6 +827,17 @@ class AlertSettings:
             raise ValueError(
                 f"AlertSettings.logger_name must be a string ('' for this module's own logger), "
                 f"got {type(self.logger_name).__name__}")
+        # ⭐ AND NOT A CONTROL CHARACTER, for the same reason `title_prefix` refuses one — and it
+        # was inconsistent to refuse it there and accept it here. A logger NAME reaches every
+        # `%(name)s` in an operator's formatter, so a `\n` in it FORGES log lines, which is the
+        # class `_parse_env_text`'s own comment warns about; and a name carrying one is not the
+        # name any logging configuration was written against, so the records silently land
+        # somewhere nobody is watching — this field's whole failure mode.
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in self.logger_name):
+            raise ValueError(
+                "AlertSettings.logger_name contains a control character. It is interpolated into "
+                "every log record as %(name)s, so a newline in it forges log lines — and it is "
+                "not a name any logging configuration can be written against.")
 
 
 def _is_bare_mailbox(value: str) -> bool:
@@ -1225,22 +1288,6 @@ class AlertConfig:
             lg.error("the ntfy URL must be the FULL topic URL (https://<host>/<topic>), "
                            "not a bare topic — ntfy alerts are DISABLED until it is fixed")
             return False
-        if _bracketed_host_misplaced(parts.netloc):
-            # ⭐ THE ONE SHAPE THE STDLIB REFUSES ONLY ON A PATCHED INTERPRETER (#8). A bracketed
-            # IPv6 host with colon-bearing userinfo — `https://tok:secret[::1]/topic` — is refused
-            # by `urlsplit` raising "Invalid IPv6 URL", and that check (`_check_bracketed_netloc`)
-            # shipped in CPython PATCH releases, which `requires-python = ">=3.10"` does not
-            # constrain. Where it is absent the URL reported READY and was dead on every send.
-            # This is the stdlib's own rule, stated here — data before a `[`, or anything but a
-            # port after its `]`, is not a host — and it is only REACHABLE on an interpreter that
-            # lacks the check, since a patched `urlsplit` has already raised above. Not a fourth
-            # host-shape predicate of this module's own invention: the same predicate, so the two
-            # cannot disagree about a URL. The shape, never the value.
-            lg.error("the ntfy URL's host is not a valid bracketed IPv6 literal (something "
-                           "precedes the '[' or follows the ']' that is not a port) — ntfy alerts "
-                           "are DISABLED until it is fixed. If the URL carries userinfo, put the "
-                           "token in a header-bearing proxy, not in the URL.")
-            return False
         if not parts.path.isascii() or not parts.query.isascii():
             # ⭐ THE SMTP CREDENTIAL REFUSAL'S MISSING SIBLING. `http.client` encodes the request
             # line as ASCII, so one non-ASCII character in the topic raises
@@ -1279,6 +1326,35 @@ class AlertConfig:
             # input that reaches it.
             lg.error("the ntfy URL could not be parsed the way the send path parses it (%s) — "
                      "ntfy alerts are DISABLED until it is fixed", type(exc).__name__)
+            return False
+        if _bracketed_host_misplaced(host):
+            # ⭐ THE ONE SHAPE THE STDLIB REFUSES ONLY ON A PATCHED INTERPRETER (#8). A bracketed
+            # IPv6 host with colon-bearing userinfo — `https://tok:secret[::1]/topic` — is refused
+            # by `urlsplit` raising "Invalid IPv6 URL", and that check (`_check_bracketed_netloc`)
+            # shipped in CPython PATCH releases, which `requires-python = ">=3.10"` does not
+            # constrain. Measured: present on 3.10.20 and 3.14.7, ABSENT on 3.12.0, where such a
+            # URL reported READY and was dead on every send.
+            #
+            # ⛔⛔ ASKED OF `host`, NOT OF `parts.netloc`, AND THAT IS THE WHOLE POINT — the first
+            # version of this asked the RAW netloc and the verification gate walked straight past
+            # it with `https://tok:secret%5B::1%5D/topic`: no literal `[` for a raw check to see,
+            # while `urllib` unquotes it and `http.client` is handed `tok:secret[::1]`. That is
+            # not a new mistake, it is THE mistake this check has now been made twice — the
+            # docstring above records `%40` and `%2540` beating the two previous userinfo
+            # predicates for exactly the same reason. Judge the host the send path will use.
+            #
+            # It is only REACHABLE on an interpreter lacking the hardening, since a patched
+            # `urlsplit` has already raised above. ⚠️ NARROWER THAN THE STDLIB'S: this mirrors
+            # `_check_bracketed_netloc`'s placement rule (nothing before the `[`, nothing but a
+            # port after the `]`) and NOT `_check_bracketed_host`'s validation that the brackets
+            # contain an IPv6 literal — so `[hello]` is refused by a patched interpreter and
+            # admitted here. Stated rather than closed: adding an address parser would be the
+            # fourth hand-written host-shape predicate, which is the arms race #8 exists to avoid.
+            # The shape, never the value.
+            lg.error("the ntfy URL's host is not a valid bracketed IPv6 literal (something "
+                     "precedes the '[' or follows the ']' that is not a port) — ntfy alerts "
+                     "are DISABLED until it is fixed. If the URL carries userinfo, put the "
+                     "token in a header-bearing proxy, not in the URL.")
             return False
         if "@" in host or _UNSAFE_IN_URL.search(host):
             # ⭐ USERINFO IS REFUSED, AND IT COSTS NOTHING TO REFUSE. `urllib` puts the whole
@@ -1446,25 +1522,28 @@ class AlertConfig:
         about a channel that sends.
         """
         lg = self._log
-        global _LAST_SMTP_PORT_SEEN
         raw = (self.email or {}).get("SMTP_PORT", "").strip()
         if not raw:
-            _LAST_SMTP_PORT_SEEN = raw
+            # ⚠️ A HEALTHY READ CLEARS ONLY THIS CONFIG'S ENTRY. Clearing more — or writing a
+            # "last seen" value here — is what let one service's good port silence another's bad
+            # one, and let a healthy config evict a broken one's memo on every send.
+            _COMPLAINED_SMTP_PORT.pop(self.config_file, None)
             return DEFAULT_SMTP_PORT
         # The DECISION is `smtp_port_fault`'s, so that a boot report and a config dump reach the
         # same verdict without provoking a send-time log line to find it out. What stays here is
         # the REPORTING, which is what makes this the send-time accessor.
         fault = smtp_port_fault(raw)
         if not fault:
-            _LAST_SMTP_PORT_SEEN = raw
+            _COMPLAINED_SMTP_PORT.pop(self.config_file, None)
             return int(raw)
-        # ⭐ ONCE PER DISTINCT VALUE (consumer#46) — see `_LAST_SMTP_PORT_SEEN`. The same fault on
-        # the same value, send after send, is one line; a value that changes complains afresh.
+        # ⭐ ONCE PER DISTINCT VALUE, PER CONFIG (consumer#46) — see `_COMPLAINED_SMTP_PORT`. The
+        # same fault on the same value, send after send, is one line; a different value, or the
+        # same value in a DIFFERENT service's config, complains on its own account.
         # `%s` with the complaint already assembled, so nothing in the message is re-interpreted
         # as a format string. The SHAPE of the rejected value, never the value.
-        if raw != _LAST_SMTP_PORT_SEEN:
+        if _COMPLAINED_SMTP_PORT.get(self.config_file) != raw:
+            _COMPLAINED_SMTP_PORT[self.config_file] = raw
             lg.error("%s", fault)
-            _LAST_SMTP_PORT_SEEN = raw
         return DEFAULT_SMTP_PORT
 
     def setting_faults(self) -> list[str]:
@@ -1849,7 +1928,7 @@ def _record_is_at_or_after(rec: dict, floor: datetime) -> bool:
 
 def read_jsonl_tail(path: str, limit: int, since_iso: str = "",
                     keep: Callable[[dict], bool] | None = None,
-                    backups: int | None = ERROR_LOG_BACKUPS,
+                    backups: int | None = ERROR_LOG_BACKUPS, *,
                     logger: logging.Logger | None = None) -> list[dict]:
     """The most recent records from a rotating jsonl file, oldest-first. Never raises on I/O.
 

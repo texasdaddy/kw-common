@@ -3538,6 +3538,82 @@ def test_a_refused_SMTP_PORT_complains_ONCE_per_distinct_value_not_once_per_send
     assert AlertConfig(email={"SMTP_PORT": "65536"}).setting_faults() != []
 
 
+def test_the_SMTP_PORT_memo_is_per_CONFIG_so_one_service_cannot_silence_another(
+        caplog: pytest.LogCaptureFixture) -> None:
+    """⛔⛔ THE FIRST VERSION OF THIS MEMO WAS A SINGLE GLOBAL HOLDING "the last raw value seen",
+    and the verification gate measured it wrong in BOTH directions:
+
+      * two services in one process with the SAME bad port — the first complained and the second
+        was silenced FOREVER, and since this release also gives each service its own logger, its
+        operator had no stream in which the fault ever appeared;
+      * a HEALTHY config sharing the process evicted the broken one's memo on every call, because
+        the success path wrote it too: 50 sends produced 50 lines, the flood this exists to remove.
+
+    Three properties, all asserted here, because any one alone is satisfiable by a wrong design.
+    """
+    broken = [AlertConfig(email={"SMTP_PORT": "0"}, config_file=f"/etc/{name}.env")
+              for name in ("svcA", "svcB")]
+    healthy = AlertConfig(email={"SMTP_PORT": "587"}, config_file="/etc/healthy.env")
+
+    with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
+        for _ in range(25):
+            for cfg in broken:
+                cfg.smtp_port()
+            healthy.smtp_port()
+    assert caplog.text.count("SMTP_PORT") == 2, (
+        f"two services with the same bad port must each be told ONCE, and a healthy config in "
+        f"the same process must evict neither — got {caplog.text.count('SMTP_PORT')} line(s) "
+        f"across 25 rounds:\n{caplog.text}")
+
+    # ...and the same config, corrected and then re-broken, complains AFRESH — the property that
+    # made "once per distinct value" preferable to "once per process".
+    caplog.clear()
+    with caplog.at_level(logging.ERROR, logger="kw_common.alerting"):
+        AlertConfig(email={"SMTP_PORT": "587"}, config_file="/etc/svcA.env").smtp_port()
+        AlertConfig(email={"SMTP_PORT": "0"}, config_file="/etc/svcA.env").smtp_port()
+    assert caplog.text.count("SMTP_PORT") == 1, caplog.text
+
+
+def test_a_hostile_str_subclass_as_the_logger_name_cannot_cost_the_config_load() -> None:
+    """⛔ `isinstance(name, str)` ADMITS A `str` SUBCLASS, which `AlertSettings` accepts and which
+    this module explicitly designs for elsewhere (`_usable_path` is written around "a `str`
+    subclass whose `strip()` lies"). One whose `strip()` RAISES made `_logger_named` raise, inside
+    `AlertConfig.load`, outside any guard — turning a boot report that said "ALERTING
+    UNCONFIGURED" into "ALERTING CONFIG UNREADABLE" and every channel into `"failed"`.
+
+    That is verbatim the outcome `_settings_logger_name` was written to prevent, one call further
+    on, which is where the verification gate found it. Where a record goes is cosmetic; nothing
+    about it may cost a delivery.
+    """
+    class Hostile(str):
+        def strip(self, *args: object) -> str:
+            raise RuntimeError("hostile strip()")
+
+    name = Hostile("svc.alerts")
+    settings = AlertSettings(service="svc", logger_name=name)   # the constructor accepts it
+    assert alerting._logger_named(name) is alerting.log, "a hostile name must fall back, not raise"
+    assert AlertConfig.load(settings).logger_name == name, "the config still loads"
+    assert Alerter(settings)._log is alerting.log
+    # The whole point: the alert still goes out, and readiness still answers.
+    assert Alerter(settings).notify(ERROR, "t", "m") == {"email": "skipped", "ntfy": "skipped"}
+    assert AlertConfig.load(settings).ready_channels() == []
+
+
+def test_a_logger_name_carrying_a_control_character_is_REFUSED_like_a_title_prefix() -> None:
+    """⛔ A LOGGER NAME REACHES EVERY `%(name)s` IN AN OPERATOR'S FORMATTER, so a newline in it
+    FORGES log lines — the class `_parse_env_text`'s own comment warns about — and a name carrying
+    one is not the name any logging configuration was written against, so the records land
+    somewhere nobody is watching, which is this field's whole failure mode.
+
+    `title_prefix` has refused a control character since it was added, for the same reason.
+    Accepting one here while refusing it there was an inconsistency the gate found.
+    """
+    for bad in ("svc\nINJECT", "svc\rx", "a\x00b", "svc\x7f"):
+        with pytest.raises(ValueError, match="control character"):
+            AlertSettings(service="svc", logger_name=bad)
+    AlertSettings(service="svc", logger_name="svc.alerts")      # the ordinary one is fine
+
+
 def test_the_four_pure_helpers_the_adopter_tested_are_EXPORTED_and_the_old_spellings_still_work(
         ) -> None:
     """⭐ consumer#50. An adopter imported six `_`-prefixed names from this module because its own
@@ -3743,6 +3819,15 @@ def test_a_bracketed_ipv6_host_with_userinfo_is_refused_on_EVERY_interpreter(
     assert alerting._bracketed_host_misplaced("[::1]junk") is True
     assert alerting._bracketed_host_misplaced("[::1") is True
     assert alerting._bracketed_host_misplaced("ntfy.example.com:8443") is False
+
+    # ⛔ THE PERCENT-ENCODED SPELLING, which is the whole reason the predicate is asked of the
+    # RESOLVED host and not of `parts.netloc`. The first version asked the raw netloc and the
+    # verification gate walked past it with this URL: no literal `[` for a raw check to see, while
+    # `urllib` unquotes it and `http.client` is handed `tok:secret[::1]`. It is the same mistake
+    # `%40` and `%2540` made against the two earlier userinfo predicates, and it needs no stub —
+    # `urlsplit` does not raise for it on ANY interpreter, so only the branch can refuse it.
+    for encoded in ("https://tok:secret%5B::1%5D/topic", "https://%5B::1%5Dextra/topic"):
+        assert AlertConfig(ntfy_url=encoded).ntfy_ready() is False, encoded
 
     # UNHARDENED, reproduced: `urlsplit` accepts the netloc and the branch has to catch it.
     import urllib.parse

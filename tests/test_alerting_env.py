@@ -328,6 +328,41 @@ def test_the_env_layer_reads_shared_root_and_builds_the_documented_subpath(
     assert settings.ntfy_url == GOOD_CONFIG["NTFY_URL_DEV"]
 
 
+def test_BOTH_loaders_pass_the_injected_logger_name_through(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """⛔ A FIELD THE CONVENTION LAYER CANNOT SET IS A FIELD THE FLEET CANNOT USE.
+
+    `load_alert_settings*` is the call every app in this deployment makes, and it builds
+    `AlertSettings(...)` explicitly — so a new field is not passed through unless somebody passes
+    it. The verification gate caught exactly that: the changelog announced `logger_name` on both
+    loaders while the edits adding it had silently failed to apply, so an adopter following the
+    release notes would have got a `TypeError` on the boot path and the feature would have been
+    unreachable for the one population it was written for.
+
+    Both loaders and the DEFAULT in both, because a pass-through that only works when you ask is
+    still one that can be dropped without a test noticing.
+    """
+    write_shared(tmp_path)
+    explicit = load_alert_settings(config_file_for(tmp_path), "dev", "feed-poller",
+                                   logger_name="feed-poller.alerts")
+    assert explicit.logger_name == "feed-poller.alerts"
+    assert load_alert_settings(config_file_for(tmp_path), "dev", "feed-poller").logger_name == ""
+
+    monkeypatch.setenv(SHARED_ROOT_VAR, str(tmp_path))
+    monkeypatch.setenv(DEPLOY_ENV_VAR, "dev")
+    assert load_alert_settings_from_env(
+        "feed-poller", logger_name="feed-poller.alerts").logger_name == "feed-poller.alerts"
+    assert load_alert_settings_from_env("feed-poller").logger_name == ""
+
+    # ...and it reaches the thing that logs, which is the only reason the field exists.
+    assert Alerter(explicit)._log.name == "feed-poller.alerts"
+
+    # KEYWORD-ONLY, so the three positional arguments every adopter already passes are unchanged.
+    with pytest.raises(TypeError):
+        load_alert_settings(config_file_for(tmp_path), "dev", "feed-poller",  # type: ignore[misc]
+                            "feed-poller.alerts")
+
+
 @pytest.mark.parametrize("value", ["", "staging", "production", "DEV ELOPMENT", "1"])
 def test_an_environment_that_is_not_dev_or_prod_is_refused_rather_than_guessed(value: str) -> None:
     with pytest.raises(AlertEnvError):

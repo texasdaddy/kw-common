@@ -139,8 +139,21 @@ def _no_network(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch)
 
 @pytest.fixture(autouse=True)
 def _reset_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`configure()` installs a process-wide default; no test may leave one behind."""
+    """`configure()` installs a process-wide default; no test may leave one behind.
+
+    ⭐ AND THE `SMTP_PORT` MEMO, WHICH IS THE SAME KIND OF THING. It is process-global state that
+    decides whether a complaint is LOGGED, so a test that provoked one would otherwise silence it
+    for the next test that expects it — and such a failure is order-dependent, which is the worst
+    shape a test can fail in. The verification gate measured exactly that: two tests that pass
+    individually and pass as a whole file, and FAIL when run as a pair, because the file's other
+    tests happened to clear the memo in between. Any `-k` selection, a reordering plugin or an
+    xdist shard would have flipped it.
+
+    A fresh dict rather than `.clear()`: `monkeypatch` rebinds the module attribute and restores
+    it afterwards, so the real one is never mutated.
+    """
     monkeypatch.setattr(alerting, "_default", None)
+    monkeypatch.setattr(alerting, "_COMPLAINED_SMTP_PORT", {})
 
 
 # The repository (or unpacked sdist) this suite is running from. `parents[1]` because the tests

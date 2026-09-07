@@ -298,7 +298,7 @@ def read_config(config_path: str | os.PathLike[str]) -> dict[str, str]:
     second answer to the same question. There is exactly one, and this is the seam.
 
     ⚠️ THE ERROR POLICY IS THE OPPOSITE ONE, AND THAT IS THE WHOLE REASON THIS WRAPPER EXISTS.
-    `alerting._parse_env_file` returns `{}` for a missing or unreadable file, which is right for a
+    `alerting.parse_env_file` returns `{}` for a missing or unreadable file, which is right for a
     notification in flight — the email channel is simply unconfigured and ntfy still goes. At BOOT
     that same silence is the failure: "the file is empty" and "the file is UTF-16" must not look
     alike. So the read happens here, with the errors surfaced.
@@ -309,7 +309,7 @@ def read_config(config_path: str | os.PathLike[str]) -> dict[str, str]:
     """
     path = Path(config_path)
     try:
-        # `newline=""` matches `alerting._parse_env_file` exactly: universal-newline translation
+        # `newline=""` matches `alerting.parse_env_file` exactly: universal-newline translation
         # rewrites a lone `\r` before the parser can see it, which silently truncates a value
         # rather than rejecting it. The two readers must make the same choice or the parse they
         # share is being fed different text.
@@ -359,7 +359,7 @@ def read_config(config_path: str | os.PathLike[str]) -> dict[str, str]:
 
 # --- layer one: pure -----------------------------------------------------------------------------
 def load_alert_settings(config_path: str | os.PathLike[str], deploy_env: str,
-                        service: str) -> AlertSettings:
+                        service: str, *, logger_name: str = "") -> AlertSettings:
     """Build `AlertSettings` from an explicit config file, environment and service name.
 
     Pure in the sense that matters: it reads NO environment variable and has NO default path.
@@ -392,6 +392,13 @@ def load_alert_settings(config_path: str | os.PathLike[str], deploy_env: str,
         settings = replace(load_alert_settings_from_env("my-service"),
                            state_file="/data/alerts.json",
                            error_log="/data/logs/my-service-errors.log")
+
+    ⭐ `logger_name` IS PASSED THROUGH, and it has to be. It is the one piece of `AlertSettings`
+    that this layer cannot leave to `replace()` with a straight face: a service adopting the
+    library keeps its OWN logger name precisely so the operator's existing logging configuration
+    goes on working, and this loader is the call every app in this deployment makes. A field the
+    convention layer cannot set is a field the fleet cannot use. `""` — the default — means the
+    library's own logger, so this is inert for every existing caller.
     """
     env = normalise_env(deploy_env)
     key = ntfy_key(service)          # validates `service` before anything else is read
@@ -432,6 +439,7 @@ def load_alert_settings(config_path: str | os.PathLike[str], deploy_env: str,
         config_file=str(Path(config_path)),
         ntfy_url=ntfy_url,
         title_prefix=title_prefix,
+        logger_name=logger_name,
     )
 
 
@@ -459,7 +467,7 @@ def _require_env(name: str) -> str:
     return value.strip()
 
 
-def load_alert_settings_from_env(service: str) -> AlertSettings:
+def load_alert_settings_from_env(service: str, *, logger_name: str = "") -> AlertSettings:
     """The fleet convention, executable: read `SHARED_ROOT` and `DEPLOY_ENV`, build the settings.
 
     This is the call every app in this deployment makes. `load_alert_settings` exists for anything
@@ -495,7 +503,8 @@ def load_alert_settings_from_env(service: str) -> AlertSettings:
             f"the volume was never added to the template, was added with a host path that does not "
             f"exist, or the value names something that is not a directory at all. It is the "
             f"{SHARED_ROOT_VAR} variable.")
-    return load_alert_settings(config_file_for(shared_root), deploy_env, service)
+    return load_alert_settings(config_file_for(shared_root), deploy_env, service,
+                               logger_name=logger_name)
 
 
 # --- boot validation -----------------------------------------------------------------------------
