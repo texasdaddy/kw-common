@@ -2694,7 +2694,9 @@ def test_rolling_BACK_costs_one_revalidation_and_the_release_notes_say_so(
 
     The older comparison is spelled out here rather than imported, because the point is to measure
     a reader that no longer exists in this tree. It is three lines, and they are the three lines
-    `_marker_matches` had.
+    `_marker_matches` had — transcribed from the PUBLISHED 1.4.1 wheel rather than from memory,
+    and checked against it: `read_text(errors="replace").strip()`, refuse anything not opening
+    `sha256:`, then `recorded == current`.
     """
     settings, marker_dir, marker = _validated(tmp_path)
     assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
@@ -2710,7 +2712,9 @@ def test_rolling_BACK_costs_one_revalidation_and_the_release_notes_say_so(
     assert matches_1_4_1(written) is False, (
         "a 1.4.1 reader matched this marker, so the rollback cost recorded in the CHANGELOG and "
         "in `_marker_body` is wrong in the other direction")
-    assert matches_1_4_1(digest) is True, "the stand-in does not model 1.4.1's own marker either"
+    assert written != digest, (
+        "the marker is one line, so there is no second line for a whole-text reader to trip "
+        "over and nothing above proves anything")
 
 
 def test_two_services_sharing_one_marker_dir_are_named_in_the_log_every_boot(
@@ -2720,12 +2724,12 @@ def test_two_services_sharing_one_marker_dir_are_named_in_the_log_every_boot(
     `validate_boot` requires `marker_dir` to be the app's OWN directory and always has. Sharing one
     used to be quietly wrong - the second service skipped on the first's marker, so its own
     service-derived settings were never checked, which is #18 from the other side. It is now loudly
-    wrong: each service rewrites the other's record, so both re-validate and both announce, on
-    every boot.
+    wrong: each service rewrites the other's record, so both re-validate and both announce, every
+    boot.
 
     Nothing can tell that apart from a rename, so the behaviour is the same for both and the LOG is
-    what distinguishes them: a rename says it once, a shared directory says it every boot. This
-    asserts the line names both services, and that three boots produce three of them.
+    what separates them: a rename replaces the record once, a shared directory replaces it on every
+    boot. This asserts the line names both services and that six boots produce six of them.
 
     ⛔ AND THE MIGRATION CASE IS SILENT, asserted in the same test. A marker recording no service is
     every service's first boot after this release, and warning about that would put the line in
@@ -2734,7 +2738,6 @@ def test_two_services_sharing_one_marker_dir_are_named_in_the_log_every_boot(
     settings, marker_dir, marker = _validated(tmp_path)
     other = load_alert_settings(config_file_for(tmp_path), "prod", "log-shipper")
 
-    # The migration case first: a marker recording NO service must not warn.
     marker_dir.mkdir(parents=True, exist_ok=True)
     digest = hashlib.sha256(Path(settings.config_file).read_bytes()).hexdigest()
     marker.write_text(f"sha256:{digest}" + chr(10), encoding="utf-8")
@@ -2757,10 +2760,90 @@ def test_two_services_sharing_one_marker_dir_are_named_in_the_log_every_boot(
         f"the line names one service only: {lines[0]!r}")
 
 
-def test_the_shared_dir_line_is_not_logged_when_the_config_ITSELF_changed(
+def test_a_rename_is_reported_once_and_then_never_again(
         tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
-    """A re-validation caused by an edited config says nothing about who wrote the marker, so the
-    line would be a false accusation. The rename is still there; only the reason is different."""
+    """The other half of the repeat-count claim, and the half that makes it a claim at all.
+
+    The line tells an operator that a rename says this once and a shared directory says it every
+    boot. That sentence is only true if a rename really does go quiet, so it is asserted rather
+    than asserted-about: one rename, then three more boots under the new name, then zero further
+    lines.
+    """
+    settings, marker_dir, _marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    renamed = load_alert_settings(config_file_for(tmp_path), "prod", "feed-poller-2")
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+        assert validate_boot(renamed, "prod", marker_dir, alerter=Alerter(renamed)) is True
+    said = [r.getMessage() for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()]
+    assert len(said) == 1, f"the rename was reported {len(said)} times"
+    assert "feed-poller" in said[0] and "feed-poller-2" in said[0]
+
+    for _ in range(3):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+            validate_boot(renamed, "prod", marker_dir, alerter=Alerter(renamed))
+        assert [r for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()] == [], (
+            "the line repeated after a rename, so its own repeat-count advice is a lie")
+
+
+def test_a_rename_with_NO_alerter_accuses_nobody(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
+    """⛔ THE STATE THAT MADE THE FIRST VERSION OF THIS LINE A LIE, and it is a documented one.
+
+    With no `Alerter` available the marker is deliberately WITHHELD, so the confirmation is not
+    lost to a boot that could not send it. Asked BEFORE the write, the line then fired on every
+    boot after a single rename - accusing the operator of a shared `CONFIG_PATH` and telling them
+    to go and split a directory layout that was not the problem. Measured at five boots, five
+    accusations.
+
+    Asked after the write and OF THE FILE, a boot that wrote nothing says nothing: it has taken
+    nothing from anybody. The withheld marker has its own warning, which is not this one.
+    """
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    renamed = load_alert_settings(config_file_for(tmp_path), "prod", "feed-poller-2")
+
+    for _ in range(5):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
+            assert validate_boot(renamed, "prod", marker_dir, alerter=None) is True
+        assert [r for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()] == [], (
+            "a boot that withheld the marker still accused somebody of taking their record")
+    assert marker_facts(marker)[1] == "feed-poller", "the marker was written after all"
+
+
+def test_a_boot_that_REFUSES_does_not_accuse_anybody_on_its_way_out(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
+    """⛔ THE ORDERING THE FIRST VERSION GOT WRONG. Asked before `_check_layout`, the line landed
+    immediately above a refusal that had nothing to do with it - a `CONFIG_PATH` accusation printed
+    on top of "the shared root is not a directory", and the marker never rewritten, so it repeated
+    forever. The refusal is the only thing an operator should see here."""
+    settings, marker_dir, marker = _validated(tmp_path)
+    assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
+    renamed = load_alert_settings(config_file_for(tmp_path), "prod", "log-shipper")
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"), \
+            pytest.raises(AlertEnvError):
+        validate_boot(renamed, "prod", marker_dir, shared_root=tmp_path / "no-such-mount",
+                      alerter=Alerter(renamed))
+    assert [r for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()] == [], (
+        "the refusal was preceded by an accusation about a different thing entirely")
+    assert marker_facts(marker)[1] == "feed-poller", "the refusing boot rewrote the marker"
+
+
+def test_the_replacement_is_reported_even_when_the_config_ALSO_changed(
+        tmp_path: Path, channels: dict[str, Spy], caplog: pytest.LogCaptureFixture) -> None:
+    """⚠️ THIS IS THE OPPOSITE OF WHAT THE FIRST VERSION DID, deliberately.
+
+    That version suppressed the line whenever the config's digest had moved, reasoning that a
+    re-validation caused by an edit says nothing about who wrote the marker. True of the question
+    it was asking - "what do I find here" - and false of the question this one asks: the record WAS
+    replaced, whatever else was going on, and a shared `CONFIG_PATH` does not stop being shared
+    because somebody edited the file.
+    """
     settings, marker_dir, _marker = _validated(tmp_path)
     assert validate_boot(settings, "prod", marker_dir, alerter=Alerter(settings)) is True
 
@@ -2771,7 +2854,9 @@ def test_the_shared_dir_line_is_not_logged_when_the_config_ITSELF_changed(
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="kw_common.alerting_env"):
         assert validate_boot(other, "prod", marker_dir, alerter=Alerter(other)) is True
-    assert [r for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()] == []
+    said = [r.getMessage() for r in caplog.records if "share this CONFIG_PATH" in r.getMessage()]
+    assert len(said) == 1, f"the replacement was reported {len(said)} times"
+
 
 
 # ============================================================ the package's own boundaries

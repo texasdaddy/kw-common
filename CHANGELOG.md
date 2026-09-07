@@ -79,8 +79,10 @@ checked, which is #18 arriving from the other side. It is now loud: each service
 other's record, so both re-validate and both announce on EVERY boot — measured at four alerts
 per boot for two services. Nothing in the library can tell that apart from a legitimate rename,
 which produces the identical marker state and must re-validate, so the behaviour is the same for
-both and the process log is what separates them: **a warning naming both services that repeats
-every boot is a shared directory; one that appears once is a rename.**
+both and the process log is what separates them: a warning is logged when a boot REPLACES a
+different service's record, so **a line that appears on every boot is a shared directory and one
+that appears once is a rename.** A boot that writes no marker — no `Alerter` installed, or a
+refusal — logs nothing, because it has taken nothing from anybody.
 
 **Nothing in any module's `__all__` was removed or renamed.** Four names were added.
 
@@ -203,7 +205,8 @@ in the range and `--staged` scans. It is mentioned only so nobody attributes it 
   prefix that fails every ntfy send. It is the same defect the per-environment marker fixed, with
   `service` in the place of `env`. ⚠️ **In the CONTENTS, not the filename** — the ops-alerting
   standard fixes the name at `.alerting-validated-<env>`, so line one is still `sha256:<hex>` and
-  nothing else, and a reader that knows only the older format still reads the digest correctly.
+  nothing else, and anything reading the FIRST LINE reads the digest correctly — which is not
+  the same as backward compatible; see the rollback note above.
   Line two is `service:"<name>"`, JSON-encoded so that a name carrying a quote, a non-ASCII
   letter or a control character cannot split into a line the parser could never read back — which
   would be a marker that matches nothing forever, re-announcing on every boot. `json.loads` is

@@ -154,8 +154,9 @@ service name**, so a rename on an unchanged config used to skip a refusal it sho
 
 ⚠️ **Two services must not share one `CONFIG_PATH`.** That was always the rule — `marker_dir` is
 the app's own read-write directory — and the cost of breaking it changed: each service now
-overwrites the other's record, so both re-validate and both announce on every boot. The process
-log names both services when it happens, so a line that repeats is the diagnosis.
+overwrites the other's record, so both re-validate and both announce on every boot. A boot that
+replaces a different service's record says so in the process log, naming both — **every boot
+means a shared directory; once means a rename.**
 
 **On failure it logs and raises and does not attempt to alert** — it cannot report a broken
 alerting channel through that channel — and with no `Alerter` installed it validates but withholds

@@ -625,8 +625,15 @@ def _recorded_service(recorded: str) -> str | None:
     only ever writes `json.dumps(<str>)`, which always opens with `"`, so nothing this module
     writes is refused by the guard, and nothing that opens with `"` can nest.
 
-    `RecursionError` is caught as well, because a guard whose whole job is "this cannot happen"
-    is worth one more name in an except clause.
+    ⚠️ `RecursionError` IS CAUGHT AS WELL, AND THE TWO ARE DELIBERATELY REDUNDANT — stated
+    rather than implied, because a verification pass measured it: on CPython 3.12 removing
+    EITHER one alone changes no observable behaviour, so neither can have a test of its own
+    that fails. What is pinned is the PAIR, and that is the honest claim. They are kept both
+    because they answer different questions — "is this payload the shape we write" and "did
+    the parser survive" — and the day a payload that opens with a quote can nest, or a future
+    parser raises before the first character is examined, the surviving one is the one that
+    holds. This is the same shape as the mutually-redundant opt-out gates in `alerting`, and it
+    is recorded here for the same reason: so nobody removes one as dead code.
     """
     for line in recorded.splitlines()[1:]:
         head, sep, payload = line.strip().partition("service:")
@@ -645,48 +652,63 @@ def _recorded_service(recorded: str) -> str | None:
     return None
 
 
-def _diagnose_shared_marker_dir(marker: Path, config: Path, service: str) -> None:
-    """Name the one caller mistake whose COST this release changed, at the moment it happens.
+def _service_the_marker_records(marker: Path) -> str | None:
+    """The service a marker on disk records, or `None` for absent, unreadable or unparseable.
 
-    ⚠️ TWO SERVICES POINTED AT ONE `CONFIG_PATH` NOW RE-ANNOUNCE ON EVERY BOOT. `validate_boot`
-    requires `marker_dir` to be the app's OWN read-write directory and always has; sharing one
-    used to be quietly wrong — the second service skipped on the first's marker and its own
-    service-derived settings were never checked, which is #18 arriving from the other side — and
-    is now loudly wrong: each service rewrites the other's record, so both re-validate and both
-    announce, on every boot. Measured at four alerts per boot for two services.
-
-    ⛔ NOTHING HERE CAN TELL THAT APART FROM A LEGITIMATE RENAME, which produces exactly the
-    same marker state and must re-validate. So this does not change the decision — it states
-    what the state IS, once per boot, naming both services. A rename logs it once and never
-    again; a shared directory logs it every boot, and that difference is the thing an operator
-    can act on. A sentence in a document is not read at 03:00; this line is in the log beside
-    the alert that woke them.
-
-    Silent for the migration case — a marker recording no service at all — which is every
-    service's first boot after this release and is not a mistake. Silent too when the config
-    itself changed, because then re-validating says nothing about who wrote the marker.
-
-    Costs one extra read of a small file, on the path that is about to re-read the config,
-    round-trip SMTP and POST to a topic.
+    Split out because it is asked TWICE per validating boot, once before the marker is written
+    and once after, and the pair is what makes `_report_a_replaced_service` accurate.
     """
     try:
-        recorded = marker.read_text(encoding="utf-8", errors="replace").strip()
+        return _recorded_service(marker.read_text(encoding="utf-8", errors="replace").strip())
     except (OSError, ValueError):
-        return
-    was = _recorded_service(recorded)
+        return None
+
+
+def _report_a_replaced_service(marker: Path, was: str | None, service: str) -> None:
+    """Say so when this boot has just written ITS name over a DIFFERENT service's record.
+
+    ⚠️ TWO SERVICES POINTED AT ONE `CONFIG_PATH` RE-ANNOUNCE ON EVERY BOOT, and that is what
+    this line exists to name. `validate_boot` requires `marker_dir` to be the app's OWN
+    read-write directory and always has; sharing one used to be quietly wrong — the second
+    service skipped on the first's marker, so its own service-derived settings were never
+    checked, which is #18 arriving from the other side — and since #18 it is loudly wrong: each
+    service rewrites the other's record, so both re-validate and both announce, every boot.
+    Measured at four alerts per boot for two services.
+
+    ⛔ NOTHING HERE CAN TELL A SHARED DIRECTORY FROM A LEGITIMATE RENAME. They produce the
+    identical marker state and both must re-validate, so this changes no decision; it reports
+    what happened. The REPEAT COUNT is what separates them, and that is why this is asked AFTER
+    the write rather than before it.
+
+    ⭐⭐ AFTER THE WRITE, AND THE FIRST VERSION ASKED BEFORE IT — which made the line a lie in
+    every state where the marker is NOT rewritten. `validate_boot` documents two of those as
+    ordinary: no `Alerter` installed withholds the marker deliberately, and a refusal raises
+    before the write. Asked beforehand, ONE rename in either state accused the operator of a
+    shared `CONFIG_PATH` on every boot forever, and the line told them to go and split a
+    directory layout that was not the problem. Measured at five boots, five accusations.
+    Asked here, the count means what it says: a rename replaces the record once and is silent
+    afterwards, a shared directory replaces it on every boot, and a boot that wrote nothing
+    says nothing — it has taken nothing from anybody.
+
+    ⛔ AND IT IS ASKED OF THE FILE, not of whether `_write_marker` was called. That function
+    cannot fail a boot and does not raise, so "we called it" is not "it landed" — an
+    unwritable `CONFIG_PATH` would otherwise produce the same false accusation from the other
+    direction. It has its own warning for that; this one stays quiet.
+
+    Silent for the migration case, a marker recording no service at all, which is every
+    service's first boot after this release and is not a mistake.
+    """
     if was is None or was == service:
         return
-    if not recorded.startswith("sha256:"):
-        return
-    if recorded.splitlines()[0].strip() != _config_digest(config):
+    if _service_the_marker_records(marker) != service:
         return
     log.warning(
-        "alerting: %s records service %r and this process is %r, while %s is unchanged. Either "
-        "this service was RENAMED - expected once, and this line will not repeat - or two "
-        "services share this CONFIG_PATH, which is not supported: each overwrites the other's "
-        "record, so both re-validate and both send their confirmation alert on EVERY boot. If "
-        "this line repeats, give each service its own CONFIG_PATH directory.",
-        marker, was, service, config)
+        "alerting: this boot replaced service %r with %r in %s. A RENAME does that once and "
+        "this line will not appear again. If it appears on EVERY boot, two services share this "
+        "CONFIG_PATH, which is not supported: each overwrites the other's record, so both "
+        "re-validate and both send their confirmation alert every time they start. Give each "
+        "service its own CONFIG_PATH directory.",
+        was, service, marker)
 
 
 def _marker_matches(marker: Path, config: Path, service: str) -> bool:
@@ -809,7 +831,9 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
         _reharden(marker)
         return False
 
-    _diagnose_shared_marker_dir(marker, config, settings.service)
+    # ⭐ TAKEN BEFORE ANYTHING IS WRITTEN and reported after, so the line below can say what
+    # this boot REPLACED rather than what it merely found. See `_report_a_replaced_service`.
+    was = _service_the_marker_records(marker)
     _check_layout(config, shared_root)
     # ⭐⭐ THE DIGEST IS TAKEN HERE AND CARRIED TO THE MARKER — before anything whose RESULT is
     # used to validate has read the file. Not before every read: `_marker_matches` above may hash
@@ -843,6 +867,7 @@ def validate_boot(settings: AlertSettings, deploy_env: str,
         return True
     _write_marker(marker, _marker_body(digest, settings.service),
                   consequence=_WROTE_NOTHING_AFTER_VALIDATING)
+    _report_a_replaced_service(marker, was, settings.service)
     return True
 
 

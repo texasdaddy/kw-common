@@ -179,9 +179,11 @@ marker's whole text to a bare `sha256:<hex>`, which a two-line marker cannot equ
 ⛔ **Two services may not share one `CONFIG_PATH`.** That has always been the rule — the marker
 directory is the app's OWN read-write directory — and since v1.5.0 breaking it is expensive
 rather than merely wrong: each service overwrites the other's record, so both re-validate and
-both send their confirmation alert on EVERY boot. The process log names both services when this
-happens; a line that repeats every boot is a shared directory, a line that appears once is a
-service that was renamed.
+both send their confirmation alert on EVERY boot. A boot that REPLACES a different service's
+record says so in the process log, naming both services: a line on every boot is a shared
+directory, a line that appears once is a service that was renamed. A boot that writes no marker
+— no `Alerter` installed, or a refusal — says nothing, because it has taken nothing from
+anybody.
 
 To force a re-check without editing the file, delete the marker: `CONFIG_PATH/.alerting-validated-<env>`.
 
