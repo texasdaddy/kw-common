@@ -612,7 +612,7 @@ def test_a_leak_in_a_PATH_is_scanned_REGARDLESS_of_its_suffix(tmp_path: Path) ->
     _git(repo, "add", "-A")
 
     assert guard._binary_suffix(f"icons/{_HOST}.png"), "vacuity guard: .png must be a skip suffix"
-    assert guard._looks_binary((repo / "icons" / f"{_HOST}.png").read_bytes()), (
+    assert guard._binary_by_content((repo / "icons" / f"{_HOST}.png").read_bytes()), (
         "vacuity guard: the CONTENT must be genuinely binary, so only the NAME can be the finding")
 
     staged = _cli(repo, "--staged")
@@ -1225,17 +1225,28 @@ def test_the_staged_scan_passes_a_clean_index(tmp_path: Path) -> None:
 
 
 # ===========================================================================================
-# consumer#22 — the suffix is a hint, and a scan that read nothing is not clean
+# consumer#22 — the suffix is a hint the bytes must corroborate, in GIT'S window
 # ===========================================================================================
 
 
-def test_looks_binary_asks_the_BYTES(tmp_path: Path) -> None:
-    """The pure half. A NUL anywhere, or bytes that are not UTF-8, mean binary; ASCII does not."""
-    assert guard._looks_binary(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
-    assert guard._looks_binary(b"plain text with a nul \x00 inside")
-    assert guard._looks_binary(b"\xff\xd8\xff\xe0latin-1 \xe9 bytes")
-    assert not guard._looks_binary(b"an ordinary ASCII runbook\n")
-    assert not guard._looks_binary("accented but UTF-8: café\n".encode())
+def test_binary_by_content_asks_GITS_question_of_the_bytes() -> None:
+    """The pure half: a NUL inside git's 8000-byte window, and NOTHING else. Both sides of the
+    boundary, because "8000" is the whole claim.
+
+    ⚠️ Undecodable bytes are NOT "binary" by this test. git serves a latin-1 file as text, and so
+    does `_reading` (with replacement, as the range scan always has). The predicate this replaces
+    said binary for a NUL ANYWHERE or a failed decode — and skipped, in silence, a file git would
+    have diffed as text. `test_a_leak_on_a_NUL_FREE_line_of_a_late_NUL_pdf_is_found_by_ALL_THREE_
+    scans` is what that cost.
+    """
+    assert guard._SNIFF_BYTES == 8000, "the window is git's, not a tunable"
+    assert guard._binary_by_content(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+    assert guard._binary_by_content(b"a" * 7999 + b"\x00"), "offset 7999 is inside the window"
+    assert not guard._binary_by_content(b"a" * 8000 + b"\x00"), "offset 8000 is outside it"
+    assert not guard._binary_by_content(b"an ordinary ASCII runbook\n")
+    assert not guard._binary_by_content("accented but UTF-8: café\n".encode())
+    assert not guard._binary_by_content(b"\xff\xd8\xff\xe0latin-1 \xe9 bytes"), (
+        "a failed decode is not git's test, and calling it binary skipped text git would diff")
 
 
 def test_an_ASCII_leak_in_a_pdf_NAMED_file_reds_the_TREE_scan(tmp_path: Path) -> None:
@@ -1250,7 +1261,7 @@ def test_an_ASCII_leak_in_a_pdf_NAMED_file_reds_the_TREE_scan(tmp_path: Path) ->
     _git(repo, "add", "-A")
 
     assert guard._binary_suffix("deploy-notes.pdf"), "vacuity guard: .pdf must be a skip suffix"
-    assert not guard._looks_binary((repo / "deploy-notes.pdf").read_bytes()), (
+    assert not guard._binary_by_content((repo / "deploy-notes.pdf").read_bytes()), (
         "vacuity guard: the plant must really be text")
 
     res = _cli(repo)
@@ -1280,19 +1291,20 @@ def test_a_GENUINELY_binary_asset_is_still_skipped_in_silence(tmp_path: Path) ->
     (repo / "icons" / "logo.png").write_bytes(png)
     _git(repo, "add", "-A")
 
-    assert guard._looks_binary(png), "vacuity guard: the plant must really be binary"
+    assert guard._binary_by_content(png), "vacuity guard: the plant must really be binary"
     res = _cli(repo)
     assert res.returncode == 0, f"an ordinary image reddened the tree scan:\n{_out(res)}"
     assert "UNREADABLE" not in _out(res), _out(res)
 
 
 def test_a_NUL_bearing_blob_at_a_SKIPPED_suffix_is_still_skipped(tmp_path: Path) -> None:
-    """⚠️ THE STATED SCOPE OF THIS CHANGE, pinned so it is discoverable rather than folklore.
+    """⚠️ THE STATED SCOPE, pinned so it is discoverable rather than folklore.
 
-    `_looks_binary` treats a NUL as binary, so a UTF-16 payload hidden in a file named `.pdf` is
-    skipped silently — exactly as it was before this change, no better and no worse. At any OTHER
-    path a NUL-bearing blob is still REFUSED and reported (the #242 posture). Widening this means
-    re-litigating which suffixes are assets, which is issue #38's design call and not this one's.
+    UTF-16 of ASCII carries a NUL at byte 1 — inside git's 8000-byte window — so a UTF-16 payload
+    hidden in a file named `.pdf` corroborates the name's binary claim and is skipped silently,
+    exactly as before. At any OTHER path a NUL-bearing blob is still REFUSED and reported (the
+    #242 posture). This is consumer#98's residual (a), stated in KNOWN LIMITS; a NUL PAST the
+    window is the different case `_reading` blanks, and it has its own tests below.
     """
     repo = tmp_path / "suffix_nul"
     _init(repo)
@@ -1310,33 +1322,49 @@ def test_a_NUL_bearing_blob_at_a_SKIPPED_suffix_is_still_skipped(tmp_path: Path)
         f"a declared binary asset is skipped silently, not reported:\n{out}")
 
 
-def test_a_run_that_scanned_ZERO_files_is_an_ERROR_not_a_pass(tmp_path: Path) -> None:
-    """⭐ consumer#22, second half. A scan that opened no file cannot clear a tree.
+def test_an_assets_only_tree_is_NOT_reddened_because_every_path_was_examined(
+        tmp_path: Path) -> None:
+    """⛔ THE ZERO-FILE FLOOR IS RETIRED (consumer#22, second half — the half its own consumer then
+    measured and did NOT ship, and the version the fleet's package explicitly said not to port).
 
-    Measured at `main@046fc7e`: `no internal info found (0 tracked text files scanned)`, exit 0 —
-    a cheerful pass in the same words a real one uses. The count was printed all along; nothing
-    acted on it.
+    Measured on v1.4.1 of THIS engine: `REFUSING to report clean: 2 tracked path(s), but ZERO
+    were read as text`, exit 1 — on a CORRECT tree whose only remedy was "add a README". A guard
+    that reds a correct tree gets switched off. Since every tracked PATH is scanned, such a run
+    has not looked at nothing: it examined every name and declined every body, for a reason the
+    design states and the verdict prints. Both directions asserted: the assets-only tree passes
+    and says what it examined, and a leak in one of those NAMES is still caught.
     """
-    repo = tmp_path / "floor"
+    repo = tmp_path / "assets_only"
     _init(repo)
-    (repo / "only.pdf").write_bytes(b"\x89PDF\x00\x00binary-ish\x00\xff\xfe")
+    (repo / "icon.png").write_bytes(_PNG)
+    (repo / "logo.ico").write_bytes(b"\x00\x00\x01\x00" + bytes(64))
     _git(repo, "add", "-A")
 
-    assert _git(repo, "ls-files").split() == ["only.pdf"], "vacuity guard"
+    assert sorted(_git(repo, "ls-files").split()) == ["icon.png", "logo.ico"], "vacuity guard"
     res = _cli(repo)
-    assert res.returncode == 1, f"a scan that read nothing reported clean:\n{_out(res)}"
-    assert "ZERO" in _out(res), _out(res)
+    assert res.returncode == 0, f"a correct assets-only tree was reddened:\n{_out(res)}"
+    assert "0 tracked text files scanned, 2 tracked path(s) examined" in _out(res), (
+        f"the verdict does not say what it DID examine, which is the whole reason it is entitled "
+        f"to report clean here:\n{_out(res)}")
+
+    (repo / f"{_ADDR}.png").write_bytes(_PNG)
+    _git(repo, "add", "-A")
+    named = _cli(repo)
+    assert named.returncode == 1 and "<path>" in _out(named), (
+        f"the path scan is what makes the clean verdict above honest, and it did not "
+        f"fire:\n{_out(named)}")
 
 
-def test_the_floor_does_not_fire_on_an_ordinary_tree(tmp_path: Path) -> None:
-    """The false-red direction for the floor: one readable text file is enough."""
-    repo = tmp_path / "floor_ok"
+def test_an_ordinary_tree_passes_and_the_verdict_prints_BOTH_counts(tmp_path: Path) -> None:
+    """One text file and one asset: read one, examined two, and the verdict says so."""
+    repo = tmp_path / "counts"
     _init(repo)
     _write(repo, "README.md", "clean\n")
     (repo / "logo.png").write_bytes(b"\x89PNG\x00\x00binary")
     _git(repo, "add", "-A")
     res = _cli(repo)
-    assert res.returncode == 0, f"an ordinary tree tripped the zero-scan floor:\n{_out(res)}"
+    assert res.returncode == 0, f"an ordinary tree was reddened:\n{_out(res)}"
+    assert "(1 tracked text files scanned, 2 tracked path(s) examined)" in _out(res), _out(res)
 
 
 def test_the_floor_does_not_refuse_an_EMPTY_tree(tmp_path: Path) -> None:
@@ -1392,6 +1420,286 @@ def test_an_unstaged_rm_of_a_BINARY_ASSET_does_not_red(tmp_path: Path) -> None:
     assert res.returncode == 1, (
         f"an absent .pdf whose staged blob is TEXT must still be scanned:\n{_out(res)}")
     assert _HOST in _out(res), _out(res)
+
+
+# ===========================================================================================
+# consumer PR95 / PR99 — what the consumer's three gate rounds found on top of the four
+# surfaces above, re-measured against v1.4.1 of THIS engine before each was ported.
+#
+#   * the TREE scan's binary test read every byte, where git reads 8000: a `.pdf` of ASCII with a
+#     leak on line 6 and a NUL at the end was CAUGHT by `--staged` and `--range` and CLEARED by
+#     the tree scan — the pre-commit layer, the one that runs most often, was the one that missed;
+#   * `staged_blob` read `:<path>`, so a path beginning `0:` resolved as a merge STAGE and another
+#     file's bytes vouched for it;
+#   * anything named `HEAD` beside the repository root killed `--staged` with a traceback;
+#   * the zero-file floor reddened an assets-only tree (above).
+# Every plant below is one of those, plus its false-red direction.
+# ===========================================================================================
+_PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + bytes(64)
+
+
+def _late_nul(leak_line: str | None) -> bytes:
+    """~9 KB of ASCII lines — the SIXTH carrying `leak_line` when given — then ONE NUL at the end.
+
+    Past git's 8000-byte window, so git serves the file as TEXT; a NUL anywhere is what made the
+    old tree scan skip it whole. The fixture asserts its own premise.
+    """
+    lines = ["x" * 70] * 120
+    if leak_line is not None:
+        lines[5] = leak_line
+    raw = ("\n".join(lines) + "\n").encode("ascii") + b"\x00tail\n"
+    assert len(raw) > 8000 and b"\x00" not in raw[:8000], "the fixture is inside git's window"
+    return raw
+
+
+def _refusals(out: str) -> str:
+    """The guard's output with the PARTLY-read disclosure removed.
+
+    That block NAMES files the scan DID clear, so a bare `"<name>" not in out` reads a
+    disclosure as a refusal. The engine prints it LAST, after the findings, so everything from
+    its heading to the end is disclosure.
+    """
+    head, sep, _ = out.partition("PARTLY read (")
+    return head if sep else out
+
+
+def test_a_leak_on_a_NUL_FREE_line_of_a_late_NUL_pdf_is_found_by_ALL_THREE_scans(
+        tmp_path: Path) -> None:
+    """⭐⭐ consumer PR95 rounds 1 and 3, measured on v1.4.1 of this engine: `--staged` exit 1 and
+    `--range` exit 1 naming `late.pdf:6`, the TREE scan exit 0 with "1 tracked text files
+    scanned". The three scans must classify one file one way, and the tree scan is the layer
+    that runs on every commit.
+
+    The NUL line is blanked, not removed: the finding keeps its true line number in all three.
+    """
+    repo = tmp_path / "late"
+    base = _seeded(repo)
+    (repo / "late.pdf").write_bytes(_late_nul(f"agent lives at {_ADDR}"))
+    _git(repo, "add", "-A")
+
+    staged = _cli(repo, "--staged")
+    assert staged.returncode == 1 and "late.pdf:6:" in _out(staged), _out(staged)
+
+    _git(repo, "commit", "-q", "-m", "add a document whose first NUL falls past git's window")
+    assert "-\t-\t" not in _git(repo, "diff", "--numstat", base, "HEAD"), (
+        "premise broken: git called the fixture binary, so this measures the skip, not the window")
+
+    tree = _cli(repo)
+    assert tree.returncode == 1, f"the TREE scan cleared it (the v1.4.1 bypass):\n{_out(tree)}"
+    assert "late.pdf:6:" in _out(tree), _out(tree)
+    assert "PARTLY read (1)" in _out(tree) and "late.pdf (1 line(s) carried a NUL" in _out(tree), (
+        f"the verdict does not say the file was only partly read:\n{_out(tree)}")
+
+    rng = _cli(repo, "--range", f"{base}..HEAD")
+    assert rng.returncode == 1 and "late.pdf:6:" in _out(rng), _out(rng)
+
+
+def test_a_late_NUL_pdf_with_NO_leak_is_DISCLOSED_not_refused_and_the_residual_is_stated(
+        tmp_path: Path) -> None:
+    """The false-red direction, and the declared limit, in one test so they cannot drift apart.
+
+    A clean file of the same shape passes every scan; the tree scan discloses the partial read
+    and does not refuse it. And a leak ON the NUL line is cleared — consumer#98 residual (b),
+    asserted as the limit it is, so it cannot rot into an assumption.
+    """
+    repo = tmp_path / "late_clean"
+    base = _seeded(repo)
+    (repo / "clean.pdf").write_bytes(_late_nul(None))
+    _git(repo, "add", "-A")
+    assert _cli(repo, "--staged").returncode == 0
+    _git(repo, "commit", "-q", "-m", "add a clean document")
+
+    tree = _cli(repo)
+    assert tree.returncode == 0, f"a clean late-NUL .pdf was refused:\n{_out(tree)}"
+    assert "PARTLY read (1)" in _out(tree) and "clean.pdf" in _out(tree), _out(tree)
+    assert "UNREADABLE" not in _out(tree), _out(tree)
+    assert _cli(repo, "--range", f"{base}..HEAD").returncode == 0
+
+    same = ("x" * 70 + "\n").encode("ascii") * 120 + f"host {_ADDR}\x00 here\n".encode("ascii")
+    assert b"\x00" not in same[:8000]
+    (repo / "sameline.pdf").write_bytes(same)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add the residual")
+    for label, proc in (("tree", _cli(repo)), ("range", _cli(repo, "--range", f"{base}..HEAD"))):
+        assert proc.returncode == 0 and "sameline.pdf" not in _refusals(_out(proc)), (
+            f"the {label} scan reported a value sharing a line with a NUL. That is better than "
+            f"the documented behaviour - update KNOWN LIMITS and the residual issue rather than "
+            f"this assertion:\n{_out(proc)}")
+    assert "sameline.pdf (1 line(s) carried a NUL" in _out(_cli(repo)), (
+        "the tree scan must at least SAY it did not read that line")
+
+
+def test_the_tree_scan_reads_the_INDEX_and_the_WORKTREE_alike_for_a_late_NUL_pdf(
+        tmp_path: Path) -> None:
+    """⛔ The consumer's tree scan contradicted itself on the same bytes: the staged-blob branch
+    asked about a NUL ANYWHERE and cleared what the worktree read had just reported. Both sources
+    go through `_reading` here; this pins that they reach the same verdict.
+    """
+    repo = tmp_path / "index_vs_worktree"
+    _seeded(repo)
+    (repo / "asset.pdf").write_bytes(_late_nul(f"host {_ADDR} is the db"))
+    _git(repo, "add", "-A")
+
+    present = _cli(repo)
+    assert present.returncode == 1 and "asset.pdf:6:" in _out(present), (
+        f"the premise is broken - the worktree read did not find it:\n{_out(present)}")
+
+    (repo / "asset.pdf").unlink()
+    absent = _cli(repo)
+    assert absent.returncode == 1, (
+        f"the same staged bytes were CLEARED once the file left the worktree:\n{_out(absent)}")
+    assert "asset.pdf:6:" in _out(absent), _out(absent)
+    assert "asset.pdf (absent from the worktree) (1 line(s) carried a NUL" in _out(absent), (
+        f"the disclosure must say the bytes came from the index:\n{_out(absent)}")
+
+
+def test_a_latin1_file_under_a_binary_suffix_is_SCANNED_the_way_the_range_scan_scans_it(
+        tmp_path: Path) -> None:
+    """git serves a latin-1 file as text (no NUL in the window), and the range scan has always
+    scanned it with replacement characters. The old tree scan called a failed decode "binary"
+    and skipped the file in silence — so a latin-1 runbook named `.pdf` was reported by
+    `--range` and cleared by the tree scan. Same file, same verdict, from every scan now; and it
+    is not reported UNREADABLE either, because the remedy for that would name the suffix it
+    already has.
+    """
+    repo = tmp_path / "latin1"
+    base = _seeded(repo)
+    (repo / "notes.pdf").write_bytes(b"caf\xe9 notes\n" + f"host {_ADDR}\n".encode("ascii"))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add latin-1 notes")
+
+    tree = _cli(repo)
+    assert tree.returncode == 1 and "notes.pdf:2:" in _out(tree), (
+        f"a latin-1 leak under a binary suffix was cleared by the tree scan:\n{_out(tree)}")
+    assert "UNREADABLE" not in _out(tree), _out(tree)
+    rng = _cli(repo, "--range", f"{base}..HEAD")
+    assert rng.returncode == 1 and "notes.pdf:2:" in _out(rng), _out(rng)
+
+
+def test_staged_blob_reads_the_PATH_it_was_given_not_a_git_STAGE_expression(
+        tmp_path: Path) -> None:
+    """⛔⛔ `:<path>` IS A REVISION EXPRESSION, and `:0:`/`:1:`/`:2:`/`:3:` inside one name a merge
+    STAGE — so a file whose NAME begins with one of those prefixes resolved to a DIFFERENT file,
+    and its bytes vouched for the leak (consumer PR99). `:0:<path>` makes the remainder a path.
+
+    ⚠️ Windows cannot hold such a file (git refuses `:` in a name), so this asserts the
+    RESOLUTION rather than an end-to-end commit, which is what makes it run everywhere: under
+    the defect `0:cfg.env` returns `cfg.env`'s bytes on every platform; under the fix it returns
+    that path's own content where the path can exist and None where it cannot. Neither is
+    `cfg.env`'s. The stage-1/2/3 half needs an unmerged path, where those prefixes name a real,
+    other blob — a modify/modify conflict over a base version, so all three stages exist.
+    """
+    repo = tmp_path / "stage_syntax"
+    _seeded(repo)
+    (repo / "cfg.env").write_bytes(b"HOST=placeholder.example\n")
+    _git(repo, "add", "cfg.env")
+    decoy = guard.staged_blob(repo, "cfg.env")
+    assert decoy == b"HOST=placeholder.example\n", decoy
+    assert guard.staged_blob(repo, "0:cfg.env") != decoy, (
+        "'0:' was parsed as a git stage, so a file named 0:cfg.env would be cleared on the "
+        "strength of cfg.env's bytes")
+
+    (repo / "both.txt").write_bytes(b"base\n")
+    _commit(repo, "a file both sides will change")
+    _git(repo, "checkout", "-q", "-b", "side")
+    (repo / "both.txt").write_bytes(b"theirs\n")
+    _commit(repo, "side")
+    _git(repo, "checkout", "-q", "main")
+    (repo / "both.txt").write_bytes(b"ours\n")
+    _commit(repo, "main")
+    merge = subprocess.run(["git", *_PINNED, "merge", "side"], cwd=repo, capture_output=True,
+                           check=False, timeout=300)
+    assert merge.returncode != 0, "the fixture did not conflict, so the stages do not exist"
+    stages = _git(repo, "ls-files", "-u", "both.txt")
+    assert all(f"{n}\tboth.txt" in stages for n in (1, 2, 3)), f"a stage is missing: {stages}"
+
+    assert guard.staged_blob(repo, "both.txt") is None, (
+        "an unmerged path has no stage-0 entry, so there is nothing this may vouch for")
+    for prefix in ("1:", "2:", "3:"):
+        got = guard.staged_blob(repo, f"{prefix}both.txt")
+        assert got not in (b"base\n", b"ours\n", b"theirs\n"), (
+            f"{prefix!r} was parsed as a git stage, so a file named {prefix}both.txt would be "
+            f"cleared on the strength of a conflict stage's bytes: {got!r}")
+
+
+def test_a_staged_path_that_LOOKS_like_a_stage_prefix_is_read_as_ITSELF(tmp_path: Path) -> None:
+    """The positive direction, in its own test so the sibling still REPORTS where this skips: a
+    version that refused every path containing a colon would satisfy the sibling, and on POSIX
+    it would silently stop reading a legitimately-named staged file — a bypass dressed as a fix.
+    Skipped where the filesystem cannot hold the name (Windows refuses a colon outright)."""
+    repo = tmp_path / "colon_path"
+    _seeded(repo)
+    odd = repo / "0:real.txt"
+    try:
+        odd.write_bytes(b"its own content\n")
+    except OSError:
+        pytest.skip("this filesystem cannot hold a file whose name contains a colon")
+    _git(repo, "add", "--", "0:real.txt")
+    assert guard.staged_blob(repo, "0:real.txt") == b"its own content\n", (
+        "the fix resolves the path to nothing rather than to itself")
+
+
+def test_anything_named_HEAD_beside_the_repository_does_not_crash_a_scan(tmp_path: Path) -> None:
+    """⛔ git resolves a revision NAME against the filesystem as well as the refs, so a file, an
+    untracked file or a DIRECTORY named `HEAD` beside the root made `git diff --cached HEAD` die
+    128 ("ambiguous argument") — and `--staged` died with a traceback naming an argument the
+    operator never typed (consumer PR99; measured on v1.4.1 of this engine). The trailing `--`
+    settles it. All three shapes, because the disambiguation is against the FILESYSTEM, not the
+    index; and the range scan too, whose `rev-list` takes the same names.
+    """
+    repo = tmp_path / "head_file"
+    _seeded(repo)
+    (repo / "HEAD").write_bytes(f"HOST={_ADDR}\n".encode("ascii"))
+    _git(repo, "add", "--", "HEAD")
+    res = _cli(repo, "--staged")
+    assert "Traceback" not in _out(res), f"the scan died instead of reporting:\n{_out(res)[-900:]}"
+    assert res.returncode == 1 and "HEAD:1:" in _out(res), (
+        f"the leak in a file named HEAD was cleared:\n{_out(res)}")
+
+    for shape in ("untracked", "directory"):
+        other = tmp_path / f"head_{shape}"
+        base = _seeded(other)
+        if shape == "directory":
+            (other / "HEAD").mkdir()
+        else:
+            (other / "HEAD").write_bytes(b"not tracked\n")
+        _write(other, "notes.md", "clean\n")
+        _git(other, "add", "notes.md")
+        res = _cli(other, "--staged")
+        assert "Traceback" not in _out(res), f"a {shape} HEAD killed --staged:\n{_out(res)[-900:]}"
+        assert res.returncode == 0, _out(res)
+        _git(other, "commit", "-q", "-m", "add notes")
+        for rng in (f"{base}..HEAD", "HEAD"):
+            res = _cli(other, "--range", rng)
+            assert res.returncode == 0 and "Traceback" not in _out(res), (
+                f"a {shape} HEAD broke --range {rng}:\n{_out(res)}")
+
+
+def test_adding_a_SUBMODULE_does_not_redden_any_scan(tmp_path: Path) -> None:
+    """A gitlink adds `.gitmodules` and one `Subproject commit <sha>` line — nothing a shape can
+    match — and `git submodule add`, then every pointer bump, has to pass the commit hook.
+
+    ⚠️ A RELATIVE URL. An absolute one puts the checkout's own path into `.gitmodules`, and on a
+    workstation that is a `windows profile path` — the guard correctly reporting the FIXTURE.
+    """
+    inner = tmp_path / "inner"
+    _seeded(inner)
+    outer = tmp_path / "outer"
+    base = _seeded(outer)
+    _git(outer, "-c", "protocol.file.allow=always", "submodule", "add", "-q", "../inner", "sub")
+    assert "160000" in _git(outer, "ls-files", "-s"), "the fixture planted no gitlink"
+
+    staged = _cli(outer, "--staged")
+    assert staged.returncode == 0, f"adding a submodule reddened the commit:\n{_out(staged)}"
+    _git(outer, "commit", "-q", "-m", "add the submodule")
+    assert _cli(outer).returncode == 0
+    assert _cli(outer, "--range", f"{base}..HEAD").returncode == 0
+
+    _write(inner, "notes.md", "more\n")
+    _commit(inner, "move the submodule on")
+    _git(outer, "add", "sub")
+    bump = _cli(outer, "--staged")
+    assert bump.returncode == 0, f"a submodule pointer bump was reddened:\n{_out(bump)}"
 
 
 # ===========================================================================================
