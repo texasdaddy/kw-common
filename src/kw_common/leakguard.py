@@ -106,22 +106,41 @@ KNOWN LIMITS (state them; do not pretend to coverage)
         ⚠️ WHAT REMAINS, stated rather than claimed away: `--staged` sees what the commit ADDS
         relative to HEAD. A leak already present in HEAD is not "staged" and is not reported by
         it — that is the tree scan's question, which is why both still run.
-      * ⭐ WHAT A `SKIP_SUFFIXES` NAME STILL BUYS, in TWO cases (consumer#98, and this engine's
-        own issue for the same residual). The name is a HINT the content has to corroborate, and
-        "corroborate" means precisely one NUL byte in git's own 8000-byte window:
-          (a) A NUL IN THE FIRST 8000 BYTES skips the whole file, in every scan, however much
-              plain text follows. Measured: one commit adding `deploy-notes.pdf` =
-              `b"\x00\nsecret host <cgnat-addr> lives here\n..."` scans clean in every mode,
-              exit 0, while the identical bytes in `deploy.conf` are refused by every mode.
-          (b) A NUL LATER leaves the file scanned, but every LINE carrying one is BLANKED unread —
-              so a value sharing a line with a NUL is cleared. The tree scan says how many lines
-              went unread ("PARTLY read"); the range and `--staged` scans blank the same line and
-              say nothing, because `parse_diff` cannot tell that line from a binary diff.
-        A UTF-16 `.pdf` falls under (a), not (b): UTF-16 of ASCII carries a NUL at byte 1, so the
-        whole file is skipped and the blanking branch is never reached. Closing (a) means either
-        reading every asset's decodable runs (a false-red risk on files an operator cannot edit)
-        or reporting every binary as "not cleared" (a red on every repository with an icon in it);
-        both are behaviour changes with their own costs, so it is stated rather than guessed at.
+      * ⭐ WHAT A `SKIP_SUFFIXES` NAME BUYS, CLOSED to a narrower residual (#26, #27; consumer#98
+        raised the original shape). The name is a HINT the content has to corroborate, and a NUL
+        byte in git's own 8000-byte window is no longer enough corroboration on its own — it must
+        ALSO fail a strict UTF-8 decode, because a NUL is itself a legal UTF-8 codepoint:
+          (a) [#26, CLOSED to a narrower case] A NUL IN THE FIRST 8000 BYTES used to skip the
+              whole file, in every scan, however much plain text followed — `deploy-notes.pdf` =
+              `b"\x00\nsecret host <cgnat-addr> lives here\n..."` scanned clean in every mode
+              while the identical bytes in `deploy.conf` were refused. That payload decodes as
+              valid UTF-8 (the NUL is one), which is exactly what let a NAME earn a silent pass
+              for it. The silent skip is now trusted only when the bytes ALSO fail a strict UTF-8
+              decode — genuine binary noise (arbitrary high bytes, as a real PNG/ZIP/etc. is)
+              still does; content that is valid UTF-8 despite the NUL falls through to (b)'s
+              treatment instead. RESIDUAL, stated rather than implied: a leak straddling one
+              INVALID UTF-8 byte (not the NUL itself) alongside an early NUL still corroborates
+              the binary claim and is still skipped in silence — narrower than the original hole
+              by a wide margin (it needs a non-ASCII, non-UTF-8 byte in the same file as the NUL,
+              not just the NUL), but not zero. Closing it fully means either reading every asset's
+              decodable runs (a false-red risk on files an operator cannot edit) or reporting
+              every binary as "not cleared" (a red on every repository with an icon in it); both
+              are their own behaviour change, so this one is stated rather than guessed at.
+          (b) [#27, CLOSED] A NUL LATER (or an early NUL that falls through (a)'s strict-decode
+              check) leaves the file scanned, with every LINE carrying a NUL BLANKED unread — a
+              value sharing a line with a NUL is still cleared, unchanged. What closed: ALL THREE
+              scans now disclose it the same way. The tree scan always said how many lines went
+              unread ("PARTLY read"); the range and `--staged` scans used to blank the same line
+              and say nothing, because a NUL-bearing added line and a path git refused outright
+              shared one `unscannable` list with no way to tell them apart. `ParsedDiff` now
+              carries them separately (`unscannable` vs. `partial`), and both scans print their
+              own "PARTLY read" block — the SAME split `_reading` already applied for the tree
+              scan (a hinted path's dropped line is disclosed, not silent; a NON-hinted path's is
+              still fail-closed, per #242).
+        A UTF-16 `.pdf` now falls under (b), not (a): UTF-16 of ASCII carries a NUL at byte 1
+        inside the window, but every byte is under 0x80, so it decodes as valid UTF-8 (the same
+        fact #242 is about) and (a)'s strict-decode check no longer trusts the name for it — it
+        is blanked and disclosed like any other NUL-bearing content instead of skipped whole.
       * A CUSTOM Unraid pool name (`/mnt/tank`, `/mnt/nvme`) has no shape here — the pool list is
         a fixed set of stock names. Widening to `/mnt/[\w-]+/` would fire on ordinary container
         paths. Custom names are the project-side guard's job.
@@ -1215,11 +1234,14 @@ def _binary_by_content(data: bytes) -> bool:
     will serve as text is read as text here, and what it then turns out to contain is decided by
     `_reading`, which is where the NUL-past-the-window case is handled rather than here.
 
-    ⚠️ WHAT THIS DOES NOT CLOSE, stated because this file's rule is to declare a gap rather than
-    imply coverage: a file NAMED with a binary suffix whose first 8000 bytes DO contain a NUL is
-    still skipped on that evidence, however much plain text follows — one byte is all the
-    corroboration a name needs. That is consumer#98's residual, it is far narrower than the old
-    rule (which needed only the NAME), and it is written down in KNOWN LIMITS.
+    ⚠️ WHAT THIS ALONE DOES NOT CLOSE (#26 narrowed this further — see `_reading`, which asks a
+    SECOND question before trusting this one for a hinted name): a NUL in the window is
+    corroboration ONLY when the bytes also fail a strict UTF-8 decode. This function alone cannot
+    tell `deploy-notes.pdf`'s planted leak (valid UTF-8 despite the NUL) from a real PNG (invalid
+    UTF-8) — both return `True` here, on purpose, because THIS is git's own question and nothing
+    more. `_reading` is where the two are told apart; a caller that skips a hinted file on this
+    result alone, without also checking the strict decode, reopens #26. The residual that
+    survives even that second check is written down in KNOWN LIMITS.
     """
     return b"\x00" in data[:_SNIFF_BYTES]
 
@@ -1253,24 +1275,25 @@ def _reading(rel: str, raw: bytes, *, absent_from_worktree: bool = False) -> Rea
     """
     where = " (absent from the worktree)" if absent_from_worktree else ""
     hinted = _binary_suffix(rel)
-    # A name that CLAIMS binary is believed only if the bytes agree — in git's own window. A real
-    # asset is skipped here in silence, exactly as it always was.
+    # A name that CLAIMS binary is corroborated by a NUL in git's own window — but a NUL is
+    # itself valid UTF-8 (U+0000), so that corroboration is satisfied by `\x00\nsecret host
+    # <addr>...` just as readily as by a real PNG (issue #26). A STRICT decode tells them apart:
+    # genuine binary noise (arbitrary high bytes) fails it; ASCII/UTF-8 text that merely carries
+    # one stray NUL passes it. Only the first is trusted silently — the second falls through to
+    # exactly the same blank-and-scan treatment as a NUL past the window, below.
     if hinted and _binary_by_content(raw):
-        return Reading(None, None, None)
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        if not hinted:
-            # NOT silent: a file this scanner cannot read is a file it cannot vouch for.
-            return Reading(None, (f"{rel} (absent from the worktree, and its staged content is "
-                                  f"not UTF-8)" if absent_from_worktree else rel), None)
-        # ⭐ A HINTED FILE GIT WOULD SERVE AS TEXT IS SCANNED AS TEXT, EVEN WHEN IT IS NOT UTF-8 —
-        # the way the range scan already scans it (`_git` decodes with `errors="replace"`).
-        # Skipping it in silence, which this used to do, let a latin-1 runbook named `.pdf` walk
-        # past the tree scan while `--range` reported it; reporting it "unreadable" would be a red
-        # whose printed remedy ("keep it under an asset suffix") names the suffix it already has.
-        # Replacement characters cannot create a false hit: every pattern is ASCII.
-        text = raw.decode("utf-8", errors="replace")
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return Reading(None, None, None)
+    # ⭐ #28: EVERY PATH decodes with `errors="replace"`, not only a hinted one — matching how the
+    # range/`--staged` scans have always read the same bytes (`_git` decodes with
+    # `errors="replace"`). The old strict-then-refuse posture for a non-hinted path meant an
+    # ordinary latin-1 runbook BLOCKED `git commit` while `git push` was green on the identical
+    # bytes, and the only way past it was to rename the file to look like an asset. Cost: a
+    # genuinely mis-encoded file is scanned with replacement characters instead of refused —
+    # accepted, because replacement characters cannot create a false hit (every pattern is ASCII).
+    text = raw.decode("utf-8", errors="replace")
     if "\x00" in text:
         if not hinted:
             # ⛔⛔ A SUCCESSFUL DECODE IS NOT PROOF IT IS TEXT (issue #242). BOM-less UTF-16LE of
@@ -1790,10 +1813,20 @@ def widen_unreachable_base(root: Path, rev_range: str) -> tuple[str, str | None]
 
 
 class ParsedDiff(NamedTuple):
-    """What one commit's diff contributes: lines we CAN scan, and paths we cannot."""
+    """What one commit's diff contributes: lines we CAN scan, and paths we cannot.
+
+    ⭐ `partial` is issue #27's fix: a path lands here, instead of in `unscannable`, when SOME of
+    its added lines carried a NUL and were dropped while OTHERS were kept and scanned (`added`
+    still has them). That is exactly the tree scan's "PARTLY read" situation, and it used to be
+    indistinguishable from a path git refused outright — both landed in the same flat
+    `unscannable` list, so a suffix-hinted path's dropped line was filtered out by `_skipped` with
+    NO disclosure at all, while the tree scan said so. One list could not carry both "I could not
+    read this at all" and "I read most of this", so it is two lists now.
+    """
 
     added: list[tuple[str, int, str]]   # (path, new-file line number, content)
-    unscannable: list[str]              # paths git served as binary — see `parse_diff`
+    unscannable: list[str]              # paths git served as binary, or with no readable header
+    partial: list[tuple[str, int]]      # (path, NUL-bearing lines dropped) — the rest was scanned
 
 
 def parse_diff(diff: str) -> ParsedDiff:
@@ -1856,7 +1889,7 @@ def parse_diff(diff: str) -> ParsedDiff:
     deleted = False
     saw_header = False
     saw_hunk = False
-    nul_seen: set[str] = set()
+    nul_counts: dict[str, int] = {}
     for line in _lines(diff):
         if line.startswith("diff --git "):
             saw_header = True
@@ -1939,23 +1972,13 @@ def parse_diff(diff: str) -> ParsedDiff:
         if in_hunk and line.startswith("+"):
             content = line[1:]
             if "\x00" in content:
-                # ⛔ THE PLAIN PATH, NOT A MARKER, and the difference was a false red nobody could
-                # clear. Markers are steered AROUND `_skipped` on purpose — `_NO_HEADER` and an
-                # unparsed header have no path, so no suffix rule can apply to them. This case is
-                # the opposite: it HAS a path, and wrapping it made it inherit that exemption. A
-                # `.pdf` whose first NUL falls past git's 8000-byte window was then SKIPPED by the
-                # tree scan and REFUSED by the range scan — the two scans disagreeing about which
-                # files count, which is exactly what `_skipped` exists to prevent. Worse, the
-                # printed remedy was inert: the suffix was already in SKIP_SUFFIXES, so the
-                # operator was told to do the thing they had already done, with no way to pass.
-                #
-                # Reported ONCE per path, not once per line: a UTF-16 file is NUL-bearing on
-                # every line, and a report repeated a thousand times reads as a thousand faults.
-                if path not in nul_seen:
-                    nul_seen.add(path)
-                    # An unparsed-header marker is ALREADY in `unscannable` from the header line.
-                    if not _is_marker(path):
-                        unscannable.append(path)
+                # ⛔ THE PLAIN PATH, NOT A MARKER — a marker has no path, so no suffix rule and no
+                # disclosure keyed on a path could ever apply to it. This case is the opposite: it
+                # HAS a path, so it is counted per path (#27: not just "one or none", so the
+                # disclosure can say how many lines were dropped, matching the tree scan's count).
+                # An unparsed-header marker is ALREADY in `unscannable` from the header line.
+                if not _is_marker(path):
+                    nul_counts[path] = nul_counts.get(path, 0) + 1
             else:
                 added.append((path, lineno, content))
             lineno += 1
@@ -1964,7 +1987,21 @@ def parse_diff(diff: str) -> ParsedDiff:
         # is what stops that from being SILENT. Checked after the loop rather than per line so it
         # is reported once for the diff, not once per hunk.
         unscannable.append(_NO_HEADER)
-    return ParsedDiff(added, unscannable)
+    # ⭐ #27, split the SAME way `_reading` already splits the tree scan's own late-NUL case: a
+    # NUL-bearing added line at a SUFFIX-HINTED path is `partial` (disclosed, not a failure — the
+    # NUL-free lines of that same path were still scanned, exactly as `_reading` blanks and scans
+    # the rest); at any OTHER path it stays fail-closed in `unscannable`, unchanged from before
+    # this issue (the #242 posture: an ordinary path this cannot fully vouch for is not cleared).
+    # Getting this backwards was the regression the gate caught: routing EVERY NUL-bearing path
+    # into the non-failing `partial` bucket would have cleared `report.txt` for the same reason
+    # `_reading` refuses it — the suffix is the ONLY thing that earns the benefit of the doubt.
+    partial: list[tuple[str, int]] = []
+    for path, count in nul_counts.items():
+        if _binary_suffix(path):
+            partial.append((path, count))
+        else:
+            unscannable.append(path)
+    return ParsedDiff(added, unscannable, partial)
 
 
 def first_parent(root: Path, sha: str) -> str:
@@ -2078,7 +2115,8 @@ def resolve_unscannable(root: Path, parsed: ParsedDiff, revs: tuple[str, ...]) -
     # Feeding one to the re-diff below would match nothing, git would exit 0 with empty output,
     # and the run would clear a diff it could not read at all.
     unattributable = [p for p in parsed.unscannable if _is_marker(p)]
-    parsed = ParsedDiff(parsed.added, [p for p in parsed.unscannable if not _is_marker(p)])
+    parsed = ParsedDiff(parsed.added, [p for p in parsed.unscannable if not _is_marker(p)],
+                        parsed.partial)
     # ⚠️ `root` IS LOAD-BEARING HERE, and leaving it off was a live fail-open. `_skipped(p)` with
     # no root once fell back to a hardcoded self-path instead of resolving this file from
     # `__file__` — the exact defect `_self_rel_path` exists to remove, one line away from its own
@@ -2090,10 +2128,13 @@ def resolve_unscannable(root: Path, parsed: ParsedDiff, revs: tuple[str, ...]) -
     # a blob the scan never read is reported as clean on the push path.
     pending = [p for p in parsed.unscannable if not _skipped(p, root)]
     if not pending:
-        return ParsedDiff(parsed.added, unattributable)
+        return ParsedDiff(parsed.added, unattributable, parsed.partial)
 
     added = list(parsed.added)
     still_unreadable: list[str] = list(unattributable)
+    # `parsed.partial` already has its own disposition (a NUL-bearing added line, the rest of the
+    # diff scanned) and is never re-diffed — only `unscannable` paths go through `--text` below.
+    still_partial: list[tuple[str, int]] = list(parsed.partial)
     for path in pending:
         try:
             # ⚠️ `:(literal)` — WITHOUT IT THE PATH IS A GLOB. A perfectly ordinary asset name
@@ -2125,16 +2166,19 @@ def resolve_unscannable(root: Path, parsed: ParsedDiff, revs: tuple[str, ...]) -
         # flagged binary, re-diffed with `--text`, that came back NUL-bearing (a BOM-less UTF-16
         # blob) contributed no added lines, raised nothing, and quietly dropped out of
         # `still_unreadable` — reported CLEAN. Whatever the re-diff could not read stays unread.
+        # `sub.partial` is #27's disclosure for the SAME re-diff: some of its lines carried a NUL
+        # and were dropped while the rest (already in `sub.added`) was scanned.
+        still_partial += sub.partial
         if sub.unscannable:
             still_unreadable += sub.unscannable
             continue
         added += sub.added
-    return ParsedDiff(added, still_unreadable)
+    return ParsedDiff(added, still_unreadable, still_partial)
 
 
 def scan_added(sha: str, parsed: ParsedDiff, compiled: list[tuple[str, re.Pattern[str]]],
-               root: Path | None = None) -> tuple[list[str], list[str]]:
-    """(findings, unscannable) for one commit.
+               root: Path | None = None) -> tuple[list[str], list[str], list[str]]:
+    """(findings, unscannable, partial) for one commit. See `ParsedDiff` for what `partial` is.
 
     ⚠️ THIS NO LONGER SKIPS "the same files the tree scan skips", and the old summary line saying
     so was left in place while the paragraph below contradicted it. What the two scans share is the
@@ -2152,13 +2196,10 @@ def scan_added(sha: str, parsed: ParsedDiff, compiled: list[tuple[str, re.Patter
     list below still uses `_skipped`: that one is about not complaining that a genuine `.png`
     could not be decoded, which is a question about assets, not about text.
 
-    ⚠️ STATED, NOT CLOSED: a NUL-bearing ADDED LINE in a suffix-hinted file is dropped by
-    `parse_diff` into `unscannable`, and the `_skipped` filter below then drops it from the report
-    — so the range scan and `--staged` scan the NUL-free lines of such a file and say nothing about
-    the line they could not read. The tree scan discloses the same situation as "PARTLY read"
-    (`_reading`). `parse_diff` cannot tell "git served a binary diff" from "one added line carried
-    a NUL", which is what a disclosure here would need; it is recorded as a follow-up rather than
-    bolted on.
+    ⭐ #27, CLOSED: a NUL-bearing ADDED LINE no longer shares `unscannable` with a path git
+    refused outright — `parse_diff` puts it in `parsed.partial` instead, so this can disclose it
+    ("N line(s) carried a NUL and were not read") the same way the tree scan's "PARTLY read"
+    does, instead of saying nothing while quietly scanning only the NUL-free lines.
     """
     findings: list[str] = []
     for path, lineno, content in parsed.added:
@@ -2169,8 +2210,14 @@ def scan_added(sha: str, parsed: ParsedDiff, compiled: list[tuple[str, re.Patter
     # `_shown` strips the marker sigil for display. `_skipped` is still asked of the RAW value: a
     # marker is not a path, so it matches no skip suffix and no self-exemption, which is the
     # answer wanted — an unattributable diff is never skipped.
-    return findings, [f"{sha[:10]} {_shown(p)}" for p in parsed.unscannable
-                      if not _skipped(p, root)]
+    unscannable = [f"{sha[:10]} {_shown(p)}" for p in parsed.unscannable if not _skipped(p, root)]
+    # ⚠️ NOT FILTERED BY `_skipped` — that is the whole fix. A NUL-bearing line is disclosed
+    # whether the path is suffix-hinted or not, because "some of this file could not be read" is
+    # true regardless of what the name claims; `_skipped` only ever answered "is it pointless to
+    # complain that this asset could not be decoded AT ALL", which is not this question.
+    partial = [f"{sha[:10]} {_shown(p)} ({n} line(s) carried a NUL and were not read)"
+              for p, n in parsed.partial]
+    return findings, unscannable, partial
 
 
 # ------------------------------------------------------- the COMMIT'S OWN identity
@@ -2396,6 +2443,7 @@ def scan_tags(tags: list[tuple[str, str, str]]) -> list[str]:
 class RangeResult(NamedTuple):
     findings: list[str]
     unscannable: list[str]
+    partial: list[str]
     commits: int
 
 
@@ -2417,17 +2465,19 @@ def scan_range(root: Path, rev_range: str,
     """
     findings: list[str] = []
     unscannable: list[str] = []
+    partial: list[str] = []
     commits = commits_in_range(root, rev_range)
     for sha in commits:
         parent = first_parent(root, sha)
-        hits, blind = scan_added(sha, added_lines(root, sha), compiled, root)
+        hits, blind, partly = scan_added(sha, added_lines(root, sha), compiled, root)
         findings += hits
         findings += scan_paths(f"{sha[:10]} ", changed_paths(root, parent, sha))
         findings += scan_identity(sha, commit_identity(root, sha), compiled)
         findings += scan_message(sha, commit_message(root, sha))
         unscannable += blind
+        partial += partly
     findings += scan_tags(refs_being_published(root, rev_range, unscannable))
-    return RangeResult(findings, unscannable, len(commits))
+    return RangeResult(findings, unscannable, partial, len(commits))
 
 
 # Deny cases are SYNTHETIC by construction — reserved documentation ranges (RFC5737), the top of
@@ -3213,7 +3263,7 @@ def staged_diff(root: Path) -> tuple[ParsedDiff, list[str]]:
 def _scan_staged(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int:
     """Scan the INDEX. Same reporting posture as the range scan: unread is never cleared."""
     parsed, paths = staged_diff(root)
-    findings, unscannable = scan_added("", parsed, compiled, root)
+    findings, unscannable, partial = scan_added("", parsed, compiled, root)
     # `scan_added` prefixes each finding with `sha[:10] ` and there is no sha here, so the prefix
     # is empty and the lines read `<file>:<line>: ...`. Same for the path findings below.
     findings += scan_paths("", paths)
@@ -3241,6 +3291,12 @@ def _scan_staged(root: Path, compiled: list[tuple[str, re.Pattern[str]]]) -> int
               "/mnt/POOL/..., RFC5737 addresses), then `git add` the corrected file.")
         print("A `<path>` finding is the FILE NAME, not its contents: `git mv` it to a neutral "
               "name and stage the rename.")
+    if partial:
+        # #27: the same "PARTLY read" disclosure the tree scan and the range scan print now.
+        print(f"\nPARTLY read ({len(partial)}) - a NUL-bearing added line could not be read; "
+              f"the rest of each was scanned:")
+        for p in partial:
+            print("  " + _ascii(p.strip()))
     if findings or unscannable:
         return 1
     print(f"no internal info staged ({len(parsed.added)} added line(s), "
@@ -3329,6 +3385,14 @@ def _scan_commits(root: Path, rev_range: str,
               "clears it, or re-cut it with `git tag -a -f`.")
         print("A `<path>` finding is the FILE NAME, not its contents: `git mv` it to a neutral "
               "name in the offending commit.")
+    if result.partial:
+        # #27: the same disclosure the tree scan prints as "PARTLY read" — NOT a failure (the
+        # NUL-free lines of each path WERE scanned; see `scan_added`), but not a silent clean
+        # bill of health either, printed after the findings so it reads as disclosure, not refusal.
+        print(f"\nPARTLY read ({len(result.partial)}) - a NUL-bearing added line could not be "
+              f"read; the rest of each was scanned:")
+        for p in result.partial:
+            print("  " + _ascii(p))
     if result.findings or result.unscannable:
         return 1
     # ⚠️ `_ascii` HERE TOO — this is the FOURTH `rev_range` site and the only one on the SUCCESS
