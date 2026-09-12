@@ -1297,14 +1297,21 @@ def test_a_GENUINELY_binary_asset_is_still_skipped_in_silence(tmp_path: Path) ->
     assert "UNREADABLE" not in _out(res), _out(res)
 
 
-def test_a_NUL_bearing_blob_at_a_SKIPPED_suffix_is_still_skipped(tmp_path: Path) -> None:
-    """⚠️ THE STATED SCOPE, pinned so it is discoverable rather than folklore.
+def test_a_UTF16_blob_at_a_SKIPPED_suffix_is_now_DISCLOSED_not_silent(tmp_path: Path) -> None:
+    """⭐ #26 CLOSED (narrowed residual, stated in KNOWN LIMITS). This used to pin the opposite —
+    a NUL in git's window silently trusted the name's binary claim, full stop, which is exactly
+    what let `deploy-notes.pdf = b"\\x00\\nsecret host <addr> lives here\\n..."` scan clean in
+    every mode: that payload decodes as valid UTF-8 (a NUL is a legal UTF-8 codepoint), so the old
+    test's PREMISE — "a NUL in the window proves this is opaque binary" — was false for exactly
+    the shape an attacker would plant.
 
-    UTF-16 of ASCII carries a NUL at byte 1 — inside git's 8000-byte window — so a UTF-16 payload
-    hidden in a file named `.pdf` corroborates the name's binary claim and is skipped silently,
-    exactly as before. At any OTHER path a NUL-bearing blob is still REFUSED and reported (the
-    #242 posture). This is consumer#98's residual (a), stated in KNOWN LIMITS; a NUL PAST the
-    window is the different case `_reading` blanks, and it has its own tests below.
+    So the silent skip is now trusted only when the bytes ALSO fail a STRICT UTF-8 decode — a
+    real PNG's arbitrary high bytes do; this UTF-16LE-of-ASCII payload does not (every byte is
+    under 0x80, which is #242's own point about it). It falls through to the SAME blank-and-scan
+    treatment as a NUL past git's window: every line here happens to carry a NUL (each original
+    ASCII byte is followed by 0x00), so nothing survives to be scanned, and the result is a
+    "PARTLY read" disclosure with zero findings rather than total silence. At any OTHER path a
+    NUL-bearing blob is still REFUSED outright (the #242 posture, unchanged).
     """
     repo = tmp_path / "suffix_nul"
     _init(repo)
@@ -1318,8 +1325,40 @@ def test_a_NUL_bearing_blob_at_a_SKIPPED_suffix_is_still_skipped(tmp_path: Path)
     assert res.returncode == 1, "a NUL-bearing .txt must still be refused"
     out = _out(res)
     assert "notes.txt" in out, f"the #242 refusal no longer fires on an ordinary path:\n{out}"
-    assert "notes.pdf" not in out, (
-        f"a declared binary asset is skipped silently, not reported:\n{out}")
+    refused = out.partition("PARTLY read (")[0]
+    assert "notes.pdf" not in refused, (
+        f"a hinted file that fails strict UTF-8 decode must stay silently skipped; this one "
+        f"decodes as valid UTF-8 and must not be REFUSED (it has a real remedy: none, since "
+        f"the suffix is already an asset suffix):\n{out}")
+    assert "notes.pdf (2 line(s) carried a NUL and were not read)" in out, (
+        f"the free pass for a NUL in git's window is gone once the bytes decode as valid UTF-8 "
+        f"— the guard must at least SAY it could not read this file:\n{out}")
+
+
+def test_a_leak_hidden_by_ONE_early_NUL_under_a_binary_suffix_now_REDS(tmp_path: Path) -> None:
+    """⭐⭐ THE MEASURED REPRO FROM #26 ITSELF, closed. `deploy-notes.pdf` holding
+    `b"\\x00\\nsecret host <addr> lives here\\n..."` scanned clean in every mode before this fix
+    — a binary suffix corroborated by ONE NUL in git's 8000-byte window was trusted outright, and
+    a NUL is valid UTF-8, so the corroboration cost the planted leak nothing. Standard from the
+    WP: plant the hidden leak and assert the scan REDS, not that a pattern string looks right.
+    """
+    repo = tmp_path / "early_nul_leak"
+    _init(repo)
+    _write(repo, "README.md", "clean\n")
+    body = b"\x00\nsecret host " + _ADDR.encode() + b" lives here\nmore text\n"
+    (repo / "deploy-notes.pdf").write_bytes(body)
+    (repo / "deploy.conf").write_bytes(body)   # the control: identical bytes, ordinary name
+    _git(repo, "add", "-A")
+
+    assert guard._binary_suffix("deploy-notes.pdf") and guard._binary_by_content(body), (
+        "vacuity guard: the plant must really corroborate the name's binary claim")
+
+    res = _cli(repo)
+    out = _out(res)
+    assert res.returncode == 1, f"the planted leak walked past every scan:\n{out}"
+    assert "deploy-notes.pdf" in out and "deploy.conf" in out, (
+        f"both the hinted and the ordinary copy carry the same leak and must both be caught:\n"
+        f"{out}")
 
 
 def test_an_assets_only_tree_is_NOT_reddened_because_every_path_was_examined(
@@ -1337,7 +1376,11 @@ def test_an_assets_only_tree_is_NOT_reddened_because_every_path_was_examined(
     repo = tmp_path / "assets_only"
     _init(repo)
     (repo / "icon.png").write_bytes(_PNG)
-    (repo / "logo.ico").write_bytes(b"\x00\x00\x01\x00" + bytes(64))
+    # ⚠️ NOT all-zero. A real ICO's pixel data spans the full byte range, and #26's strict-decode
+    # corroboration (see `_reading`) trusts a NUL-in-window binary claim only when the bytes ALSO
+    # fail to decode as UTF-8 — an all-zero/low-byte fixture decodes CLEANLY (every byte under
+    # 0x80 is valid UTF-8 on its own) and would misrepresent a genuine asset as text-shaped.
+    (repo / "logo.ico").write_bytes(b"\x00\x00\x01\x00" + bytes(range(256)))
     _git(repo, "add", "-A")
 
     assert sorted(_git(repo, "ls-files").split()) == ["icon.png", "logo.ico"], "vacuity guard"
@@ -1648,6 +1691,40 @@ def test_a_latin1_file_under_a_binary_suffix_is_SCANNED_the_way_the_range_scan_s
     assert "UNREADABLE" not in _out(tree), _out(tree)
     rng = _cli(repo, "--range", f"{base}..HEAD")
     assert rng.returncode == 1 and "notes.pdf:2:" in _out(rng), _out(rng)
+
+
+def test_a_latin1_file_at_an_ORDINARY_path_is_now_SCANNED_not_refused(tmp_path: Path) -> None:
+    """⭐ #28 CLOSED. A clean latin-1 file at an ordinary (non-hinted) path used to REFUSE the
+    tree scan — `git commit` blocked — while `--range`/`--staged` cleared the identical bytes
+    with replacement characters, and renaming the file under an asset suffix was the only way
+    past the block. Every path now decodes with `errors="replace"`, matching what `_git` has
+    always done for the range/staged scans, so all three scans reach the SAME verdict on the
+    same bytes: a real leak is still caught (replacement characters cannot create a false hit,
+    every pattern is ASCII), and a leak-free latin-1 file no longer blocks the commit.
+    """
+    repo = tmp_path / "latin1_ordinary"
+    base = _seeded(repo)
+    (repo / "notes.txt").write_bytes(b"caf\xe9 notes\n" + f"host {_ADDR}\n".encode("ascii"))
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "add latin-1 notes")
+
+    tree = _cli(repo)
+    out = _out(tree)
+    assert tree.returncode == 1 and "notes.txt:2:" in out, (
+        f"a latin-1 leak at an ordinary path was cleared by the tree scan:\n{out}")
+    assert "UNREADABLE" not in out, (
+        f"the old strict-decode refusal must be gone for a leak-free latin-1 file too:\n{out}")
+    rng = _cli(repo, "--range", f"{base}..HEAD")
+    assert rng.returncode == 1 and "notes.txt:2:" in _out(rng), _out(rng)
+
+    clean = tmp_path / "latin1_ordinary_clean"
+    _seeded(clean)
+    (clean / "notes.txt").write_bytes(b"caf\xe9 notes, nothing internal here\n")
+    _git(clean, "add", "-A")
+    res = _cli(clean)
+    assert res.returncode == 0 and "UNREADABLE" not in _out(res), (
+        f"a leak-free latin-1 file at an ordinary path must no longer block the commit:\n"
+        f"{_out(res)}")
 
 
 def test_staged_blob_reads_the_PATH_it_was_given_not_a_git_STAGE_expression(

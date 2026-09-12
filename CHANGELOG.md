@@ -9,6 +9,56 @@ exported symbol that changed. ⛔ It does NOT name the consumers that need a cod
 repository is public, and honouring that older promise would publish the fleet's inventory at
 exactly the moment the release notes are read most widely.
 
+## [1.6.0] - 2026-09-12
+
+**Closes the three scan-coverage holes v1.5.0's own gate found in itself** (`#26`, `#27`, `#28`),
+plus the root question behind all three: why a tree scan, a range scan and a `--staged` scan could
+reach different verdicts on the same bytes. No name in `__all__` changed — this is additive.
+
+### ⚠️ WHAT A CONSUMER SHOULD EXPECT WHEN IT BUMPS
+
+**New findings, again, are the fix working.** A leak that was invisible to every scan before this
+release may now be caught — that is what closing these three holes means.
+
+* **`#26` — a binary suffix plus one NUL inside git's 8000-byte window no longer earns a silent
+  pass by itself.** `deploy-notes.pdf = b"\x00\nsecret host <addr> lives here\n..."` used to scan
+  clean in every mode; the name's binary claim is now trusted in silence only when the bytes ALSO
+  fail a strict UTF-8 decode. A NUL is itself valid UTF-8, which is exactly what made the old
+  NUL-only test unable to tell a planted leak from a real asset. **Narrowed residual, not zero**:
+  a leak sharing a file with one genuinely non-UTF-8 byte (not the NUL itself) still corroborates
+  the binary claim and is still skipped in silence — stated in KNOWN LIMITS rather than chased,
+  because closing it fully means either false-redding every binary asset in a repository or
+  reading every asset's decodable byte-runs (its own false-positive risk on files nobody can
+  edit).
+* **`#27` — the range and `--staged` scans now DISCLOSE a NUL-bearing line the same way the tree
+  scan always has.** A hinted file with some lines dropped for a NUL (and its other lines
+  genuinely scanned) used to clear silently on these two surfaces; both now print the same
+  "PARTLY read" block the tree scan prints, naming the file and how many lines it could not read.
+  This is disclosure, not a new failure mode: a NON-hinted path with a NUL-bearing line is
+  unchanged and still fails closed (`#242`'s posture).
+* **`#28` — a clean latin-1 file at an ordinary path no longer blocks `git commit` while `--push`
+  clears the identical bytes.** Every path now decodes with `errors="replace"`, matching how the
+  range/`--staged` scans have always read the same bytes — a real leak is still caught (every
+  pattern is ASCII; a replacement character cannot forge a match), and a leak-free latin-1 file no
+  longer has to be renamed under an asset suffix to pass. Measured identical on `v1.4.1` and
+  `v1.5.0`; this was not introduced by either.
+
+### Why the three scans used to disagree
+
+One list, `ParsedDiff.unscannable`, used to carry two genuinely different answers: "git refused
+this outright, I cannot vouch for any of it" and "one added line carried a NUL, the rest of this
+file was scanned." The tree scan had always kept those as two separate questions (`Reading.
+unreadable` vs. `Reading.partial`); the range and `--staged` scans had only one, which is what let
+the disclosure gap in `#27` open. `ParsedDiff` now carries a third field, `partial`, so the same
+split applies everywhere: `unscannable` is a scan's fail-closed refusal, `partial` is its
+disclosure of the SAME kind the tree scan already had a word for.
+
+### `#6` — left open, unchanged
+
+Assessed again against this release; the two residual mutation survivors are unpinnable **by
+construction** (documented redundancy, not untested behaviour), the same finding v1.5.0 recorded.
+No new evidence to close it with.
+
 ## [1.5.0] - 2026-09-06
 
 **This release is a migration brief as much as a changelog.** Five repositories still carry their
