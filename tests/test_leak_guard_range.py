@@ -133,7 +133,7 @@ def _binary(diff: str) -> list[str]:
 
 
 def _hits(sha: str, added: list[tuple[str, int, str]]) -> list[str]:
-    return guard.scan_added(sha, guard.ParsedDiff(added, []), COMPILED)[0]
+    return guard.scan_added(sha, guard.ParsedDiff(added, [], []), COMPILED)[0]
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -443,8 +443,8 @@ def test_a_binary_asset_is_still_not_REPORTED_as_unreadable_by_either_scan():
         diff = (f"diff --git a/assets/asset{suffix} b/assets/asset{suffix}\n"
                 "new file mode 100644\n"
                 f"Binary files /dev/null and b/assets/asset{suffix} differ\n")
-        _, blind = guard.scan_added("abc", guard.parse_diff(diff), COMPILED)
-        assert blind == [], suffix
+        _, blind, partial = guard.scan_added("abc", guard.parse_diff(diff), COMPILED)
+        assert blind == [] and partial == [], suffix
 
 
 def test_the_guards_own_source_is_skipped_in_range_mode_BY_EXACT_PATH_ONLY():
@@ -461,14 +461,14 @@ def test_the_guards_own_source_is_skipped_in_range_mode_BY_EXACT_PATH_ONLY():
     scanned", so a call with no root exempts NOTHING — pinned by the last assertion, which is the
     case an installed guard is in on every run.
     """
-    assert guard.scan_added("abc", guard.ParsedDiff([(_GUARD_REL, 5, _LEAK)], []), COMPILED,
+    assert guard.scan_added("abc", guard.ParsedDiff([(_GUARD_REL, 5, _LEAK)], [], []), COMPILED,
                             _GUARD_ROOT)[0] == [], (
         "the guard's own source must be skipped — it carries synthetic deny cases by design")
     assert guard.scan_added("abc", guard.ParsedDiff(
-        [(f"__pycache__/{Path(_GUARD_REL).stem}.cpython-312.pyc", 5, _LEAK)], []),
+        [(f"__pycache__/{Path(_GUARD_REL).stem}.cpython-312.pyc", 5, _LEAK)], [], []),
         COMPILED, _GUARD_ROOT)[0], (
         "a .pyc copy of the scanner is NOT the scanner and must still be scanned")
-    assert guard.scan_added("abc", guard.ParsedDiff([(f"docs/{_GUARD_REL}", 5, _LEAK)], []),
+    assert guard.scan_added("abc", guard.ParsedDiff([(f"docs/{_GUARD_REL}", 5, _LEAK)], [], []),
                             COMPILED, _GUARD_ROOT)[0], (
         "only the real path is exempt; a same-named file elsewhere is not")
     assert _hits("abc", [(_GUARD_REL, 5, _LEAK)]), (
@@ -525,7 +525,7 @@ def test_a_binary_file_is_reported_as_NOT_CLEARED_rather_than_passed_over():
         "Binary files /dev/null and b/u16.txt differ\n"
     )
     assert _binary(diff) == ["u16.txt"]
-    _, blind = guard.scan_added("abc", guard.parse_diff(diff), COMPILED)
+    _, blind, _partial = guard.scan_added("abc", guard.parse_diff(diff), COMPILED)
     assert blind == ["abc u16.txt"]
 
 
@@ -2025,7 +2025,8 @@ def test_an_empty_diff_is_not_reported_as_headerless() -> None:
 
 def test_the_headerless_marker_reaches_the_verdict_and_prints_without_its_sigil() -> None:
     """The marker is only worth having if it survives to the operator, legibly."""
-    findings, blind = guard.scan_added("abc1234567", guard.parse_diff(_HEADERLESS_DIFF), COMPILED)
+    findings, blind, _partial = guard.scan_added("abc1234567", guard.parse_diff(_HEADERLESS_DIFF),
+                                                 COMPILED)
     assert findings == []
     assert len(blind) == 1, blind
     assert "external diff driver" in blind[0], blind[0]
@@ -2037,8 +2038,8 @@ def test_the_sigil_is_stripped_from_a_FINDING_line_too_not_only_the_unscannable_
     line left the whole suite green. A raw NUL reaching a git hook's cp1252 stdout is exactly the
     class `_ascii` exists for, so the guard would die while announcing a leak."""
     marker = guard._unparsed_header("a/x b/y")
-    findings, _ = guard.scan_added("abc1234567", guard.ParsedDiff([(marker, 1, _LEAK_LINE)], []),
-                                   COMPILED)
+    findings, _, _partial = guard.scan_added(
+        "abc1234567", guard.ParsedDiff([(marker, 1, _LEAK_LINE)], [], []), COMPILED)
     assert len(findings) == 1, findings
     assert guard._MARKER_SIGIL not in findings[0], (
         "the NUL sigil leaked into a finding line, which a cp1252 pipe cannot print")
@@ -2070,7 +2071,8 @@ def test_an_unattributable_marker_survives_ALONGSIDE_a_binary_needing_a_rediff(
         parsed = _o(diff)
         # Only the PRIMARY parse gets the extra marker; the re-diff's own result is untouched.
         if "--text" not in diff and parsed.unscannable:
-            return guard.ParsedDiff(parsed.added, [*parsed.unscannable, guard._NO_HEADER])
+            return guard.ParsedDiff(parsed.added, [*parsed.unscannable, guard._NO_HEADER],
+                                    parsed.partial)
         return parsed
 
     guard.parse_diff = both
@@ -2496,7 +2498,7 @@ def test_a_redi_ff_that_matches_NOTHING_leaves_the_path_unreadable(tmp_path: Pat
     `still_unreadable`. Driven here through the pure function, since inventing a NEW mis-parse is
     exactly what this is meant to survive.
     """
-    parsed = guard.ParsedDiff([], ["no/such/file.bin"])
+    parsed = guard.ParsedDiff([], ["no/such/file.bin"], [])
     # A path that is tracked nowhere: the re-diff can only come back empty.
     repo = tmp_path / "empty-rediff"
     _seeded(repo)
