@@ -915,13 +915,15 @@ def test_send_email_uses_the_configured_port_and_host(
 
 def test_post_ntfy_sends_the_body_and_the_severity_headers(
         monkeypatch: pytest.MonkeyPatch) -> None:
-    """The headers ARE the rendering: ntfy turns the `Tags` NAME into the emoji, and `Priority`
-    decides whether the phone buzzes. Swapping the two survived a mutation sweep."""
+    """`Priority`/`Tags` ARE the rendering: ntfy turns the `Tags` NAME into the emoji, and
+    `Priority` decides whether the phone buzzes. `title`/`message` travel in the JSON body, not
+    headers (kw-common#32 — a header is latin-1-only; the body is UTF-8). Swapping the header
+    pair survived a mutation sweep."""
     captured: dict[str, object] = {}
 
     def fake_urlopen(req: object, timeout: float | None = None) -> object:
         captured["url"] = req.full_url  # type: ignore[attr-defined]
-        captured["data"] = req.data  # type: ignore[attr-defined]
+        captured["body"] = json.loads(req.data)  # type: ignore[attr-defined]
         captured["headers"] = dict(req.headers)  # type: ignore[attr-defined]
         captured["timeout"] = timeout
 
@@ -956,25 +958,36 @@ def test_post_ntfy_sends_the_body_and_the_severity_headers(
     alerting._post_ntfy(cfg, alerting.SEVERITIES[ERROR], "svc: down", "connection refused")
 
     assert captured["url"] == "https://ntfy.example.com/svc"
-    assert captured["data"] == b"connection refused"
+    assert captured["body"] == {"title": "[ERROR] svc: down", "message": "connection refused"}
     assert captured["timeout"] == alerting.NTFY_TIMEOUT_S
     headers = captured["headers"]
-    assert headers["Title"] == "[ERROR] svc: down"
     assert headers["Priority"] == "urgent"
     assert headers["Tags"] == "red_circle"
+    assert headers["Content-type"] == "application/json"
 
 
-def test_post_ntfy_keeps_the_title_header_ascii(monkeypatch: pytest.MonkeyPatch) -> None:
-    """`http.client` encodes header values latin-1, so putting the emoji itself in `Title` raises
-    `UnicodeEncodeError` before anything is sent. The emoji travels as a TAG NAME instead — this
-    pins that the severity table's `emoji` field never reaches a header."""
-    seen: dict[str, object] = {}
+# ⭐ CORPUS: the fleet's own message punctuation conventions (kw-common#32). Each of these, put
+# through the OLD header-based `_post_ntfy`, raised `UnicodeEncodeError` before the request was
+# ever sent — the title never reached ntfy and the failure was logged where nobody was watching.
+_NON_LATIN1_TITLE_CORPUS = (
+    "svc: a run DIED — gone",       # em-dash
+    "svc: retrying – attempt 2",    # en-dash
+    "svc: queue → drained",         # arrow
+    "svc: backfill complete ✅",     # check mark
+    "svc: disk pressure ⚠️",   # warning
+)
+
+
+@pytest.mark.parametrize("title", _NON_LATIN1_TITLE_CORPUS)
+def test_post_ntfy_delivers_titles_outside_latin1(
+        title: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A title carrying the fleet's own punctuation conventions must reach ntfy, not raise
+    `UnicodeEncodeError` before the request is sent (kw-common#32)."""
+    captured: dict[str, object] = {}
 
     def fake_urlopen(req: object, timeout: float | None = None) -> object:
-        seen.update(dict(req.headers))  # type: ignore[attr-defined]
+        captured["body"] = json.loads(req.data)  # type: ignore[attr-defined]
 
-        # A context manager, because a real `HTTPResponse` is one and `_post_ntfy` closes the
-        # response rather than leaving the socket to the collector.
         class Response:
             def read(self) -> bytes:
                 return b"ok"
@@ -987,23 +1000,13 @@ def test_post_ntfy_keeps_the_title_header_ascii(monkeypatch: pytest.MonkeyPatch)
 
         return Response()
 
-    # ⭐ THE OPENER, NOT `urlopen`. `_post_ntfy` sends through the module-level opener that
-    # refuses redirects; a spy on `urlopen` records nothing and every assertion below reads an
-    # empty dict.
-    #
-    # ⚠️ THE MODULE ATTRIBUTE, NOT `setattr(alerting._NTFY_OPENER, "open", ...)`. That form
-    # LEAKS ACROSS TESTS and it cost a debugging round: `monkeypatch` restores by writing the
-    # old value back, and the old value of an INSTANCE's `open` is the bound method it inherited
-    # from the class — so the undo installs a permanent instance attribute. Captured while
-    # `conftest` had the class patched to refuse, that permanent attribute is the refusal, and
-    # every later test that opts out of the network block still gets it.
-    # (`_ntfy_opener()` returns this the moment it is not None, so the lazy build never runs.)
     monkeypatch.setattr(alerting, "_NTFY_OPENER", SimpleNamespace(open=fake_urlopen))
-    for severity in (OK, WARN, ERROR):
-        alerting._post_ntfy(AlertConfig(ntfy_url="https://ntfy.example.com/t"),
-                            alerting.SEVERITIES[severity], "svc: x", "m")
-        for name, value in seen.items():
-            assert str(value).isascii(), f"{name} header is not latin-1 safe: {value!r}"
+
+    # Must not raise.
+    alerting._post_ntfy(AlertConfig(ntfy_url="https://ntfy.example.com/t"),
+                        alerting.SEVERITIES[WARN], title, "m")
+
+    assert captured["body"] == {"title": f"[WARN] {title}", "message": "m"}
 
 
 # ======================================= no credential reaches any sink on a failure path (#2)
@@ -2793,7 +2796,9 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         length = int(self.headers.get("Content-Length") or 0)
-        _Recorder.received.append((self.path, self.headers.get("Title"), self.rfile.read(length)))
+        raw = self.rfile.read(length)
+        title = json.loads(raw)["title"]
+        _Recorder.received.append((self.path, title, raw))
         self.send_response(200)
         self.send_header("Content-Length", "2")
         self.end_headers()
@@ -2831,8 +2836,8 @@ def _direct_to_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.allow_loopback
 @pytest.mark.usefixtures("_direct_to_loopback")
 def test_post_ntfy_refuses_to_follow_a_redirect() -> None:
-    """⭐⭐ ISSUE #4. `urlopen` re-issues a redirected request WITH THE HEADERS INTACT, so a `302`
-    from the topic host delivers the alert `Title` — `[SEV] <title>`, the most identifying part of
+    """⭐⭐ ISSUE #4. `urlopen` re-issues a redirected request WITH THE BODY INTACT, so a `302`
+    from the topic host delivers the alert title — `[SEV] <title>`, the most identifying part of
     the message — to a host the operator never configured, over any scheme the redirect names.
 
     The assertion is on the TARGET, not on the exception: what matters is that the second server
@@ -2859,13 +2864,19 @@ def test_post_ntfy_refuses_to_follow_a_redirect() -> None:
 @pytest.mark.usefixtures("_direct_to_loopback")
 def test_post_ntfy_still_delivers_when_the_server_does_not_redirect() -> None:
     """⭐ THE NEGATIVE DIRECTION, and it is the half that makes the test above mean something: an
-    opener that refused EVERY request would satisfy "the target received nothing" perfectly."""
+    opener that refused EVERY request would satisfy "the target received nothing" perfectly.
+    The title carries an em-dash — kw-common#32's own trigger — proving over a REAL socket
+    (not a stubbed opener) that a non-latin-1 title reaches ntfy well-formed end to end."""
     _Recorder.received = []
     with _loopback_server(_Recorder) as target:
         cfg = AlertConfig(ntfy_url=f"http://127.0.0.1:{target.server_port}/topic",
                           allow_cleartext_ntfy=True)
-        alerting._post_ntfy(cfg, alerting.SEVERITIES[ERROR], "svc: down", "no route to host")
-    assert _Recorder.received == [("/topic", "[ERROR] svc: down", b"no route to host")]
+        alerting._post_ntfy(cfg, alerting.SEVERITIES[ERROR], "svc: down — gone",
+                            "no route to host")
+    assert _Recorder.received == [
+        ("/topic", "[ERROR] svc: down — gone",
+         b'{"title": "[ERROR] svc: down \xe2\x80\x94 gone", "message": "no route to host"}'),
+    ]
 
 
 def test_the_ntfy_opener_has_no_redirect_handler_that_follows() -> None:
