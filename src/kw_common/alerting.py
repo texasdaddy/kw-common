@@ -1669,11 +1669,11 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
 
     ⭐ A PUBLISH ENDPOINT HAS NO BUSINESS REDIRECTING, and following one hands the alert to a host
     the operator never configured. `urlopen` re-issues the request AT THE NEW LOCATION WITH THE
-    HEADERS INTACT — including `Title`, which is `[SEV] <title>` and is where an operator puts the
-    identifying half of the message. (`_post_ntfy` builds it from the severity's own prefix and
-    the title it was handed. The SERVICE NAME has never been in it; on a shared topic
+    BODY INTACT — the JSON body carries `title` (`[SEV] <title>`, the identifying half of the
+    message) and `message`. (`_post_ntfy` builds the title from the severity's own prefix and the
+    title it was handed. The SERVICE NAME has never been in it; on a shared topic
     `AlertSettings.title_prefix` puts `[<env>][<service>] ` at the front of the title itself, which
-    is a property of the topic rather than of this header.) The target need not share the original
+    is a property of the topic rather than of this field.) The target need not share the original
     host or even the scheme, so an `https` topic can be handed to a cleartext one by a single
     `302` from a compromised or merely misconfigured endpoint. `ntfy_ready()` validates the URL
     the OPERATOR chose; it has nothing to say about where that server then points.
@@ -1714,17 +1714,17 @@ def _ntfy_opener() -> urllib.request.OpenerDirector:
 
 
 def _post_ntfy(cfg: AlertConfig, spec: SeveritySpec, title: str, message: str) -> None:
-    # Header values are encoded latin-1 by http.client, so the Title stays ASCII and the emoji
-    # is carried by the Tags header as a NAME (ntfy renders `white_check_mark` as ✅). Putting
-    # the emoji itself in a header raises UnicodeEncodeError before anything is sent.
-    # The scheme check that makes this safe is `AlertConfig.ntfy_ready()`, which the dispatcher
-    # calls before either line below is reached; a test feeds it `ftp://` and other non-http
-    # values to prove it refuses them. The suppression sits on the `Request`, which is where the
-    # URL is accepted.
+    # Title/message go in the JSON BODY, not headers: http.client encodes header values latin-1,
+    # so a title carrying anything outside that range (an em-dash, an arrow) raised
+    # UnicodeEncodeError before the request was ever sent (kw-common#32). The body is UTF-8 JSON
+    # and has no such limit. `Priority`/`Tags` stay ASCII by construction (`SeveritySpec`'s own
+    # fixed values) and are left as headers — ntfy accepts either place for them, and moving them
+    # too would be change without benefit.
     req = urllib.request.Request(  # noqa: S310 — scheme gated by ntfy_ready()
         cfg.ntfy_url,
-        data=message.encode("utf-8"),
-        headers={"Title": f"{spec.prefix} {title}",
+        data=json.dumps({"title": f"{spec.prefix} {title}", "message": message},
+                         ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json",
                  "Priority": spec.ntfy_priority,
                  "Tags": spec.ntfy_tags},
     )

@@ -9,6 +9,17 @@ exported symbol that changed. ⛔ It does NOT name the consumers that need a cod
 repository is public, and honouring that older promise would publish the fleet's inventory at
 exactly the moment the release notes are read most widely.
 
+## [1.6.1] - 2026-09-16
+
+**Fixes the ntfy channel dropping an alert whose title carries a character outside latin-1** (an
+em-dash, an arrow — the fleet's own message-punctuation conventions), `#32`. `notify()` raised
+`UnicodeEncodeError` INSIDE the ntfy channel before the request was ever sent, logged at WARNING
+in the same log nobody watches when the alert was supposed to page them; email was unaffected
+(MIME handles UTF-8). Title and message now travel in the ntfy JSON body instead of an HTTP
+header — the body is UTF-8 and has no such limit. `Priority`/`Tags` are unaffected. No name in
+`__all__` changed — this is a bug fix to existing exported behaviour, PATCH per this project's own
+semver contract.
+
 ## [1.6.0] - 2026-09-12
 
 **Closes the three scan-coverage holes v1.5.0's own gate found in itself** (`#26`, `#27`, `#28`),
